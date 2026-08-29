@@ -1604,13 +1604,41 @@ static void foldIdenticalLiterals() {
   in.wordLiteralSection->finalizeContents();
 }
 
-static void addSynthenticMethnames() {
+static void prepareObjCStubs() {
   std::string &data = *make<std::string>();
   llvm::raw_string_ostream os(data);
-  for (Symbol *sym : symtab->getSymbols())
-    if (isa<Undefined>(sym))
-      if (ObjCStubsSection::isObjCStubSymbol(sym))
-        os << ObjCStubsSection::getMethname(sym) << '\0';
+  // This loop may add class symbols to the symbol table, so avoid range-for
+  // over the backing vector.
+  for (size_t i = 0; i < symtab->getSymbols().size(); ++i) {
+    Symbol *sym = symtab->getSymbols()[i];
+    if (!isa<Undefined>(sym))
+      continue;
+
+    if (ObjCStubsSection::isObjCMsgSendStubSymbol(sym)) {
+      StringRef selectorName = ObjCStubsSection::getMethname(sym);
+      os << selectorName << '\0';
+    } else if (ObjCStubsSection::isObjCClassStubSymbol(sym)) {
+      std::optional<ObjCStubsSection::ObjCClassStubNames> parsed =
+          ObjCStubsSection::parseObjCClassStubSymbol(sym);
+      if (!parsed)
+        continue;
+
+      os << parsed->selectorName << '\0';
+      if (!target->supportsObjCClassStubs())
+        continue;
+
+      Symbol *classSym = symtab->find(parsed->classSymbolName);
+      bool needsUndefinedClassRef =
+          !classSym || isa<LazyArchive>(classSym) || isa<LazyObject>(classSym);
+      // Create an undefined reference before markLive() only when it may
+      // trigger archive extraction. Existing dylib symbols are marked
+      // referenced later if the class stub survives dead stripping.
+      if (needsUndefinedClassRef)
+        classSym = symtab->addUndefined(parsed->classSymbolName,
+                                        /*file=*/nullptr, /*isWeakRef=*/false);
+      in.objcStubs->recordClassSymbol(sym, classSym);
+    }
+  }
 
   if (data.empty())
     return;
@@ -2470,7 +2498,7 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
     if (config->thinLTOIndexOnly || config->emitLLVM)
       return errorCount() == 0;
 
-    addSynthenticMethnames();
+    prepareObjCStubs();
 
     // LTO may emit a non-hidden (extern) object file symbol even if the
     // corresponding bitcode symbol is hidden. In particular, this happens for
