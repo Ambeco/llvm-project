@@ -113,7 +113,20 @@ static std::error_code getHostID(SmallVectorImpl<char> &HostID) {
 }
 
 bool LockFileManager::processStillExecuting(StringRef HostID, int PID) {
-#if LLVM_ON_UNIX && !defined(__ANDROID__)
+#if defined(__wasi__)
+  // WASI has no getsid() (nor any other means of checking whether some other
+  // process is still alive) at all -- wasi-libc compiles the whole
+  // getpgrp/setsid/getsid family out unconditionally, unlike e.g. getpid(),
+  // which at least has an opt-in emulation library. There's also no real
+  // multi-process contention to detect in the first place: each compile runs
+  // in its own isolated module instance rather than racing other processes
+  // over a shared filesystem the way native builds do. So, same as the
+  // conservative fallback just below for a getHostID() failure, assume the
+  // lock is still held rather than guessing it's stale.
+  (void)HostID;
+  (void)PID;
+  return true;
+#elif LLVM_ON_UNIX && !defined(__ANDROID__)
   SmallString<256> StoredHostID;
   if (getHostID(StoredHostID))
     return true; // Conservatively assume it's executing on error.
