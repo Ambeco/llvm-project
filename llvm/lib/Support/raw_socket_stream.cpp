@@ -61,6 +61,7 @@ static std::error_code getLastSocketErrorCode() {
 #endif
 }
 
+#if !defined(__wasi__)
 static Expected<sockaddr_un> setSocketAddr(StringRef SocketPath) {
   struct sockaddr_un Addr;
   memset(&Addr, 0, sizeof(Addr));
@@ -112,6 +113,7 @@ static Expected<int> getSocketFD(StringRef SocketPath) {
   return Socket;
 #endif // _WIN32
 }
+#endif // !__wasi__
 
 ListeningSocket::ListeningSocket(int SocketFD, StringRef SocketPath,
                                  int PipeFD[2])
@@ -127,6 +129,17 @@ ListeningSocket::ListeningSocket(ListeningSocket &&LS)
   LS.PipeFD[1] = -1;
 }
 
+#if defined(__wasi__)
+// WASI has no BSD sockets API at all (no socket()/bind()/listen(), no
+// sockaddr_un, and unlike sigaction/getpid/mmap there's no opt-in emulation
+// library for it either). Fail loudly rather than silently returning a
+// socket that can never actually be created.
+Expected<ListeningSocket> ListeningSocket::createUnix(StringRef SocketPath,
+                                                      int MaxBacklog) {
+  report_fatal_error("ListeningSocket::createUnix is not implemented on "
+                      "WASI: there is no sockets API to implement it with");
+}
+#else
 Expected<ListeningSocket> ListeningSocket::createUnix(StringRef SocketPath,
                                                       int MaxBacklog) {
 
@@ -208,6 +221,7 @@ Expected<ListeningSocket> ListeningSocket::createUnix(StringRef SocketPath,
   return ListeningSocket{Socket, SocketPath, PipeFD};
 #endif // _WIN32
 }
+#endif // __wasi__
 
 // If a file descriptor being monitored by ::poll is closed by another thread,
 // the result is unspecified. In the case ::poll does not unblock and return,
@@ -282,6 +296,16 @@ manageTimeout(const std::chrono::milliseconds &Timeout,
   return std::error_code();
 }
 
+#if defined(__wasi__)
+// See ListeningSocket::createUnix above: no sockets API on WASI, and
+// createUnix() already fails before a ListeningSocket with a real FD could
+// ever exist, so this can never legitimately be reached either.
+Expected<std::unique_ptr<raw_socket_stream>>
+ListeningSocket::accept(const std::chrono::milliseconds &Timeout) {
+  report_fatal_error("ListeningSocket::accept is not implemented on WASI: "
+                      "there is no sockets API to implement it with");
+}
+#else
 Expected<std::unique_ptr<raw_socket_stream>>
 ListeningSocket::accept(const std::chrono::milliseconds &Timeout) {
   auto getActiveFD = [this]() -> int { return FD; };
@@ -302,6 +326,7 @@ ListeningSocket::accept(const std::chrono::milliseconds &Timeout) {
                                          "Socket accept failed");
   return std::make_unique<raw_socket_stream>(AcceptFD);
 }
+#endif // __wasi__
 
 void ListeningSocket::shutdown() {
   int ObservedFD = FD.load();
@@ -348,6 +373,15 @@ raw_socket_stream::raw_socket_stream(int SocketFD)
 
 raw_socket_stream::~raw_socket_stream() = default;
 
+#if defined(__wasi__)
+// See ListeningSocket::createUnix above: no sockets API on WASI.
+Expected<std::unique_ptr<raw_socket_stream>>
+raw_socket_stream::createConnectedUnix(StringRef SocketPath) {
+  report_fatal_error(
+      "raw_socket_stream::createConnectedUnix is not implemented on WASI: "
+      "there is no sockets API to implement it with");
+}
+#else
 Expected<std::unique_ptr<raw_socket_stream>>
 raw_socket_stream::createConnectedUnix(StringRef SocketPath) {
 #ifdef _WIN32
@@ -358,6 +392,7 @@ raw_socket_stream::createConnectedUnix(StringRef SocketPath) {
     return FD.takeError();
   return std::make_unique<raw_socket_stream>(*FD);
 }
+#endif // __wasi__
 
 ssize_t raw_socket_stream::read(char *Ptr, size_t Size,
                                 const std::chrono::milliseconds &Timeout) {

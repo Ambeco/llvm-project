@@ -84,8 +84,28 @@
 
 using namespace llvm;
 
+// WASI has no real signal delivery at all (see CrashRecoveryContext.cpp and
+// Unix/Program.inc for the rest of this story): no sigaction/siginfo_t, no
+// way to actually install a handler for e.g. SIGSEGV or Ctrl-C's SIGINT.
+// RegisterHandlers()/unregisterHandlers() below become no-ops on WASI as a
+// result, and SignalHandler()/SignalHandlerTerminate() -- only ever invoked
+// BY a real installed signal handler -- become unreachable, so they (and
+// their siginfo_t-typed signature, which wouldn't even compile) are omitted
+// entirely rather than stubbed.
+//
+// What *does* keep working here: the FileToRemoveList cleanup machinery
+// (RemoveFileOnSignal/DontRemoveFileOnSignal/RunInterruptHandlers) and
+// RunSignalHandlers()/CleanupOnSignal() are ordinary functions with no
+// signal-specific types in their own signatures -- they're simply never
+// triggered automatically by a real signal anymore. They stay exported
+// (LLVM_ABI) so a JS-side executor can call them directly -- e.g.
+// RunInterruptHandlers() to clean up temp files, or CleanupOnSignal() to run
+// the same cleanup a caught crash would have -- when it terminates the
+// Worker running a compile after an interrupt or a detected crash.
+#if !defined(__wasi__)
 static void SignalHandler(int Sig, siginfo_t *Info, void *Context);
 static void SignalHandlerTerminate(int Sig, siginfo_t *Info, void *Context);
+#endif
 static void InfoSignalHandler(int Sig); // defined below.
 static void InfoSignalHandlerTerminate(int Sig); // defined below.
 
@@ -284,10 +304,12 @@ static const size_t NumSigs = std::size(IntSigs) + std::size(KillSigs) +
                               std::size(InfoSigs) + 1 /* SIGPIPE */;
 
 static std::atomic<unsigned> NumRegisteredSignals = 0;
+#if !defined(__wasi__)
 static struct {
   struct sigaction SA;
   int SigNo;
 } RegisteredSignalInfo[NumSigs];
+#endif
 
 #if defined(HAVE_SIGALTSTACK)
 // Hold onto both the old and new alternate signal stack so that it's not
@@ -320,6 +342,14 @@ static void CreateSigAltStack() {
 static void CreateSigAltStack() {}
 #endif
 
+#if defined(__wasi__)
+static void RegisterHandlers(bool NeedsPOSIXUtilitySignalHandling = false) {
+  // No sigaction() to call: there is nothing to register on WASI. Callers
+  // (RemoveFileOnSignal, AddSignalHandler, SetInterruptFunction, ...) still
+  // record what they were asked to do (the file list, the callback list,
+  // InterruptFunction, ...); it just never gets invoked by a real signal.
+}
+#else
 static void RegisterHandlers(
     bool NeedsPOSIXUtilitySignalHandling = false) { // Not signal-safe.
   // The mutex prevents other threads from registering handlers while we're
@@ -387,14 +417,17 @@ static void RegisterHandlers(
   for (auto S : InfoSigs)
     registerHandler(S, SignalKind::IsInfo);
 }
+#endif // __wasi__
 
 void sys::unregisterHandlers() {
+#if !defined(__wasi__)
   // Restore all of the signal handlers to how they were before we showed up.
   for (unsigned i = 0, e = NumRegisteredSignals.load(); i != e; ++i) {
     sigaction(RegisteredSignalInfo[i].SigNo, &RegisteredSignalInfo[i].SA,
               nullptr);
     --NumRegisteredSignals;
   }
+#endif
 }
 
 /// Process the FilesToRemove list.
@@ -421,6 +454,7 @@ void sys::CleanupOnSignal(uintptr_t Context) {
   llvm::sys::RunSignalHandlers();
 }
 
+#if !defined(__wasi__)
 // The signal handler that runs.
 static void SignalHandler(int Sig, siginfo_t *Info, void *Context) {
   // Restore the signal behavior to default, so that the program actually
@@ -514,6 +548,7 @@ static void SignalHandlerTerminate(int Sig, siginfo_t *Info, void *Context) {
   if (llvm::is_contained(KillSigs, Sig))
     raise(Sig); // Execute the default handler.
 }
+#endif // !__wasi__
 
 static void InfoSignalHandler(int Sig) {
   SaveAndRestore SaveErrnoDuringASignalHandler(errno);
@@ -949,7 +984,7 @@ void llvm::sys::PrintStackTrace(raw_ostream &OS, int Depth) {
   OS << "Stack dump without symbol names (ensure you have llvm-symbolizer in "
         "your PATH or set the environment var `LLVM_SYMBOLIZER_PATH` to point "
         "to it):\n";
-#if HAVE_DLOPEN && !defined(_AIX)
+#if HAVE_DLOPEN && !defined(_AIX) && !defined(__wasi__)
   int width = 0;
   for (int i = 0; i < depth; ++i) {
     Dl_info dlinfo;

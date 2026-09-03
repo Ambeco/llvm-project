@@ -14,12 +14,42 @@
 #include "llvm/Support/thread.h"
 #include <cassert>
 #include <mutex>
+#if !defined(__wasi__)
 #include <setjmp.h>
+#endif
 #ifdef __APPLE__
 #include <sys/resource.h>
 #endif
 
 using namespace llvm;
+
+#if defined(__wasi__)
+// WASI's setjmp.h refuses to be included at all (it #errors unconditionally)
+// because WebAssembly has no standardized setjmp/longjmp support. That's
+// fine here: as explained where installExceptionOrSignalHandlers() is
+// defined below, CrashRecoveryContext::Enable() -- the only thing that ever
+// lets gCrashRecoveryEnabled become true, which is in turn the only thing
+// that ever lets ValidJumpBuffer become true -- fails loudly on WASI, so the
+// actual jmp_buf/longjmp use below is unreachable at runtime. We still need
+// something that type-checks to get this file to compile, so provide a
+// placeholder type and a longjmp that fails loudly if it's ever somehow
+// reached anyway rather than silently doing nothing.
+namespace {
+using crc_jmp_buf = int;
+}
+static int crc_setjmp(crc_jmp_buf &) { return 0; }
+[[noreturn]] static void crc_longjmp(crc_jmp_buf &, int) {
+  report_fatal_error("unreachable: CrashRecoveryContext's setjmp/longjmp "
+                      "path was reached despite crash recovery never being "
+                      "enabled on WASI");
+}
+#else
+using crc_jmp_buf = ::jmp_buf;
+static int crc_setjmp(crc_jmp_buf &Buf) { return setjmp(Buf); }
+[[noreturn]] static void crc_longjmp(crc_jmp_buf &Buf, int Val) {
+  longjmp(Buf, Val);
+}
+#endif
 
 namespace {
 
@@ -34,7 +64,7 @@ struct CrashRecoveryContextImpl {
   const CrashRecoveryContextImpl *Next;
 
   CrashRecoveryContext *CRC;
-  ::jmp_buf JumpBuffer;
+  crc_jmp_buf JumpBuffer;
   volatile unsigned Failed : 1;
   unsigned SwitchedThread : 1;
   unsigned ValidJumpBuffer : 1;
@@ -77,7 +107,7 @@ public:
 
     // Jump back to the RunSafely we were called under.
     if (ValidJumpBuffer)
-      longjmp(JumpBuffer, 1);
+      crc_longjmp(JumpBuffer, 1);
 
     // Otherwise let the caller decide of the outcome of the crash. Currently
     // this occurs when using SEH on Windows with MSVC or clang-cl.
@@ -335,6 +365,37 @@ static void uninstallExceptionOrSignalHandlers() {
   }
 }
 
+#elif defined(__wasi__)
+
+// WASI has no signal delivery at all -- there is no OS process to deliver a
+// signal into, and a real fault (e.g. an out-of-bounds memory access) is
+// reported as an uncatchable WebAssembly trap that tears down the whole
+// module instance rather than invoking a handler. So unlike the other
+// platforms in this file, there is no way to implement RunSafely's actual
+// contract (catch a crash, unwind, let the caller keep running) here at all.
+//
+// Rather than silently compiling to a no-op that would look like recovery is
+// happening when it isn't, fail loudly the moment anyone actually tries to
+// turn crash recovery on, so a caller that genuinely depends on it finds out
+// immediately instead of finding out later via an unexplained trap. Callers
+// that don't need recovery (i.e. that never call
+// CrashRecoveryContext::Enable(), which is how clang's driver is configured
+// via -DCLANG_SPAWN_CC1=ON) never reach this code: RunSafely() only takes the
+// setjmp/signal-handling path when gCrashRecoveryEnabled is true, and it
+// falls back to simply calling Fn() directly otherwise -- exactly the
+// upstream-sanctioned behavior for "crash recovery disabled".
+static void
+installExceptionOrSignalHandlers(bool NeedsPOSIXUtilitySignalHandling) {
+  report_fatal_error("CrashRecoveryContext::Enable() is not supported when "
+                      "targeting WASI: WebAssembly traps cannot be caught "
+                      "and recovered from within the same module instance.");
+}
+
+static void uninstallExceptionOrSignalHandlers() {
+  report_fatal_error("CrashRecoveryContext::Disable() is not supported when "
+                      "targeting WASI (see installExceptionOrSignalHandlers).");
+}
+
 #else // !_WIN32
 
 // Generic POSIX implementation.
@@ -436,7 +497,7 @@ bool CrashRecoveryContext::RunSafely(function_ref<void()> Fn) {
     Impl = CRCI;
 
     CRCI->ValidJumpBuffer = true;
-    if (setjmp(CRCI->JumpBuffer) != 0) {
+    if (crc_setjmp(CRCI->JumpBuffer) != 0) {
       return false;
     }
   }
@@ -487,6 +548,14 @@ bool CrashRecoveryContext::throwIfCrash(int RetCode) {
     return false;
 #if defined(_WIN32)
   ::RaiseException(RetCode, 0, 0, NULL);
+#elif defined(__wasi__)
+  // A RetCode this large can only ever have come from a real signal-based
+  // crash, which CrashRecoveryContext can never actually produce on WASI
+  // (see installExceptionOrSignalHandlers() above) -- so getting here means
+  // some other, unaccounted-for code path fed us a crash-shaped code. Fail
+  // loudly rather than silently drop the re-raise.
+  report_fatal_error("CrashRecoveryContext::throwIfCrash() cannot re-raise "
+                      "a signal on WASI");
 #else
   llvm::sys::unregisterHandlers();
   raise(RetCode - 128);
