@@ -10,7 +10,7 @@
 #include "llvm/Config/config.h"
 #include "llvm/Support/Compiler.h"
 
-#ifdef LLVM_ON_UNIX
+#if defined(LLVM_ON_UNIX) && !defined(__wasi__)
 # include <sys/resource.h> // for getrlimit
 #endif
 
@@ -42,7 +42,7 @@ uintptr_t llvm::getStackPointer() {
 }
 
 unsigned llvm::getDefaultStackSize() {
-#ifdef LLVM_ON_UNIX
+#if defined(LLVM_ON_UNIX) && !defined(__wasi__)
   rlimit RL;
   getrlimit(RLIMIT_STACK, &RL);
   return RL.rlim_cur;
@@ -50,6 +50,11 @@ unsigned llvm::getDefaultStackSize() {
   // Clang recursively parses, instantiates templates, and evaluates constant
   // expressions. We've found 8MiB to be a reasonable stack size given the way
   // Clang works and the way C++ is commonly written.
+  //
+  // WASI (like every other non-Unix platform here) has no OS-level rlimit to
+  // query in the first place -- wasm's stack lives in linear memory and is
+  // sized by the toolchain/runtime, not by an OS process limit -- so it uses
+  // this same already-established fallback rather than a wasi-specific one.
   return 8 << 20;
 #endif
 }
