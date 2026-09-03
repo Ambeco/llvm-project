@@ -29,7 +29,12 @@
 #include <cstring>
 #include <string>
 #include <sys/types.h>
+#if !defined(__wasi__)
+// WASI has no sys/wait.h -- it has no concept of a process to wait on. This
+// header is included for downstream users' benefit (e.g. Unix/Program.inc's
+// waitpid()-based process management); nothing in this file itself uses it.
 #include <sys/wait.h>
+#endif
 
 #ifdef HAVE_UNISTD_H
 #include <unistd.h>
