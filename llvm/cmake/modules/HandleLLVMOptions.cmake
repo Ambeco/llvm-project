@@ -252,6 +252,12 @@ elseif(FUCHSIA OR UNIX OR CYGWIN)
   else()
     set(LLVM_HAVE_LINK_VERSION_SCRIPT 1)
   endif()
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Generic" AND LLVM_HOST_TRIPLE MATCHES "-wasi")
+  # WASI targets (unlike bare wasm32-unknown-unknown) provide a POSIX-ish
+  # libc (wasi-libc), so treat them like a Unix platform for the purposes of
+  # picking LLVMSupport's Unix/*.inc implementations.
+  set(LLVM_ON_UNIX 1)
+  set(LLVM_HAVE_LINK_VERSION_SCRIPT 0)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Generic")
   set(LLVM_ON_UNIX 0)
   set(LLVM_HAVE_LINK_VERSION_SCRIPT 0)
