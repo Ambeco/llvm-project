@@ -136,6 +136,11 @@ void Process::GetTimeUsage(TimePoint<> &elapsed,
 // their operation. To prevent the disk from filling up, this function does
 // what's necessary to prevent their generation.
 void Process::PreventCoreFiles() {
+#if !defined(__wasi__)
+  // WASI has no concept of core files at all -- there's no OS-level crash
+  // dump mechanism to disable in the first place, so there's nothing to do
+  // here (unlike the platforms below, this isn't a missing feature, the
+  // thing this function guards against structurally cannot happen).
   struct rlimit rlim;
   getrlimit(RLIMIT_CORE, &rlim);
 #ifdef __linux__
@@ -158,6 +163,7 @@ void Process::PreventCoreFiles() {
   rlim.rlim_cur = 0;
 #endif
   setrlimit(RLIMIT_CORE, &rlim);
+#endif // !__wasi__
 
 #if defined(HAVE_MACH_MACH_H) && !defined(__GNU__)
   // Disable crash reporting on Mac OS X 10.0-10.4
@@ -252,6 +258,16 @@ std::error_code Process::FixupStandardFileDescriptors() {
 }
 
 std::error_code Process::SafelyCloseFileDescriptor(int FD) {
+#if defined(__wasi__)
+  // The whole point of masking signals here is to stop a signal handler
+  // from observing/racing a half-closed FD. WASI never delivers signals at
+  // all (see CrashRecoveryContext.cpp), so there's no handler that could
+  // ever run concurrently -- masking would be a no-op even if the APIs to
+  // do it existed, so just close the FD directly.
+  if (::close(FD) < 0)
+    return errnoAsErrorCode();
+  return std::error_code();
+#else
   // Create a signal set filled with *all* signals.
   sigset_t FullSet, SavedSet;
   if (sigfillset(&FullSet) < 0 || sigfillset(&SavedSet) < 0)
@@ -284,6 +300,7 @@ std::error_code Process::SafelyCloseFileDescriptor(int FD) {
   if (ErrnoFromClose)
     return std::error_code(ErrnoFromClose, std::generic_category());
   return std::error_code(EC, std::generic_category());
+#endif // __wasi__
 }
 
 bool Process::StandardInIsUserInput() {
@@ -320,7 +337,10 @@ static unsigned getColumns(int FileID) {
   // instead if it isn't available.
   unsigned Columns = 0;
 
-#if defined(HAVE_SYS_IOCTL_H) && !defined(__sun__)
+#if defined(HAVE_SYS_IOCTL_H) && !defined(__sun__) && !defined(__wasi__)
+  // WASI has a sys/ioctl.h (for type definitions) but no real ioctl() and no
+  // TIOCGWINSZ -- there's no tty to query. Fall through to the COLUMNS=0
+  // default below, same as any other platform lacking sys/ioctl.h.
   struct winsize ws;
   if (ioctl(FileID, TIOCGWINSZ, &ws) == 0)
     Columns = ws.ws_col;
