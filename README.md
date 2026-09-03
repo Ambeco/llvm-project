@@ -28,8 +28,16 @@ invocation.
   pretending to work. The build relies on `-DCLANG_SPAWN_CC1=ON` (see
   `build.bat`) so `Enable()` is never actually called by the driver.
 - `llvm/lib/Support/Unix/Program.inc`: real subprocess spawning
-  (`Execute`/`Wait`, i.e. `posix_spawn`) doesn't exist on WASI; both fail
-  loudly pending a JS-side Worker-based executor (see "JS Framework" below).
+  (`Execute`/`Wait`, i.e. `posix_spawn`) doesn't exist on WASI. `Execute()`
+  now serializes argv/env into wasm linear memory and calls out to a
+  JS-provided `env.__wasi_shim_spawn_sync(ptr, len) -> i32` import that runs
+  the child synchronously and returns its exit code; `Wait()` just returns
+  the result `Execute()` already stashed, since there's no separate
+  spawned-but-not-yet-waited-on state to model. I/O redirection, timeouts,
+  polling, and detached processes aren't supported yet -- those fail loudly
+  rather than being silently ignored. See `ai-notes/wasi_spawn_shim.mjs` for
+  a reference host (Node `worker_threads`) and "JS Framework" below for what
+  a real host is expected to provide instead.
 - `llvm/lib/Support/Unix/Signals.inc`: WASI can't install real signal
   handlers, so handler registration (crash backtraces, Ctrl-C, cleanup-on-
   signal) becomes a silent no-op -- nothing depends on it succeeding. The
@@ -90,12 +98,19 @@ provide functionality no WASI host does by default:
 
 - **Custom host-provided functions**, to unlock functionality currently
   stubbed out as a hard failure:
-  - A process-spawning primitive backing `llvm::sys::ExecuteAndWait`/`Wait`
-    (`Unix/Program.inc`) -- needed for `cc1` invocation (the build forces
-    `-DCLANG_SPAWN_CC1=ON`, so every `cc1` invocation goes through this path)
-    and for invoking an external assembler/linker if not fully integrated.
-    The natural implementation is spawning a second Worker running its own
-    wasm instance for the child "process."
+  - `env.__wasi_shim_spawn_sync(ptr, len) -> i32`: the process-spawning
+    primitive backing `llvm::sys::ExecuteAndWait`/`Wait` (`Unix/Program.inc`)
+    -- needed for `cc1` invocation (the build forces `-DCLANG_SPAWN_CC1=ON`,
+    so every `cc1` invocation goes through this path) and will be needed for
+    invoking `ld.lld` once linking is supported (see below). **Implemented**
+    as a proof of concept in `ai-notes/wasi_spawn_shim.mjs` +
+    `ai-notes/wasi_spawn_worker.mjs`, using Node `worker_threads` +
+    `Atomics.wait` to block the calling instance synchronously while a
+    second wasm instance (in its own Worker) runs the child to completion.
+    A real extension should follow the same shape with a browser Worker
+    instead: decode the wire format documented next to the import
+    declaration in `Unix/Program.inc`, run the child argv in a fresh Worker
+    + wasm instance, and resolve with its exit code.
   - (Lower priority) a Unix-domain-socket primitive backing
     `raw_socket_stream`/`ListeningSocket`, if some future feature needs it.
     Nothing in a normal compile currently does.
