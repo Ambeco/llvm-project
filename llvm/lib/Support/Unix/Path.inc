@@ -31,7 +31,13 @@
 #endif
 
 #include <dirent.h>
+#if !defined(__wasi__)
+// WASI has no user database at all (no pwd.h, no getuid()/getpwnam_r()/
+// getpwuid_r()) -- it's not a multi-user OS. Uses below are guarded
+// accordingly and fall back to the same "couldn't resolve" paths those
+// functions already have for a lookup failure.
 #include <pwd.h>
+#endif
 
 #ifdef __APPLE__
 #include <copyfile.h>
@@ -326,6 +332,12 @@ std::string getMainExecutable(const char *argv0, void *MainAddr) {
       return std::string(real_path);
     break; // Found entry, but realpath failed.
   }
+#elif defined(__wasi__)
+  // There is no on-disk executable path to report here: the running code
+  // *is* the wasm module the JS host loaded, not a file resident in some
+  // filesystem this instance can see (WASI's virtual filesystem is
+  // host-provided workspace content, not a place the module itself lives).
+  return "";
 #elif defined(HAVE_DLOPEN)
   // Use dladdr to get executable path if available.
   Dl_info DLInfo;
@@ -519,8 +531,11 @@ static bool is_local_impl(struct STATVFS &Vfs) {
 #elif defined(__Fuchsia__)
   // Fuchsia doesn't yet support remote filesystem mounts.
   return true;
-#elif defined(__EMSCRIPTEN__)
-  // Emscripten doesn't currently support remote filesystem mounts.
+#elif defined(__EMSCRIPTEN__) || defined(__wasi__)
+  // Emscripten doesn't currently support remote filesystem mounts, and
+  // there's no equivalent "remote mount" concept in WASI's model either --
+  // everything visible through it is host-provided (e.g. VS Code's
+  // workspace filesystem), not distinguished as local vs. remote.
   return true;
 #elif defined(__HAIKU__)
   // Haiku doesn't expose this information.
@@ -704,6 +719,14 @@ static void expandTildeExpr(SmallVectorImpl<char> &Path) {
 
   // This is a string of the form ~username/, look up this user's entry in the
   // password database.
+#if defined(__wasi__)
+  // No user database on WASI -- there's no other user's entry to find, so
+  // take the same "unable to look up" outcome a real lookup failure would
+  // have below. (struct passwd is only ever forward-declared here without
+  // <pwd.h>, so this can't share the member-accessing check below the way
+  // the real implementation does.)
+  return;
+#else
   std::unique_ptr<char[]> Buf;
   long BufSize = sysconf(_SC_GETPW_R_SIZE_MAX);
   if (BufSize <= 0)
@@ -723,6 +746,7 @@ static void expandTildeExpr(SmallVectorImpl<char> &Path) {
   Path.clear();
   Path.append(Entry->pw_dir, Entry->pw_dir + strlen(Entry->pw_dir));
   llvm::sys::path::append(Path, Storage);
+#endif // __wasi__
 }
 
 void expand_tilde(const Twine &path, SmallVectorImpl<char> &dest) {
@@ -803,11 +827,19 @@ std::error_code status(int FD, file_status &Result) {
 }
 
 unsigned getUmask() {
+#if defined(__wasi__)
+  // No umask(2) (or process-level permission model at all) on WASI. Callers
+  // use this to mask bits *out* of a requested permission set, so 0 (mask
+  // nothing out) is the honest answer: it leaves requested permissions
+  // untouched rather than fabricating a restriction that doesn't exist here.
+  return 0;
+#else
   // Chose arbitary new mask and reset the umask to the old mask.
   // umask(2) never fails so ignore the return of the second call.
   unsigned Mask = ::umask(0);
   (void)::umask(Mask);
   return Mask;
+#endif
 }
 
 std::error_code setPermissions(const Twine &Path, perms Permissions) {
@@ -922,7 +954,7 @@ void mapped_file_region::dontNeedImpl() {
   assert(Mode == mapped_file_region::readonly);
   if (!Mapping)
     return;
-#if defined(__MVS__) || defined(_AIX)
+#if defined(__MVS__) || defined(_AIX) || defined(__wasi__)
     // If we don't have madvise, or it isn't beneficial, treat this as a no-op.
 #elif defined(POSIX_MADV_DONTNEED)
   ::posix_madvise(Mapping, Size, POSIX_MADV_DONTNEED);
@@ -935,7 +967,7 @@ void mapped_file_region::willNeedImpl() {
   assert(Mode == mapped_file_region::readonly);
   if (!Mapping)
     return;
-#if defined(__MVS__) || defined(_AIX)
+#if defined(__MVS__) || defined(_AIX) || defined(__wasi__)
   // If we don't have madvise, or it isn't beneficial, treat this as a no-op.
 #elif defined(POSIX_MADV_WILLNEED)
   ::posix_madvise(Mapping, Size, POSIX_MADV_WILLNEED);
@@ -948,7 +980,7 @@ void mapped_file_region::randomAccessImpl() {
   assert(Mode == mapped_file_region::readonly);
   if (!Mapping)
     return;
-#if defined(__MVS__) || defined(_AIX)
+#if defined(__MVS__) || defined(_AIX) || defined(__wasi__)
   // If we don't have madvise, or it isn't beneficial, treat this as a no-op.
 #elif defined(POSIX_MADV_RANDOM)
   ::posix_madvise(Mapping, Size, POSIX_MADV_RANDOM);
@@ -1479,11 +1511,23 @@ std::error_code readlink(const Twine &path, SmallVectorImpl<char> &dest) {
 }
 
 std::error_code changeFileOwnership(int FD, uint32_t Owner, uint32_t Group) {
+#if defined(__wasi__)
+  // No fchown()/ownership model on WASI. This is reported as an ordinary
+  // failure through the existing error_code return -- exactly how a real
+  // fchown() already fails for an unprivileged caller on a real Unix system
+  // -- rather than silently claiming success for a change that can't
+  // actually happen.
+  (void)FD;
+  (void)Owner;
+  (void)Group;
+  return std::make_error_code(std::errc::not_supported);
+#else
   auto FChown = [&]() { return ::fchown(FD, Owner, Group); };
   // Retry if fchown call fails due to interruption.
   if ((sys::RetryAfterSignal(-1, FChown)) < 0)
     return errnoAsErrorCode();
   return std::error_code();
+#endif
 }
 
 } // end namespace fs
@@ -1493,6 +1537,10 @@ namespace path {
 bool home_directory(SmallVectorImpl<char> &result) {
   std::unique_ptr<char[]> Buf;
   char *RequestedDir = getenv("HOME");
+#if !defined(__wasi__)
+  // No getuid()/getpwuid_r() on WASI -- if $HOME isn't set, there's no user
+  // database to fall back to, so just take the existing "couldn't determine
+  // it" path below (same as if this lookup had failed to find an entry).
   if (!RequestedDir) {
     long BufSize = sysconf(_SC_GETPW_R_SIZE_MAX);
     if (BufSize <= 0)
@@ -1504,6 +1552,7 @@ bool home_directory(SmallVectorImpl<char> &result) {
     if (pw && pw->pw_dir)
       RequestedDir = pw->pw_dir;
   }
+#endif
   if (!RequestedDir)
     return false;
 
