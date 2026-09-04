@@ -1,12 +1,13 @@
 # WIP: getting `clang` (the driver) to build for wasm32-wasip1
 
-**STATUS as of 2026-09-03: `clang.wasm` builds, links, runs, AND compiles
-real C source through a real spawned `cc1` subprocess.**
-`ai-notes/run_clang_compile_smoketest.mjs` compiles a `#include <stdio.h>`
-"Hello, world!" translation unit to a real 675-byte `.o` file, exercising
-the actual driver → spawn-cc1 → parse/codegen → object-file-write path end
-to end. This was the milestone this file was tracking — read on for how it
-was reached, then see "Next milestone" for what's left (linking).
+**STATUS as of 2026-09-03: full compile-and-link "Hello World" works
+end to end.** `ai-notes/run_clang_link_smoketest.mjs` compiles a
+`#include <stdio.h>` "Hello, world!" translation unit, links it with a
+real spawned `wasm-ld` into a genuine `hello.wasm`, then actually *runs*
+that binary and gets the correct output. This was the milestone this file
+was tracking — read on for how it was reached, then see "Next milestone"
+for what's actually left (a real browser-based JS host, not this Node
+reference implementation).
 
 Read `AGENTS.md` first for the general approach.
 
@@ -16,14 +17,26 @@ Git history is split into two branches (see `git log --oneline --graph
 upstream-fixes wasm-wasi`), both rebuilt with `Assisted-by:` trailers per
 llvm-project's AI-contribution policy (not `Co-Authored-By:` — that's a
 deliberate exception to this session's usual default, specific to this
-repo):
-- `upstream-fixes`: small, defensible platform-support fallbacks, clean
-  enough to plausibly PR upstream on their own.
-- `wasm-wasi` (based on `upstream-fixes`): the opinionated "fail loudly on
-  gaps we can't fill" commit, the README/ai-notes documentation commit, and
-  now the spawn-shim work below.
+repo). **Be conservative about what actually gets proposed upstream** —
+`upstream-fixes` is scoped to changes defensible on their own terms (an
+outright bug, or a mechanical extension of a pattern the codebase already
+uses for a comparable degraded platform); everything that asserts a
+project-specific policy (loud-failure-on-missing-functionality, and now
+also `LockFileManager`'s conservative fallback, moved there on reflection)
+lives on `wasm-wasi` instead. See README.md's "Changes" section, which
+explains this split in more detail and lists every commit in each bucket.
+Re-litigate the placement of any individual commit if it looks wrong on a
+fresh read — the split was reconsidered and rebuilt once already this
+session after a first pass put a policy-choice commit in the wrong branch.
+
 Nothing has been pushed to the `fork` remote (`github.com/Ambeco/llvm-project`)
-or opened as a PR yet — hold off until asked.
+since the last rewrite, or opened as a PR — hold off until asked. (An
+earlier version of these two branches *was* pushed to `fork`; since then
+the history was rewritten — `LockFileManager` moved branches, and the
+`--wasm` build fixes / lld-linking commits were added — so a plain
+`git push` will be rejected as non-fast-forward. A force-push to `fork`
+is expected and fine; just don't force-push anything that could touch
+`origin` (`llvm/llvm-project`), which nothing here does.)
 
 To reproduce or extend the build, just run `build.bat` from the repo root —
 it's fully in sync with the working configuration. It's an incremental
@@ -34,16 +47,71 @@ build; don't `rm -rf build` unless a `CMakeCache.txt` entry looks stale (see
 - `build/bin/clang.wasm --version` under `node:wasi`
   (`ai-notes/run_clang_smoketest.mjs`) — driver logic runs end-to-end,
   correct output. Doesn't invoke `cc1`.
-- `node --experimental-wasi-unstable-preview1
-  ai-notes/run_clang_compile_smoketest.mjs` — real `-c hello.c -o hello.o`
-  compile, spawning a real `cc1` child via the new
+- `ai-notes/run_clang_compile_smoketest.mjs` — real `-c hello.c -o hello.o`
+  compile, spawning a real `cc1` child via the
   `env.__wasi_shim_spawn_sync` import (`ai-notes/wasi_spawn_shim.mjs` +
   `ai-notes/wasi_spawn_worker.mjs`, Node `worker_threads` + `Atomics.wait`).
   **PASSED.**
+- `ai-notes/run_clang_link_smoketest.mjs` — the same, minus `-c`: compiles,
+  spawns a genuinely different wasm binary (`wasm-ld`, not `clang.wasm`)
+  for the link step, produces a real linked `hello.wasm`, then runs it and
+  checks the output. **PASSED.**
 
-**Still missing: linking.** `LLVM_ENABLE_PROJECTS` is `clang;compiler-rt`
-only — no `lld` in this build, so there's no linker for `clang.wasm` to
-invoke yet. See "Next milestone".
+(All three: `node --experimental-wasi-unstable-preview1
+ai-notes/<script>.mjs`.)
+
+### Getting lld/linking working (three build.bat additions, in order hit)
+
+1. `LLVM_ENABLE_PROJECTS="clang;compiler-rt;lld"` and build target `lld` —
+   built clean, **zero WASI-specific patches needed**. `bin/lld.wasm` (well,
+   the multi-personality copies `ld.lld`/`wasm-ld`/etc. — see the `.wasm`
+   suffix note below) just worked.
+2. `wasm-ld` needs `libclang_rt.builtins.a` for the target, which wasn't
+   being built at all (`Builtin supported architectures:` came back empty
+   in the cmake configure log). Root cause:
+   `COMPILER_RT_DEFAULT_TARGET_ONLY` was `OFF`, so compiler-rt ran its
+   generic multi-arch detection, which force-overrides the test-compile
+   target to `wasm32-unknown-unknown` (ignoring our actual sysroot/target) —
+   that test-compile silently fails, leaving the arch list empty. Fixed by
+   setting `COMPILER_RT_DEFAULT_TARGET_ONLY=ON`, which also requires
+   `CMAKE_C_COMPILER_TARGET`/`CMAKE_CXX_COMPILER_TARGET` to be set
+   explicitly (harmless — matches what wasi-sdk's `clang.cfg` already
+   defaults to). Needed an explicit build of the `clang_rt.builtins-wasm32`
+   target too — it's not part of the default `clang`/`lld` targets.
+3. Even once built, the builtins archive landed at
+   `lib/clang/23/lib/generic/libclang_rt.builtins-wasm32.a` — the *old*
+   flat/arch-suffixed layout. Clang's driver (for this target) looks for
+   the newer per-target-triple layout instead
+   (`lib/clang/23/lib/wasm32-unknown-wasip1/libclang_rt.builtins.a`). Fixed
+   with `LLVM_ENABLE_PER_TARGET_RUNTIME_DIR=ON`.
+
+### `.wasm` extension note
+
+`CMAKE_EXECUTABLE_SUFFIX=.wasm` alone doesn't stick — LLVM's CMake resets
+it per-language from `CMAKE_EXECUTABLE_SUFFIX_C`/`_CXX` (populated by
+compiler-ABI detection) after cache load. Set
+`CMAKE_EXECUTABLE_SUFFIX_CXX=.wasm` (all our targets are C++) instead.
+Multi-personality tool copies (`clang++`/`clang-cl`/`clang-cpp` alongside
+`clang.wasm`; `ld.lld`/`wasm-ld`/`lld-link`/`ld64.lld` alongside `lld.wasm`)
+are generated via a raw filename string in each project's own CMake code,
+not through this suffix machinery, so they come out *without* the
+`.wasm` suffix — harmless, just don't be surprised by it.
+
+### Guest-path resolution in the spawn shim (needed for a *different* spawned binary)
+
+The Node reference host (`ai-notes/wasi_spawn_shim.mjs`) originally always
+re-instantiated the *parent's own* wasm module for every spawn request.
+That happened to be correct for `cc1` (it lives inside `clang.wasm` itself;
+`argv[0]` comes through as `""`, since `getMainExecutable()` returns `""`
+on WASI), but wrong for `wasm-ld`, a genuinely separate binary. Fixed via
+`resolveGuestPath()`: resolve `argv[0]` against the same preopen map the
+calling instance uses (longest-prefix match), and load *that* file for the
+child if it resolves, falling back to the parent's own module otherwise.
+Also needed two new preopens in the link smoke test: `/bin` (so
+`Driver::GetProgramPath()`'s `PATH` search can actually find `wasm-ld` —
+see `Path.inc`, `getMainExecutable()` can't help here) and `/tmp` +
+`TMPDIR` (the driver writes the intermediate `.o` to a temp file before
+invoking the linker on it).
 
 ## The path here (don't redo this investigation)
 
@@ -148,27 +216,36 @@ dir — that's needlessly slow) and do a full fresh `cmake` configure.
   as before (see README) — `CLANG_SPAWN_CC1=ON` means `Enable()` is never
   actually called by the driver, so this is dead code in practice.
 
-## Next milestone: linking
+## Next milestone: a real browser-based JS host
 
-`clang.wasm` can compile a `.c` file to a real `.o` file (see STATUS at
-top), but `LLVM_ENABLE_PROJECTS` doesn't include `lld`, so there's no
-linker binary for it to invoke — `clang -o hello hello.c` (full compile+
-link) would fail looking for `wasm-ld`/`ld.lld` on `PATH`. This was
-discovered, not yet fixed. To actually produce a linked, runnable wasm
-binary:
-1. Add `lld` to `LLVM_ENABLE_PROJECTS` in `build.bat` and rebuild (another
-   full native+wasm CMake pass — budget disk/time for it; unclear yet
-   whether lld needs any of its own wasi-specific patches, same
-   investigate-before-assuming approach as everything above).
-2. The same `env.__wasi_shim_spawn_sync` plumbing built for `cc1` should, in
-   principle, already cover invoking `ld.lld` too (it's just another
-   argv/env spawn) — but this is untested and worth verifying explicitly
-   once lld exists, rather than assuming it "just works."
-3. Extend `ai-notes/run_clang_compile_smoketest.mjs` (or add a sibling
-   script) to drop `-c` and actually produce + run a linked `hello.wasm`,
-   the true "compile and link Hello World" proof.
+Compile-and-link "Hello World" works end to end (see STATUS at top) —
+linking turned out to need zero source patches, only three `build.bat`
+additions (see "Getting lld/linking working" above). What's left is
+entirely on the JS side, and moves outside this repo:
 
-## Further out: the real JS-side executor / VS Code for Web extension
+- **Two upstream projects to actually read before building more here** —
+  the user found these mid-session and hasn't finished reviewing them yet;
+  they may already have solved some or all of what's below. Check for
+  updates/pasted notes before assuming any of this needs building from
+  scratch:
+  - <https://discourse.llvm.org/t/rfc-building-llvm-for-webassembly/79073>
+  - <https://yowasp.org/>
+- The Node scripts in `ai-notes/` are a reference implementation proving
+  the *contract* works (see README's "JS Framework" section), not the real
+  thing. A real browser-based host needs to do differently: a real Worker
+  instead of `worker_threads`, catching a *terminated* Worker and
+  rendering its own call stack (no in-wasm backtrace is possible — see
+  README), and the hosting JS (not the Worker) being responsible for
+  invoking cleanup (`RunInterruptHandlers()`/`CleanupOnSignal()`) when it
+  terminates a Worker.
+- Likely its own repo (the VS Code for Web extension), not a branch here —
+  see the "yes please" branch-structure discussion this session for why
+  this repo stays scoped to the toolchain patches.
+- `clangd` was raised as a likely-harder future problem (persistent
+  background indexing threads, not a one-shot spawn-and-wait like `cc1`) —
+  not attempted, not even building yet (`clang-tools-extra` is disabled in
+  `LLVM_ENABLE_PROJECTS`). Worth its own investigation pass later, not
+  bolted onto this milestone.
 
 The Node scripts in `ai-notes/` are a reference implementation proving the
 *contract* works, not the real thing — see README's "JS Framework" section

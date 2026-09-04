@@ -128,16 +128,21 @@ provide functionality no WASI host does by default:
   - `env.__wasi_shim_spawn_sync(ptr, len) -> i32`: the process-spawning
     primitive backing `llvm::sys::ExecuteAndWait`/`Wait` (`Unix/Program.inc`)
     -- needed for `cc1` invocation (the build forces `-DCLANG_SPAWN_CC1=ON`,
-    so every `cc1` invocation goes through this path) and will be needed for
-    invoking `ld.lld` once linking is supported (see below). **Implemented**
-    as a proof of concept in `ai-notes/wasi_spawn_shim.mjs` +
-    `ai-notes/wasi_spawn_worker.mjs`, using Node `worker_threads` +
-    `Atomics.wait` to block the calling instance synchronously while a
-    second wasm instance (in its own Worker) runs the child to completion.
-    A real extension should follow the same shape with a browser Worker
-    instead: decode the wire format documented next to the import
-    declaration in `Unix/Program.inc`, run the child argv in a fresh Worker
-    + wasm instance, and resolve with its exit code.
+    so every `cc1` invocation goes through this path) and for invoking
+    `wasm-ld` for linking. **Implemented** as a proof of concept in
+    `ai-notes/wasi_spawn_shim.mjs` + `ai-notes/wasi_spawn_worker.mjs`, using
+    Node `worker_threads` + `Atomics.wait` to block the calling instance
+    synchronously while a second wasm instance (in its own Worker) runs the
+    child to completion -- resolving, per spawn request, to either the
+    *same* wasm module (`cc1`, which lives inside `clang.wasm` itself) or a
+    genuinely different one (`wasm-ld`), by resolving `argv[0]` against the
+    preopen map (see `resolveGuestPath()` in the shim). Verified end to end
+    by `ai-notes/run_clang_link_smoketest.mjs`: compiles, links, and *runs*
+    a real "Hello, world!" through this exact path. A real extension should
+    follow the same shape with a browser Worker instead: decode the wire
+    format documented next to the import declaration in `Unix/Program.inc`,
+    resolve which binary to load, run the child argv in a fresh Worker +
+    wasm instance, and resolve with its exit code.
   - (Lower priority) a Unix-domain-socket primitive backing
     `raw_socket_stream`/`ListeningSocket`, if some future feature needs it.
     Nothing in a normal compile currently does.
