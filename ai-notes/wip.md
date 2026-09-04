@@ -13,30 +13,60 @@ Read `AGENTS.md` first for the general approach.
 
 ## Current state
 
-Git history is split into two branches (see `git log --oneline --graph
-upstream-fixes wasm-wasi`), both rebuilt with `Assisted-by:` trailers per
-llvm-project's AI-contribution policy (not `Co-Authored-By:` — that's a
-deliberate exception to this session's usual default, specific to this
-repo). **Be conservative about what actually gets proposed upstream** —
-`upstream-fixes` is scoped to changes defensible on their own terms (an
-outright bug, or a mechanical extension of a pattern the codebase already
-uses for a comparable degraded platform); everything that asserts a
-project-specific policy (loud-failure-on-missing-functionality, and now
-also `LockFileManager`'s conservative fallback, moved there on reflection)
-lives on `wasm-wasi` instead. See README.md's "Changes" section, which
-explains this split in more detail and lists every commit in each bucket.
-Re-litigate the placement of any individual commit if it looks wrong on a
-fresh read — the split was reconsidered and rebuilt once already this
-session after a first pass put a policy-choice commit in the wrong branch.
+Git history is split into **three** branches, all rebuilt with
+`Assisted-by:` trailers per llvm-project's AI-contribution policy (not
+`Co-Authored-By:` — a deliberate exception to this session's usual
+default, specific to this repo):
 
-Nothing has been pushed to the `fork` remote (`github.com/Ambeco/llvm-project`)
-since the last rewrite, or opened as a PR — hold off until asked. (An
-earlier version of these two branches *was* pushed to `fork`; since then
-the history was rewritten — `LockFileManager` moved branches, and the
-`--wasm` build fixes / lld-linking commits were added — so a plain
-`git push` will be rejected as non-fast-forward. A force-push to `fork`
-is expected and fine; just don't force-push anything that could touch
-`origin` (`llvm/llvm-project`), which nothing here does.)
+- **`fix-webasm`** — based directly on `llvm-project`'s real, current
+  `main` (fetched shallow: `git fetch --depth=1 origin main`, then
+  `git branch -f fix-webasm FETCH_HEAD`). The actual PR-ready candidate:
+  6 commits, cherry-picked from `upstream-fixes` (see below) with the same
+  hashes' patches re-applied onto `main`. One commit dropped entirely --
+  the `__WASM__`-typo fix -- because `main` *already has the correct
+  `__wasm__` spelling*; that bug was independently fixed upstream at some
+  point after our `release/23.x` base was cut. Carries none of this fork's
+  own `README.md`/`ai-notes/` changes (none of the 6 commits touch them),
+  which is correct: a real PR shouldn't carry fork-specific docs. **Check
+  which of the remaining 6 commits, if any, get superseded the same way on
+  your next rebase** -- don't assume the list is final.
+- **`upstream-fixes`** — the original, based on this repo's actual
+  `release/23.x` snapshot (`ea7d852a7`, "Bump version to 23.1.0" -- NOT
+  `main`; see the "292 commits ahead" GitHub-compare confusion earlier
+  this session for why that distinction matters). Still 7 commits,
+  including the now-upstream-redundant typo fix -- kept as-is because
+  *our own local build* (`build.bat`, `wasm-wasi`) is based on this same
+  snapshot, and this typo genuinely still needs fixing there. Don't drop
+  it here; `fix-webasm` is the only branch where it's actually redundant.
+- **`wasm-wasi`** (based on `upstream-fixes`, NOT `fix-webasm`) — the
+  project-specific branch: everything that asserts an opinionated policy
+  (loud-failure-on-missing-functionality, `LockFileManager`'s conservative
+  fallback) plus all the README/ai-notes documentation and the actual
+  spawn-shim/JS-host reference implementation. This is what `build.bat`
+  and the smoke tests actually run against.
+
+**Be conservative about what actually gets proposed upstream** — see
+README.md's "Changes" section for the detailed criterion (mechanical
+platform-support extension vs. project-specific policy choice) and the
+per-commit bucketing. Re-litigate the placement of any individual commit
+if it looks wrong on a fresh read — the split was reconsidered and rebuilt
+once already this session after a first pass put a policy-choice commit
+(`LockFileManager`) in the wrong branch.
+
+**Before opening any actual PR from `fix-webasm`**, diff/compare against
+[llvm/llvm-project#92677](https://github.com/llvm/llvm-project/pull/92677)
+(open, unmerged, doing very similar work across almost the same files) —
+see "Prior art" below for why it stalled and why our narrower scope
+(no threading/`std::mutex` changes at all) sidesteps its actual blocker.
+
+All three branches have been pushed to the `fork` remote
+(`github.com/Ambeco/llvm-project`) as of the last update to this file.
+No PR has been opened anywhere yet — hold off until asked. `fix-webasm`
+in particular has never been pushed before its first push (no force needed
+there); `upstream-fixes`/`wasm-wasi` have been force-pushed at least once
+after a history rewrite earlier this session -- if you rewrite them again,
+expect to need `--force` again (fine for `fork`; never touch `origin`,
+`llvm/llvm-project`, with anything but a normal PR branch push).
 
 To reproduce or extend the build, just run `build.bat` from the repo root —
 it's fully in sync with the working configuration. It's an incremental
@@ -245,6 +275,20 @@ entirely on the JS side, and moves outside this repo:
     attempt, [#91051](https://github.com/llvm/llvm-project/pull/91051), was
     closed by its own author in favor of #92677 — worth knowing the RFC
     thread's history so we don't repeat an already-abandoned approach.
+    **Why it actually stalled** (read 2026-09-03, useful context for
+    `fix-webasm`): not a rejection -- two real blockers. (1) `std::mutex`
+    wasn't available at all on the single-threaded `wasm32-wasip1` target
+    until `wasi-sdk` added it in ~July 2025; the PR tried to conditionalize
+    every use, which the author called infeasible. (2) Reviewer `jyknight`
+    wanted a dedicated `lib/Support/WASI/*.inc` directory instead of inline
+    `#if defined(__wasi__)` in the existing `Unix/*.inc` files (which is
+    what we did, and where the PR ultimately landed anyway after debate)
+    -- no consensus reached, plus low maintainer bandwidth to keep pushing
+    it through. **This is exactly why `fix-webasm` should stay narrow**:
+    we never touch threading/`std::mutex` at all (`LLVM_ENABLE_THREADS=OFF`
+    sidesteps it entirely), so we don't hit #92677's actual blocker. Frame
+    any PR from `fix-webasm` explicitly as smaller/narrower than #92677,
+    link to it for context, and don't try to solve what stalled it.
   - **Real validation of our build.bat flags**: YoWASP's actual production
     `build.sh` (<https://codeberg.org/YoWASP/clang>, `develop` branch) uses
     `-DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON` and
