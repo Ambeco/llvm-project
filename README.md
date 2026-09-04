@@ -16,12 +16,67 @@ invocation.
 
 ### Changes
 
+History is split across two branches, on the theory that upstream LLVM
+should only ever be asked to take the first kind of change below:
+
+- **`upstream-fixes`**: changes defensible on their own terms, independent
+  of this fork's goals -- an outright bug (wrong on every platform, not just
+  WASI), or a platform-support fallback that mechanically extends a pattern
+  the codebase already uses elsewhere for a comparable degraded platform
+  (AIX, Haiku, Emscripten, etc.), inventing no new policy.
+- **`wasm-wasi`** (based on `upstream-fixes`): everything above, plus
+  changes that assert a stance specific to this project -- most notably,
+  "when we can't implement something, fail loudly instead of guessing" for
+  the gaps nothing else in LLVM has ever had to paper over (WASI has no
+  process model and no signal delivery at all, not just a smaller one).
+
+#### `upstream-fixes`
+
+- `llvm/include/llvm/Support/Compiler.h` and
+  `clang/include/clang/Support/Compiler.h`: a pre-existing upstream typo,
+  unrelated to WASI specifically -- both checked the never-defined
+  `__WASM__` instead of the real predefined macro `__wasm__`, silently
+  leaving `LLVM_TEMPLATE_ABI`/`CLANG_TEMPLATE_ABI` undefined for any wasm
+  target and producing bizarre "explicit instantiation ... does not refer
+  to a template" errors. (The one outright bug in this list -- wrong
+  regardless of WASI.)
 - `llvm/include/llvm/ADT/bit.h`: recognize `__wasi__` as a platform with a
   usable `<endian.h>` (wasi-libc has one; it just wasn't in the OS list).
 - `llvm/cmake/modules/HandleLLVMOptions.cmake`: treat the wasm32-wasi target
   as Unix-like (`LLVM_ON_UNIX=1`) so LLVMSupport's `Unix/*.inc` platform
   implementations get compiled at all, instead of neither the Unix nor the
-  Windows ones.
+  Windows ones. Mirrors the existing precedent for Emscripten (POSIX-ish
+  libc, not a real Unix kernel), which already gets `LLVM_ON_UNIX=1` via
+  CMake's own `UNIX` variable; WASI just doesn't trip that variable the way
+  Emscripten's toolchain does.
+- `llvm/lib/Support/Unix/Unix.h`: guard the `<sys/wait.h>` include, which
+  doesn't exist on WASI.
+- `llvm/lib/Support/ProgramStack.cpp`: no `RLIMIT_STACK`; falls back to the
+  same fixed 8MiB default already used on non-Unix platforms.
+- `clang/tools/driver/cc1_main.cpp`: same `RLIMIT_STACK` gap as
+  `ProgramStack.cpp` above, reached via `CLANG_HAVE_RLIMITS` (a
+  `check_include_file(sys/resource.h)` check that only confirms the header
+  exists, not that its rlimit content is usable on WASI). The file already
+  had an empty-stub fallback for platforms without rlimits; WASI now takes
+  that path too.
+- `llvm/lib/Support/Unix/Process.inc`: no core dumps to prevent (already
+  true), no `TIOCGWINSZ` (terminal width falls back to 0/`$COLUMNS`), no
+  signal masking needed around closing a file descriptor (there are no
+  signals to mask).
+- `llvm/lib/Support/Unix/Path.inc`: no user database (tilde-username
+  expansion and the `getpwuid_r` home-directory fallback fail gracefully,
+  same as an ordinary lookup failure), no `posix_madvise` (no-op, same as
+  other platforms without madvise), no `umask`/real `fchown`, no on-disk
+  path for the running executable (`getMainExecutable` returns `""`).
+
+#### `wasm-wasi` (additionally)
+
+- `llvm/lib/Support/LockFileManager.cpp`: no `getsid()` to check whether a
+  lock's owning process is still alive, and no real multi-process contention
+  to detect in the first place on this target (each build runs in its own
+  isolated module instance). Conservatively assume the lock is held -- a
+  judgment call about missing functionality, same category as the
+  loud-failure changes below, just landed on a quiet default instead.
 - `llvm/lib/Support/CrashRecoveryContext.cpp`: WASI has no signal delivery
   and no working `setjmp`/`longjmp`, so real crash recovery is impossible in
   a single module instance; `Enable()` now fails loudly instead of silently
@@ -44,39 +99,11 @@ invocation.
   underlying cleanup machinery (`RemoveFileOnSignal`, `RunInterruptHandlers`,
   `CleanupOnSignal`) stays fully functional and exported, for a JS host to
   call directly instead of relying on a signal to trigger it.
-- `llvm/lib/Support/Unix/Process.inc`: no core dumps to prevent (already
-  true), no `TIOCGWINSZ` (terminal width falls back to 0/`$COLUMNS`), no
-  signal masking needed around closing a file descriptor (there are no
-  signals to mask).
-- `llvm/lib/Support/Unix/Path.inc`: no user database (tilde-username
-  expansion and the `getpwuid_r` home-directory fallback fail gracefully,
-  same as an ordinary lookup failure), no `posix_madvise` (no-op, same as
-  other platforms without madvise), no `umask`/real `fchown`, no on-disk
-  path for the running executable (`getMainExecutable` returns `""`).
 - `llvm/lib/Support/Unix/Watchdog.inc`: no `alarm()`/signals, so the
   watchdog timer is a no-op; real timeout enforcement is expected to happen
   by the JS host terminating the Worker (see below).
-- `llvm/lib/Support/Unix/Unix.h`: guard the `<sys/wait.h>` include, which
-  doesn't exist on WASI.
-- `llvm/lib/Support/LockFileManager.cpp`: no `getsid()` to check whether a
-  lock's owning process is still alive; conservatively assume it is.
-- `llvm/lib/Support/ProgramStack.cpp`: no `RLIMIT_STACK`; falls back to the
-  same fixed 8MiB default already used on non-Unix platforms.
 - `llvm/lib/Support/raw_socket_stream.cpp`: no BSD sockets API on WASI;
   socket operations fail loudly rather than silently.
-- `clang/tools/driver/cc1_main.cpp`: same `RLIMIT_STACK` gap as
-  `ProgramStack.cpp` above, reached via `CLANG_HAVE_RLIMITS` (a
-  `check_include_file(sys/resource.h)` check that only confirms the header
-  exists, not that its rlimit content is usable on WASI). The file already
-  had an empty-stub fallback for platforms without rlimits; WASI now takes
-  that path too.
-- `llvm/include/llvm/Support/Compiler.h` and
-  `clang/include/clang/Support/Compiler.h`: a pre-existing upstream typo,
-  unrelated to WASI specifically -- both checked the never-defined
-  `__WASM__` instead of the real predefined macro `__wasm__`, silently
-  leaving `LLVM_TEMPLATE_ABI`/`CLANG_TEMPLATE_ABI` undefined for any wasm
-  target and producing bizarre "explicit instantiation ... does not refer
-  to a template" errors.
 
 ### Build note: link libraries
 
