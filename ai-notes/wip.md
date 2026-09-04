@@ -223,13 +223,60 @@ linking turned out to need zero source patches, only three `build.bat`
 additions (see "Getting lld/linking working" above). What's left is
 entirely on the JS side, and moves outside this repo:
 
-- **Two upstream projects to actually read before building more here** —
-  the user found these mid-session and hasn't finished reviewing them yet;
-  they may already have solved some or all of what's below. Check for
-  updates/pasted notes before assuming any of this needs building from
-  scratch:
-  - <https://discourse.llvm.org/t/rfc-building-llvm-for-webassembly/79073>
-  - <https://yowasp.org/>
+- **Prior art, read 2026-09-03** (the user found these; both fetched and
+  reviewed this session):
+  - <https://discourse.llvm.org/t/rfc-building-llvm-for-webassembly/79073> —
+    an RFC from 2024-05-19 proposing the same overall goal (LLVM for
+    WASI/WASIp1+p2, not Emscripten).
+  - <https://yowasp.org/> — a project that's actually shipping this: builds
+    of `clang`/`lld`/etc. to `wasm32-wasip1`, distributed as npm packages,
+    with a real JS runtime (`@yowasp/runtime` /
+    <https://codeberg.org/YoWASP/runtime-js>) driving them.
+  - **Before opening any upstream PR, diff against
+    [llvm/llvm-project#92677](https://github.com/llvm/llvm-project/pull/92677)**,
+    "Conditionalize use of POSIX features missing on WASI/WebAssembly" —
+    still open/unmerged as of this check, and it patches nearly the exact
+    same file list `upstream-fixes` does: `CrashRecoveryContext.cpp`,
+    `LockFileManager.cpp`, `Path.inc`, `Process.inc`, `Unix.h`,
+    `Watchdog.inc`, `raw_socket_stream.cpp` (using `defined(__wasi__)`
+    directly, same as us, after reviewers pushed back on a
+    CMake-feature-detection-only approach). Opening a competing PR without
+    checking this first would waste a maintainer's time. Its sibling
+    attempt, [#91051](https://github.com/llvm/llvm-project/pull/91051), was
+    closed by its own author in favor of #92677 — worth knowing the RFC
+    thread's history so we don't repeat an already-abandoned approach.
+  - **Real validation of our build.bat flags**: YoWASP's actual production
+    `build.sh` (<https://codeberg.org/YoWASP/clang>, `develop` branch) uses
+    `-DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON` and
+    `-DLLVM_ENABLE_PER_TARGET_RUNTIME_DIR=ON` -- the exact two flags we
+    independently reverse-engineered to get `lld`/linking working (see
+    "Getting lld/linking working" above) -- plus `-DLLVM_ENABLE_THREADS=OFF`
+    and `-DLLVM_ENABLE_PIC=OFF`, matching ours. Good sign these are the
+    real answers, not idiosyncratic hacks. They pin `wasi-sdk` 32 (we're on
+    34) and pass an unusual `-mcpu=lime1` to their WASI_CFLAGS -- purpose
+    unclear, not investigated, probably not relevant to us.
+  - **Do NOT rely on `-fintegrated-lld`**: the RFC's step 4 proposes adding
+    this driver flag to let clang invoke `cc1`/`lld` in-process instead of
+    spawning -- checked, and it does **not exist** anywhere in our current
+    tree (grepped `Options.td` and friends, zero hits). It's the RFC
+    author's own proposed-but-unimplemented idea, not real upstream
+    functionality as of this LLVM version. Our
+    `env.__wasi_shim_spawn_sync`-based spawn shim is the working approach;
+    don't design future work around `-fintegrated-lld` showing up.
+  - **A possibly-simpler alternative architecture, not investigated
+    further**: YoWASP's JS runtime API is one `runX(filesIn) -> filesOut`
+    call per *tool* (so a separate call for `clang -c` and for `wasm-ld`,
+    driven by the host), and the RFC links
+    [D109977, "LLVM Driver Multicall tool"](https://reviews.llvm.org/D109977)
+    -- suggesting YoWASP may sidestep the whole subprocess-spawn problem by
+    having the *host* directly instantiate each tool (`cc1`, `wasm-ld`) as
+    its own separate wasm module invocation via a multicall binary, rather
+    than clang.wasm's driver spawning children internally the way our shim
+    does. Couldn't confirm this from their docs alone (the actual spawn/
+    threading logic lives in `runtime-js`'s `lib/` source, not fetched this
+    session) -- worth a closer read later, but not urgent: our
+    spawn-shim approach already works end-to-end (compile *and* link, see
+    STATUS at top), so this would be a simplification, not a blocker.
 - The Node scripts in `ai-notes/` are a reference implementation proving
   the *contract* works (see README's "JS Framework" section), not the real
   thing. A real browser-based host needs to do differently: a real Worker
