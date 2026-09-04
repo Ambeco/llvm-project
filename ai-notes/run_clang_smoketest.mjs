@@ -35,6 +35,11 @@ const bytes = await readFile(wasmPath);
 console.error(`Loaded ${bytes.length} bytes, compiling...`);
 const wasmModule = await WebAssembly.compile(bytes);
 console.error('Compiled. Instantiating...');
+// No custom imports needed -- clang.wasm is self-contained by default (see
+// Unix/Program.inc): spawning a subprocess without a JS host installing a
+// hook post-instantiation just fails loudly (report_fatal_error) when
+// actually attempted, same as the second usage example below. Nothing is
+// *required* at instantiation time, unlike an import-based design.
 const instance = await WebAssembly.instantiate(wasmModule, wasi.getImportObject());
 console.error('Instantiated. Starting...');
 try {

@@ -1,19 +1,17 @@
 // Proves clang.wasm can actually *compile* a real translation unit, not
 // just run its driver (see run_clang_smoketest.mjs for that narrower
-// check). This exercises the real spawn path: the driver instance (this
-// script's own WASI instance) invokes cc1 by calling out to
-// wasi_spawn_shim.mjs's __wasi_shim_spawn_sync import, which runs cc1 in a
-// worker_threads Worker (wasi_spawn_worker.mjs) and blocks until it exits --
-// see llvm/lib/Support/Unix/Program.inc for the wasm-side half of this.
+// check). This exercises the real spawn path: right after instantiating
+// the driver instance, installs a real spawn hook via
+// wasi_spawn_shim.mjs's installSpawnHook() (see Unix/Program.inc and that
+// file for the mechanism), so the driver's cc1 invocation runs for real in
+// a worker_threads Worker (wasi_spawn_worker.mjs) and blocks until it
+// exits.
 //
-// Deliberately scoped to compile only (`-c`, no link): this repo's build
-// doesn't include lld yet (LLVM_ENABLE_PROJECTS is `clang;compiler-rt`),
-// so there's no linker for clang.wasm to invoke. Producing a linked
-// executable is a separate, later milestone once lld is added to the build
-// and the same spawn plumbing is verified to cover invoking it too.
+// Deliberately scoped to compile only (`-c`, no link) -- see
+// run_clang_link_smoketest.mjs for the full compile+link+run version.
 //
 // Usage:
-//   node --experimental-wasi-unstable-preview1 ai-notes/run_clang_compile_smoketest.mjs [path-to-clang-wasm] [path-to-wasi-sysroot]
+//   node --experimental-wasm-type-reflection --experimental-wasi-unstable-preview1 ai-notes/run_clang_compile_smoketest.mjs [path-to-clang-wasm] [path-to-wasi-sysroot]
 //
 // Defaults assume this is run from the repo root against the build.bat
 // layout: build/bin/clang.wasm, and the wasi-sdk install location recorded in
@@ -23,7 +21,7 @@ import { WASI } from 'node:wasi';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { argv as processArgv } from 'node:process';
-import { makeSpawnSyncImport, findResourceDir } from './wasi_spawn_shim.mjs';
+import { installSpawnHook, findResourceDir } from './wasi_spawn_shim.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
 const wasmPath = processArgv[2] ?? path.join(repoRoot, 'build', 'bin', 'clang.wasm');
@@ -69,15 +67,9 @@ const bytes = await readFile(wasmPath);
 console.error(`Loaded ${bytes.length} bytes, compiling wasm module...`);
 const wasmModule = await WebAssembly.compile(bytes);
 
-const memoryRef = {};
-const importObject = wasi.getImportObject();
-importObject.env = {
-  __wasi_shim_spawn_sync: makeSpawnSyncImport({ memoryRef, wasmPath, preopens }),
-};
-
 console.error('Instantiating driver instance...');
-const instance = await WebAssembly.instantiate(wasmModule, importObject);
-memoryRef.current = instance.exports.memory;
+const instance = await WebAssembly.instantiate(wasmModule, wasi.getImportObject());
+installSpawnHook(instance, { wasmPath, preopens });
 
 console.error(`Running: ${clangArgs.join(' ')}`);
 let driverExit = 0;

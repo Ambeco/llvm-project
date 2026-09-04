@@ -1,19 +1,19 @@
 // Proves clang.wasm can compile *and link* a real translation unit into a
 // runnable wasm binary -- the actual "Hello World" milestone. Builds on
-// run_clang_compile_smoketest.mjs (read that first): the same
-// __wasi_shim_spawn_sync plumbing now also has to spawn a genuinely
-// *different* wasm binary for the link step (build/bin/wasm-ld, not
-// clang.wasm itself) -- see wasi_spawn_shim.mjs's resolveGuestPath() for how
-// the shim tells the two cases apart.
+// run_clang_compile_smoketest.mjs (read that first): the same spawn hook
+// now also has to spawn a genuinely *different* wasm binary for the link
+// step (build/bin/wasm-ld, not clang.wasm itself) -- see
+// wasi_spawn_shim.mjs's resolveGuestPath() for how the shim tells the two
+// cases apart.
 //
 // Usage:
-//   node --experimental-wasi-unstable-preview1 ai-notes/run_clang_link_smoketest.mjs [path-to-clang-wasm] [path-to-wasi-sysroot]
+//   node --experimental-wasm-type-reflection --experimental-wasi-unstable-preview1 ai-notes/run_clang_link_smoketest.mjs [path-to-clang-wasm] [path-to-wasi-sysroot]
 import { writeFile, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { WASI } from 'node:wasi';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { argv as processArgv } from 'node:process';
-import { makeSpawnSyncImport, findResourceDir } from './wasi_spawn_shim.mjs';
+import { installSpawnHook, findResourceDir } from './wasi_spawn_shim.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
 const wasmPath = processArgv[2] ?? path.join(repoRoot, 'build', 'bin', 'clang.wasm');
@@ -67,15 +67,9 @@ const bytes = await readFile(wasmPath);
 console.error(`Loaded ${bytes.length} bytes, compiling wasm module...`);
 const wasmModule = await WebAssembly.compile(bytes);
 
-const memoryRef = {};
-const importObject = wasi.getImportObject();
-importObject.env = {
-  __wasi_shim_spawn_sync: makeSpawnSyncImport({ memoryRef, wasmPath, preopens }),
-};
-
 console.error('Instantiating driver instance...');
-const instance = await WebAssembly.instantiate(wasmModule, importObject);
-memoryRef.current = instance.exports.memory;
+const instance = await WebAssembly.instantiate(wasmModule, wasi.getImportObject());
+installSpawnHook(instance, { wasmPath, preopens });
 
 console.error(`Running: ${clangArgs.join(' ')}`);
 let driverExit = 0;

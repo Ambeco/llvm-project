@@ -1,5 +1,5 @@
-// worker_threads entry point spawned by wasi_spawn_shim.mjs's
-// __wasi_shim_spawn_sync import. Runs one child invocation of clang.wasm
+// worker_threads entry point spawned by wasi_spawn_shim.mjs's spawn hook.
+// Runs one child invocation of clang.wasm
 // (in practice, the cc1 invocation the driver in the parent instance asked
 // to spawn) to completion in its own thread + its own fresh wasm instance,
 // then reports the exit code back through the SharedArrayBuffer the parent
@@ -14,7 +14,7 @@
 import { readFile } from 'node:fs/promises';
 import { WASI } from 'node:wasi';
 import { workerData } from 'node:worker_threads';
-import { makeSpawnSyncImport } from './wasi_spawn_shim.mjs';
+import { installSpawnHook } from './wasi_spawn_shim.mjs';
 
 const { wasmPath, argv, env, preopens, sab } = workerData;
 const status = new Int32Array(sab);
@@ -39,19 +39,19 @@ try {
   const bytes = await readFile(wasmPath);
   const wasmModule = await WebAssembly.compile(bytes);
 
-  const memoryRef = {};
-  const importObject = wasi.getImportObject();
-  importObject.env = {
-    // Recursion support: if this child itself needs to spawn a grandchild
-    // (e.g. a future assembler/linker invocation), it gets the same shim,
-    // pointed at the same wasm binary and preopens. Untested by the current
-    // compile-only smoke test, but there's no reason to hard-fail it when
-    // the plumbing to support it is this cheap.
-    __wasi_shim_spawn_sync: makeSpawnSyncImport({ memoryRef, wasmPath, preopens }),
-  };
+  // No custom imports needed to instantiate -- see Unix/Program.inc: the
+  // spawn hook is an optional post-instantiation extension point, not a
+  // required wasm import.
+  const instance = await WebAssembly.instantiate(wasmModule, wasi.getImportObject());
 
-  const instance = await WebAssembly.instantiate(wasmModule, importObject);
-  memoryRef.current = instance.exports.memory;
+  // Recursion support: if this child itself needs to spawn a grandchild
+  // (e.g. a future assembler invocation), install the same hook, pointed at
+  // the same wasm binary and preopens. Best-effort: a leaf binary that
+  // never itself calls ExecuteAndWait (e.g. wasm-ld, in the current smoke
+  // tests) may have had Program.cpp's WASI code -- and so this export --
+  // dead-stripped by the linker, so skip installing rather than hard-fail.
+  if (instance.exports.__wasi_shim_set_spawn_hook)
+    installSpawnHook(instance, { wasmPath, preopens });
 
   let exitCode = 0;
   try {

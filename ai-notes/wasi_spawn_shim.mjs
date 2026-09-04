@@ -1,11 +1,22 @@
-// Reference implementation of the `env.__wasi_shim_spawn_sync` import that
-// llvm/lib/Support/Unix/Program.inc's WASI Execute() calls out to (see that
-// file for the wire-format comment this decodes). This is a *minimal proof
-// of concept*, not the real VS Code for Web extension: it uses Node's
-// worker_threads + Atomics.wait to block the calling wasm instance
-// synchronously, matching the "run compiles in a Worker" shape described in
-// README.md's "JS Framework" section, but with a real OS-thread Worker
-// instead of a browser Worker.
+// Reference implementation of the spawn hook llvm/lib/Support/Unix/
+// Program.inc's WASI Execute() calls through (see that file for the
+// wire-format comment this decodes). No wasm import is required to
+// instantiate clang.wasm -- it's self-contained by default, failing loudly
+// (report_fatal_error) if anything tries to spawn a subprocess without a
+// hook installed. installSpawnHook() below is how a host opts in to real
+// subprocess support *after* instantiation: it wraps a JS callback as a
+// typed wasm function (WebAssembly.Function -- needs Node's
+// --experimental-wasm-type-reflection flag), places it into the module's
+// own exported indirect-call table (needs the module linked with
+// -Wl,--export-table -- see build.bat), and calls the module's exported
+// __wasi_shim_set_spawn_hook() to point Program.inc's function-pointer hook
+// at that new table slot.
+//
+// This is a *minimal proof of concept*, not the real VS Code for Web
+// extension: it uses Node's worker_threads + Atomics.wait to block the
+// calling wasm instance synchronously, matching the "run compiles in a
+// Worker" shape described in README.md's "JS Framework" section, but with a
+// real OS-thread Worker instead of a browser Worker.
 //
 // Not implemented here (left for the real extension): I/O redirection,
 // timeouts, detached/background processes, resource-usage stats -- the
@@ -86,20 +97,32 @@ function resolveGuestPath(preopens, guestPath) {
   return rest ? `${hostDir}/${rest}` : hostDir;
 }
 
-/// Build the `env.__wasi_shim_spawn_sync(ptr, len) -> i32` import for a wasm
-/// instance. `memoryRef` is a `{ current: WebAssembly.Memory }` box so the
-/// import can be created before the instance (and thus its memory export)
-/// exists -- fill in `memoryRef.current` right after instantiation.
-/// `preopens`/`defaultWasmPath` describe how to set up the *child* instance
-/// that actually runs the spawned argv (matching the parent's own view of
-/// the filesystem, since the spawned program -- cc1 or wasm-ld -- expects to
-/// see the same preopened directories the driver does). `defaultWasmPath` is
-/// used when argv[0] doesn't resolve to a real file via `preopens` (the
-/// cc1-in-the-same-binary case above); when it does resolve (e.g. an actual
-/// `wasm-ld` binary path), that resolved file is loaded instead.
-export function makeSpawnSyncImport({ memoryRef, wasmPath: defaultWasmPath, preopens }) {
-  return function __wasi_shim_spawn_sync(ptr, len) {
-    const bytes = new Uint8Array(memoryRef.current.buffer, ptr, len);
+/// Install real subprocess-spawn support into an *already-instantiated*
+/// wasm instance, via the exported-table + function-pointer-hook mechanism
+/// documented in Unix/Program.inc. `instance` must come from a module
+/// linked with -Wl,--export-table (see build.bat). `preopens`/
+/// `defaultWasmPath` describe how to set up the *child* instance that
+/// actually runs the spawned argv (matching the parent's own view of the
+/// filesystem, since the spawned program -- cc1 or wasm-ld -- expects to
+/// see the same preopened directories the driver does). `defaultWasmPath`
+/// is used when argv[0] doesn't resolve to a real file via `preopens` (the
+/// cc1-in-the-same-binary case -- see resolveGuestPath below); when it does
+/// resolve (e.g. an actual `wasm-ld` binary path), that resolved file is
+/// loaded for the child instead.
+///
+/// Requires Node's --experimental-wasm-type-reflection flag (for
+/// WebAssembly.Function -- unflagged in modern browsers already, this is
+/// purely a Node-reference-host requirement).
+export function installSpawnHook(instance, { wasmPath: defaultWasmPath, preopens }) {
+  const table = instance.exports.__indirect_function_table;
+  if (!table) {
+    throw new Error(
+      'wasi_spawn_shim: instance has no exported __indirect_function_table -- ' +
+      'was clang.wasm linked with -Wl,--export-table? (see build.bat)');
+  }
+
+  function spawnSync(ptr, len) {
+    const bytes = new Uint8Array(instance.exports.memory.buffer, ptr, len);
     // Copy out of wasm memory before handing off to the worker (structured
     // clone of a view into a growable ArrayBuffer would be unsafe otherwise).
     const blobCopy = bytes.slice();
@@ -134,5 +157,16 @@ export function makeSpawnSyncImport({ memoryRef, wasmPath: defaultWasmPath, preo
     const exitCode = Atomics.load(status, 1);
     console.error(`wasi_spawn_shim: child exited with code ${exitCode}`);
     return exitCode;
-  };
+  }
+
+  // Program.inc's SpawnHookFn is `int (*)(const uint8_t*, size_t)` --
+  // pointer and size_t are both i32 on wasm32.
+  const wrapped = new WebAssembly.Function(
+    { parameters: ['i32', 'i32'], results: ['i32'] },
+    spawnSync);
+
+  const newIndex = table.length;
+  table.grow(1);
+  table.set(newIndex, wrapped);
+  instance.exports.__wasi_shim_set_spawn_hook(newIndex);
 }
