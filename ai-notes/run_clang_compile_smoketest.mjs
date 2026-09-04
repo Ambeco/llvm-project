@@ -16,7 +16,7 @@
 //   node --experimental-wasi-unstable-preview1 ai-notes/run_clang_compile_smoketest.mjs [path-to-clang-wasm] [path-to-wasi-sysroot]
 //
 // Defaults assume this is run from the repo root against the build.bat
-// layout: build/bin/clang, and the wasi-sdk install location recorded in
+// layout: build/bin/clang.wasm, and the wasi-sdk install location recorded in
 // ai-notes/wip.md.
 import { writeFile, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { WASI } from 'node:wasi';
@@ -26,7 +26,7 @@ import { argv as processArgv } from 'node:process';
 import { makeSpawnSyncImport } from './wasi_spawn_shim.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
-const wasmPath = processArgv[2] ?? path.join(repoRoot, 'build', 'bin', 'clang');
+const wasmPath = processArgv[2] ?? path.join(repoRoot, 'build', 'bin', 'clang.wasm');
 const sysrootPath = processArgv[3] ??
   'C:/Users/mooin/AppData/Local/wasi-sdk/wasi-sdk-34.0-x86_64-windows/share/wasi-sysroot';
 const resourceDirPath = path.join(repoRoot, 'build', 'lib', 'clang', '23');

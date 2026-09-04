@@ -31,7 +31,7 @@ build; don't `rm -rf build` unless a `CMakeCache.txt` entry looks stale (see
 "stale cache gotcha" below).
 
 **Verified working:**
-- `build/bin/clang --version` under `node:wasi`
+- `build/bin/clang.wasm --version` under `node:wasi`
   (`ai-notes/run_clang_smoketest.mjs`) — driver logic runs end-to-end,
   correct output. Doesn't invoke `cc1`.
 - `node --experimental-wasi-unstable-preview1

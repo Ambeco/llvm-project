@@ -1,4 +1,4 @@
-// Quick sanity-check runner for build/bin/clang, using Node's built-in WASI
+// Quick sanity-check runner for build/bin/clang.wasm, using Node's built-in WASI
 // implementation (no browser/VS Code extension involved). Confirms the wasm
 // binary is well-formed and its driver logic actually runs, without needing
 // the JS-side Worker executor that real compilation (cc1 invocation) needs.
@@ -7,8 +7,8 @@
 //   node --experimental-wasi-unstable-preview1 ai-notes/run_clang_smoketest.mjs <path-to-clang-wasm> [clang args...]
 //
 // Examples:
-//   node --experimental-wasi-unstable-preview1 ai-notes/run_clang_smoketest.mjs build/bin/clang --version
-//   node --experimental-wasi-unstable-preview1 ai-notes/run_clang_smoketest.mjs build/bin/clang -c foo.c -o foo.o
+//   node --experimental-wasi-unstable-preview1 ai-notes/run_clang_smoketest.mjs build/bin/clang.wasm --version
+//   node --experimental-wasi-unstable-preview1 ai-notes/run_clang_smoketest.mjs build/bin/clang.wasm -c foo.c -o foo.o
 //
 // The second example is expected to fail loudly with a report_fatal_error
 // from llvm::sys::ExecuteAndWait (see README.md's "JS Framework" section) --
