@@ -37,28 +37,47 @@ llvm-project's AI-contribution policy (not `Co-Authored-By:` — a
 deliberate exception to this session's usual default, specific to this
 repo):
 
-- **`upstream-fixes`** — 6 commits (down from 7: the `__WASM__`-typo fix
-  was dropped entirely, since `main` already has the correct `__wasm__`
-  spelling -- independently fixed upstream at some point after our
-  original `release/23.x` base was cut). Scoped to changes defensible on
-  their own terms (an outright bug, or a mechanical extension of a
-  platform-support pattern the codebase already uses elsewhere) -- the
-  actual PR-ready candidate. **Check whether any of the remaining 6
-  commits get superseded the same way on your *next* rebase** -- don't
-  assume this list is permanently final; `main` moves fast.
+- **`upstream-fixes`** — 7 commits: `bit.h`, `HandleLLVMOptions.cmake`,
+  `Unix.h`, `ProgramStack.cpp`+`cc1_main.cpp`, `Process.inc`, `Path.inc`,
+  `LockFileManager.cpp`. (Was 6 after the `main` rebase dropped the
+  `__WASM__`-typo fix entirely -- `main` already has the correct `__wasm__`
+  spelling, independently fixed upstream after our original `release/23.x`
+  base was cut. Then `LockFileManager.cpp` moved back in from `wasm-wasi`
+  -- see next paragraph.) Scoped to changes defensible on their own terms
+  (an outright bug, or a mechanical extension of a platform-support pattern
+  the codebase already uses elsewhere) -- the actual PR-ready candidate.
+  **Check whether any of these commits get superseded the same way on your
+  *next* rebase** -- don't assume this list is permanently final; `main`
+  moves fast.
 - **`wasm-wasi`** (based on `upstream-fixes`) — everything project-specific:
-  the opinionated policy commits (loud-failure-on-missing-functionality,
-  `LockFileManager`'s conservative fallback), all README/ai-notes
-  documentation, and the spawn-shim/JS-host reference implementation. This
-  is what `build.bat` and the smoke tests actually run against.
+  the opinionated policy commits (loud-failure-on-missing-functionality),
+  all README/ai-notes documentation, and the spawn-shim/JS-host reference
+  implementation. This is what `build.bat` and the smoke tests actually run
+  against.
 
 **Be conservative about what actually gets proposed upstream** — see
 README.md's "Changes" section for the detailed criterion (mechanical
 platform-support extension vs. project-specific policy choice) and the
 per-commit bucketing. Re-litigate the placement of any individual commit
-if it looks wrong on a fresh read — the split was reconsidered and rebuilt
-once already this session after a first pass put a policy-choice commit
-(`LockFileManager`) in the wrong branch.
+if it looks wrong on a fresh read — the split has been reconsidered and
+rebuilt twice already this session:
+1. A first pass put `LockFileManager` on `wasm-wasi` as a "policy choice."
+2. After reading #92677's actual diff (see "Prior art" below) and finding
+   it reaches the *identical* fix via the *identical* reasoning, moved
+   `LockFileManager` back to `upstream-fixes` -- external validation from
+   a real upstream reviewer thread that this is a mechanical fallback, not
+   a project-specific stance. **This second move is the current state.**
+
+**One thing checked and deliberately *not* adopted from #92677**: their
+`Signals.cpp`-level interception (stubbing `RunInterruptHandlers`/
+`RemoveFileOnSignal`/`CleanupOnSignal` to silent no-ops for WASI, bypassing
+`Unix/Signals.inc` entirely -- confirmed from the actual diff hunk, not
+just the PR's own description). That would make this project's JS-host
+cleanup contract (see README's "JS Framework") impossible to implement --
+those three functions have to stay real and callable. Don't "simplify" our
+`Signals.inc` patch toward their approach later without re-reading this;
+it's load-bearing, not a style difference. See README.md's `Signals.inc`
+bullet for the same note in context.
 
 **Before opening any actual PR from `upstream-fixes`**, diff/compare
 against [llvm/llvm-project#92677](https://github.com/llvm/llvm-project/pull/92677)
