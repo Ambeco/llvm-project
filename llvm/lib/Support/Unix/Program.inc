@@ -27,10 +27,12 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/StringSaver.h"
 #include "llvm/Support/raw_ostream.h"
+#include <cstdint>
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <vector>
 #if HAVE_UNISTD_H
 #include <unistd.h>
 #endif
@@ -87,6 +89,107 @@ ErrorOr<std::string> sys::findProgramByName(StringRef Name,
   return errc::no_such_file_or_directory;
 }
 
+#if defined(__wasi__)
+// WASI has no process model at all: no fork(), no exec(), no posix_spawn(),
+// nothing to spawn a subprocess into or wait on (this is also why
+// -DCLANG_SPAWN_CC1=ON is safe here despite routing cc1 invocation through
+// this file -- see CrashRecoveryContext.cpp for the other half of that
+// story). This module is self-contained by default -- no wasm import is
+// required to instantiate it, unlike an approach that declared the spawn
+// primitive as an import_module function -- but it exposes an *optional*
+// extension point a JS host can use to provide real subprocess support:
+//
+//   1. CurrentSpawnHook is a plain function pointer, which on wasm32 is
+//      just an index into this module's indirect-call table. It starts
+//      out pointing at defaultSpawnHookStub, which fails loudly (nothing
+//      should silently pretend a subprocess ran when none did).
+//   2. A host that wants real spawning: grows this module's *exported*
+//      table (see -Wl,--export-table in build.bat) by one slot, writes a
+//      JS callback into that slot (wrapped with the right wasm function
+//      type via WebAssembly.Function), then calls the exported
+//      __wasi_shim_set_spawn_hook() with that slot's index to install it.
+//      See ai-notes/wasi_spawn_shim.mjs for a reference host doing exactly
+//      this via a worker_threads Worker.
+//
+// Wire format written into wasm linear memory for the hook function:
+//   u32 argc; argc * (u32 len, bytes)      -- argv, argv[0] is the program
+//   u32 envc; envc * (u32 len, bytes)      -- "KEY=VALUE" strings, or
+//                                              envc == 0xFFFFFFFF to inherit
+// Redirects are not part of the wire format: no caller of Execute() on this
+// target has ever needed them (see the report_fatal_error below), so
+// there's nothing yet to design a format for.
+typedef int (*SpawnHookFn)(const uint8_t *Blob, size_t BlobLen);
+
+static int defaultSpawnHookStub(const uint8_t *, size_t) {
+  report_fatal_error(
+      "llvm::sys::ExecuteAndWait/ExecuteNoWait on WASI has no spawn hook "
+      "installed: a JS host must call the exported "
+      "__wasi_shim_set_spawn_hook() before anything that spawns a "
+      "subprocess (e.g. cc1 invocation) can work -- see Unix/Program.inc");
+}
+
+static SpawnHookFn CurrentSpawnHook = &defaultSpawnHookStub;
+
+extern "C"
+    __attribute__((export_name("__wasi_shim_set_spawn_hook")))
+void __wasi_shim_set_spawn_hook(SpawnHookFn NewHook) {
+  CurrentSpawnHook = NewHook;
+}
+
+static void appendLenPrefixed(std::vector<uint8_t> &Blob, StringRef S) {
+  uint32_t Len = S.size();
+  const uint8_t *LenBytes = reinterpret_cast<const uint8_t *>(&Len);
+  Blob.insert(Blob.end(), LenBytes, LenBytes + sizeof(Len));
+  Blob.insert(Blob.end(), S.bytes_begin(), S.bytes_end());
+}
+
+static bool Execute(ProcessInfo &PI, StringRef Program,
+                    ArrayRef<StringRef> Args,
+                    std::optional<ArrayRef<StringRef>> Env,
+                    ArrayRef<std::optional<StringRef>> Redirects,
+                    unsigned MemoryLimit, std::string *ErrMsg,
+                    BitVector *AffinityMask, bool DetachProcess) {
+  if (!Redirects.empty() || DetachProcess) {
+    report_fatal_error(
+        "llvm::sys::ExecuteAndWait/ExecuteNoWait on WASI does not yet "
+        "support I/O redirection or detached processes -- only the plain "
+        "argv/env spawn used by cc1 invocation is implemented (see "
+        "Unix/Program.inc)");
+  }
+
+  std::vector<uint8_t> Blob;
+  ArrayRef<StringRef> Argv = Args.empty() ? ArrayRef<StringRef>(Program) : Args;
+  uint32_t Argc = Argv.size();
+  const uint8_t *ArgcBytes = reinterpret_cast<const uint8_t *>(&Argc);
+  Blob.insert(Blob.end(), ArgcBytes, ArgcBytes + sizeof(Argc));
+  for (StringRef A : Argv)
+    appendLenPrefixed(Blob, A);
+
+  if (Env) {
+    uint32_t Envc = Env->size();
+    const uint8_t *EnvcBytes = reinterpret_cast<const uint8_t *>(&Envc);
+    Blob.insert(Blob.end(), EnvcBytes, EnvcBytes + sizeof(Envc));
+    for (StringRef E : *Env)
+      appendLenPrefixed(Blob, E);
+  } else {
+    uint32_t Inherit = 0xFFFFFFFFu;
+    const uint8_t *InheritBytes = reinterpret_cast<const uint8_t *>(&Inherit);
+    Blob.insert(Blob.end(), InheritBytes, InheritBytes + sizeof(Inherit));
+  }
+
+  // Blocks this instance (via the host's Atomics.wait on a SharedArrayBuffer
+  // -- see the reference host) until the child has actually finished; there
+  // is no separate async "spawned but not yet waited on" state to model, so
+  // Wait() below just returns the result already stashed here. Calls
+  // whatever CurrentSpawnHook currently points at -- the default stub
+  // (report_fatal_error) unless a JS host has installed its own via
+  // __wasi_shim_set_spawn_hook().
+  int ExitCode = CurrentSpawnHook(Blob.data(), Blob.size());
+  PI.Pid = 1; // No real pid on WASI; nonzero sentinel meaning "ran".
+  PI.ReturnCode = ExitCode;
+  return true;
+}
+#else
 static bool RedirectIO(std::optional<StringRef> Path, int FD, std::string *ErrMsg) {
   if (!Path) // Noop
     return false;
@@ -330,11 +433,14 @@ static bool Execute(ProcessInfo &PI, StringRef Program,
 
   return true;
 }
+#endif // __wasi__
 
 namespace llvm {
 namespace sys {
 
-#if defined(_AIX)
+#if defined(__wasi__)
+// See the Execute() stub above for why.
+#elif defined(_AIX)
 static pid_t(wait4)(pid_t pid, int *status, int options, struct rusage *usage);
 #elif !defined(__Fuchsia__)
 using ::wait4;
@@ -377,6 +483,29 @@ pid_t(llvm::sys::wait4)(pid_t pid, int *status, int options,
 }
 #endif
 
+#if defined(__wasi__)
+// Execute() above runs the child synchronously via the JS-provided import
+// and already stashed its exit code in PI.ReturnCode -- there is nothing
+// left to wait for. A non-null ProcStat is just storage the caller offers
+// in case resource-usage stats are available (see sys::ExecuteAndWait) --
+// nothing on WASI ever fills it in, which callers already treat as "stats
+// unavailable" (it stays std::nullopt), not an error. SecondsToWait/Polling
+// are genuine unsupported *requests* (a real timeout or non-blocking poll),
+// so those fail loudly instead of silently being ignored.
+ProcessInfo llvm::sys::Wait(const ProcessInfo &PI,
+                            std::optional<unsigned> SecondsToWait,
+                            std::string *ErrMsg,
+                            std::optional<ProcessStatistics> *ProcStat,
+                            bool Polling) {
+  if (SecondsToWait || Polling) {
+    report_fatal_error(
+        "llvm::sys::Wait on WASI does not yet support a timeout or polling "
+        "-- only the plain blocking wait implicit in Execute()'s "
+        "synchronous spawn is implemented (see Unix/Program.inc)");
+  }
+  return PI;
+}
+#else
 ProcessInfo llvm::sys::Wait(const ProcessInfo &PI,
                             std::optional<unsigned> SecondsToWait,
                             std::string *ErrMsg,
@@ -500,6 +629,7 @@ ProcessInfo llvm::sys::Wait(const ProcessInfo &PI,
   }
   return WaitResult;
 }
+#endif // __wasi__
 
 std::error_code llvm::sys::ChangeStdinMode(fs::OpenFlags Flags) {
   if (!(Flags & fs::OF_Text))
