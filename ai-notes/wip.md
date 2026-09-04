@@ -1,16 +1,28 @@
 # WIP: getting `clang` (the driver) to build for wasm32-wasip1
 
-**STATUS as of 2026-09-03: full compile-and-link "Hello World" works end
-to end, AND everything is now rebased onto llvm-project's real, current
-`main` (LLVM 24.0.0git) instead of the stale `release/23.x` snapshot this
-whole effort started from.** `ai-notes/run_clang_link_smoketest.mjs`
+**STATUS as of 2026-09-04: `Unix/Program.inc`'s spawn mechanism is now a
+table-indirect function pointer, not a required wasm import -- and moved
+to `upstream-fixes` as a result.** `clang.wasm` instantiates with *zero*
+custom imports (just the standard WASI ones); a JS host that wants real
+subprocess support installs it *after* instantiation by growing the
+module's exported indirect-call table, writing a
+`WebAssembly.Function`-wrapped callback into the new slot, and calling the
+exported `__wasi_shim_set_spawn_hook()`. This is genuinely self-contained
+(no host cooperation needed to link or run the module at all), so the
+whole mechanism moved from `wasm-wasi` to `upstream-fixes` -- see "Current
+state" below. All three smoke tests re-verified passing against this
+design (now needs Node's `--experimental-wasm-type-reflection` flag
+alongside the existing `--experimental-wasi-unstable-preview1`).
+
+Previous milestone (2026-09-03, still true): full compile-and-link "Hello
+World" works end to end, and everything is rebased onto llvm-project's
+real, current `main` (LLVM 24.0.0git) instead of the stale `release/23.x`
+snapshot this whole effort started from. `ai-notes/run_clang_link_smoketest.mjs`
 compiles a `#include <stdio.h>` "Hello, world!" translation unit, links it
 with a real spawned `wasm-ld` into a genuine `hello.wasm`, then actually
-*runs* that binary and gets the correct output -- verified again after the
-`main` rebase, still passes. This was the milestone this file was tracking
-— read on for how it was reached, then see "Next milestone" for what's
-actually left (a real browser-based JS host, not this Node reference
-implementation).
+*runs* that binary and gets the correct output. See "Next milestone" for
+what's actually left (a real browser-based JS host, not this Node
+reference implementation).
 
 **The `main` rebase went essentially perfectly**: all 18 non-typo commits
 across `upstream-fixes`/`wasm-wasi` cherry-picked cleanly (a few
@@ -37,22 +49,29 @@ llvm-project's AI-contribution policy (not `Co-Authored-By:` — a
 deliberate exception to this session's usual default, specific to this
 repo):
 
-- **`upstream-fixes`** — 7 commits: `bit.h`, `HandleLLVMOptions.cmake`,
+- **`upstream-fixes`** — 8 commits: `bit.h`, `HandleLLVMOptions.cmake`,
   `Unix.h`, `ProgramStack.cpp`+`cc1_main.cpp`, `Process.inc`, `Path.inc`,
-  `LockFileManager.cpp`. (Was 6 after the `main` rebase dropped the
-  `__WASM__`-typo fix entirely -- `main` already has the correct `__wasm__`
-  spelling, independently fixed upstream after our original `release/23.x`
-  base was cut. Then `LockFileManager.cpp` moved back in from `wasm-wasi`
-  -- see next paragraph.) Scoped to changes defensible on their own terms
-  (an outright bug, or a mechanical extension of a platform-support pattern
-  the codebase already uses elsewhere) -- the actual PR-ready candidate.
-  **Check whether any of these commits get superseded the same way on your
-  *next* rebase** -- don't assume this list is permanently final; `main`
-  moves fast.
-- **`wasm-wasi`** (based on `upstream-fixes`) — everything project-specific:
-  the opinionated policy commits (loud-failure-on-missing-functionality),
-  all README/ai-notes documentation, and the spawn-shim/JS-host reference
-  implementation. This is what `build.bat` and the smoke tests actually run
+  `LockFileManager.cpp`, `Unix/Program.inc`'s spawn hook. (Was 6 after the
+  `main` rebase dropped the `__WASM__`-typo fix entirely -- `main` already
+  has the correct `__wasm__` spelling, independently fixed upstream after
+  our original `release/23.x` base was cut. Then `LockFileManager.cpp`
+  moved in from `wasm-wasi`, then `Program.inc` moved in too once its
+  design changed from a required import to an optional table hook -- see
+  "Current state" and the STATUS note above.) Scoped to changes defensible
+  on their own terms (an outright bug, a mechanical extension of a
+  platform-support pattern the codebase already uses elsewhere, or -- for
+  `Program.inc` -- a mechanism that's genuinely self-contained and requires
+  no host cooperation) -- the actual PR-ready candidate. **Check whether
+  any of these commits get superseded the same way on your *next* rebase**
+  -- don't assume this list is permanently final; `main` moves fast.
+- **`wasm-wasi`** (based on `upstream-fixes`) — everything that actually
+  *requires* a JS host to do anything useful: the opinionated policy
+  commits (loud-failure-on-missing-functionality for
+  `CrashRecoveryContext`/`Signals.inc`/`Watchdog.inc`/`raw_socket_stream.cpp`),
+  all README/ai-notes documentation, and the spawn-hook JS reference host
+  (`ai-notes/wasi_spawn_shim.mjs` + `wasi_spawn_worker.mjs`) that actually
+  installs a real implementation into `upstream-fixes`'s extension point.
+  This is what `build.bat` and the smoke tests actually run
   against.
 
 **Be conservative about what actually gets proposed upstream** — see
