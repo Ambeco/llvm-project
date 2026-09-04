@@ -23,13 +23,13 @@ import { WASI } from 'node:wasi';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { argv as processArgv } from 'node:process';
-import { makeSpawnSyncImport } from './wasi_spawn_shim.mjs';
+import { makeSpawnSyncImport, findResourceDir } from './wasi_spawn_shim.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
 const wasmPath = processArgv[2] ?? path.join(repoRoot, 'build', 'bin', 'clang.wasm');
 const sysrootPath = processArgv[3] ??
   'C:/Users/mooin/AppData/Local/wasi-sdk/wasi-sdk-34.0-x86_64-windows/share/wasi-sysroot';
-const resourceDirPath = path.join(repoRoot, 'build', 'lib', 'clang', '23');
+const resourceDirPath = await findResourceDir(path.join(repoRoot, 'build', 'lib', 'clang'));
 
 const workDir = await mkdtemp(path.join(tmpdir(), 'clang-wasm-smoketest-'));
 const helloC = `// Minimal proof-of-life for the spawn shim: real libc header (stdio.h,

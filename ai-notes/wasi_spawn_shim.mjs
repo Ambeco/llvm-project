@@ -15,8 +15,24 @@
 
 import { Worker } from 'node:worker_threads';
 import { fileURLToPath } from 'node:url';
+import { readdir } from 'node:fs/promises';
+import path from 'node:path';
 
 const workerScript = fileURLToPath(new URL('./wasi_spawn_worker.mjs', import.meta.url));
+
+/// build/lib/clang/<N> is named after the LLVM major version, which changes
+/// on every dev cycle (23 -> 24 already happened once this session, when
+/// this repo got rebased onto llvm-project's current main); a stale build/
+/// dir can leave more than one such directory behind, so pick the highest
+/// numbered one rather than hardcoding a version that will eventually go
+/// stale again.
+export async function findResourceDir(clangLibDir) {
+  const entries = (await readdir(clangLibDir)).filter((e) => /^\d+$/.test(e));
+  if (entries.length === 0)
+    throw new Error(`No versioned resource dir found under ${clangLibDir}`);
+  entries.sort((a, b) => Number(b) - Number(a));
+  return path.join(clangLibDir, entries[0]);
+}
 
 /// Decode the Program.inc wire format: a little-endian blob of
 ///   u32 argc; argc * (u32 len, bytes)
