@@ -376,6 +376,14 @@ void multiThreadedPageInBackground(DeferredFiles &deferred) {
       [[maybe_unused]] volatile char t = *page;
       (void)t;
     }
+#elif defined(__wasi__)
+    // No madvise() on WASI (same as other platforms without it -- see
+    // llvm/lib/Support/Unix/Path.inc's dontNeedImpl/willNeedImpl/
+    // randomAccessImpl for the same no-op treatment); this is purely a
+    // background-thread readahead hint for large archives, nothing depends
+    // on it actually happening. This code is unreachable in practice for a
+    // wasm-only lld build (we never use the MachO backend), but it's still
+    // *compiled* as part of liblldMachO.a, so it still needs to link.
 #else
 #define DEBUG_TYPE "lld-madvise"
     auto aligned =
