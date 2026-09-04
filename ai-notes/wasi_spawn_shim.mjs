@@ -46,21 +46,51 @@ function decodeSpawnBlob(bytes) {
   return { argv, env };
 }
 
+/// Resolve a WASI guest path (as seen by the calling instance, e.g.
+/// "/bin/wasm-ld") to a real host filesystem path, using the same preopen
+/// map the instance itself was configured with. Picks the longest matching
+/// preopen prefix (so e.g. both "/" and "/bin" being preopened resolves
+/// "/bin/wasm-ld" against "/bin", not "/"). Returns null if nothing matches
+/// -- the caller falls back to spawning the *same* binary that's doing the
+/// spawning, which is correct for cc1 (argv[0] is "" there -- see
+/// Unix/Program.inc and CC1Command::Execute -- since cc1 lives in the same
+/// clang.wasm binary rather than being a separate executable on disk).
+function resolveGuestPath(preopens, guestPath) {
+  let bestPrefix = null;
+  for (const guestPrefix of Object.keys(preopens)) {
+    if ((guestPath === guestPrefix || guestPath.startsWith(guestPrefix + '/')) &&
+        (bestPrefix === null || guestPrefix.length > bestPrefix.length)) {
+      bestPrefix = guestPrefix;
+    }
+  }
+  if (bestPrefix === null)
+    return null;
+  const hostDir = preopens[bestPrefix];
+  const rest = guestPath.slice(bestPrefix.length).replace(/^\/+/, '');
+  return rest ? `${hostDir}/${rest}` : hostDir;
+}
+
 /// Build the `env.__wasi_shim_spawn_sync(ptr, len) -> i32` import for a wasm
 /// instance. `memoryRef` is a `{ current: WebAssembly.Memory }` box so the
 /// import can be created before the instance (and thus its memory export)
 /// exists -- fill in `memoryRef.current` right after instantiation.
-/// `preopens`/`wasmPath` describe how to set up the *child* instance that
-/// actually runs the spawned argv (matching the parent's own view of the
-/// filesystem, since the spawned program -- cc1 -- expects to see the same
-/// preopened directories the driver does).
-export function makeSpawnSyncImport({ memoryRef, wasmPath, preopens }) {
+/// `preopens`/`defaultWasmPath` describe how to set up the *child* instance
+/// that actually runs the spawned argv (matching the parent's own view of
+/// the filesystem, since the spawned program -- cc1 or wasm-ld -- expects to
+/// see the same preopened directories the driver does). `defaultWasmPath` is
+/// used when argv[0] doesn't resolve to a real file via `preopens` (the
+/// cc1-in-the-same-binary case above); when it does resolve (e.g. an actual
+/// `wasm-ld` binary path), that resolved file is loaded instead.
+export function makeSpawnSyncImport({ memoryRef, wasmPath: defaultWasmPath, preopens }) {
   return function __wasi_shim_spawn_sync(ptr, len) {
     const bytes = new Uint8Array(memoryRef.current.buffer, ptr, len);
     // Copy out of wasm memory before handing off to the worker (structured
     // clone of a view into a growable ArrayBuffer would be unsafe otherwise).
     const blobCopy = bytes.slice();
     const { argv, env } = decodeSpawnBlob(blobCopy);
+
+    const resolved = argv[0] ? resolveGuestPath(preopens, argv[0]) : null;
+    const wasmPath = resolved ?? defaultWasmPath;
 
     // [0] = 0 while running, 1 once the worker has written the exit code.
     // [1] = the exit code itself, once [0] is 1.
