@@ -349,6 +349,97 @@ could cheaply recover any performance:
   be a separate, substantial effort if ever needed -- don't reach for it
   without a concrete case that the cheap win above doesn't already cover.
 
+## `experiment-wasi-threads` branch: real threading, prototyped 2026-09-04
+
+Explored how hard real `wasm32-wasip1-threads` support actually is, per
+the user's request ("see how hard multithreading is"), on a **separate
+branch** (`experiment-wasi-threads`, based on `wasm-wasi`) since this is
+exploratory and not (yet) something to fold into the main branches.
+Findings, most important first:
+
+- **Real, working, verified pthreads in the browser/Node runtime model are
+  achievable and not weird hacks** -- every mechanism involved
+  (`new WebAssembly.Memory({shared:true})`, transferring that same Memory
+  object to a Worker via `postMessage`/`workerData`, wasm's own
+  `memory.atomic.wait32`/`notify` instructions for real mutex/join
+  synchronization) is standard, spec'd, well-supported JS/wasm API --
+  nothing here needed a workaround. **Proof**: `ai-notes/run_wasi_threads_prototype.mjs`
+  runs a standalone 4-pthread mutex-counter test end to end via Node
+  `worker_threads` and gets the exactly-correct answer (400000, not a
+  race-corrupted number), which only happens if both real concurrent
+  execution *and* real cross-worker synchronization actually worked.
+- **`vscode.dev` is already cross-origin isolated** (confirmed via
+  `curl -sI https://vscode.dev`: `Cross-Origin-Opener-Policy: same-origin`,
+  `Cross-Origin-Embedder-Policy: require-corp`) -- the one thing that
+  would have made this entirely impossible from within an extension
+  (`SharedArrayBuffer` doesn't exist in a browser without COOP/COEP, and
+  an extension can't turn that on itself) is not a blocker for this
+  specific deployment target. Don't assume this holds for every possible
+  host, but it holds for the one we actually care about.
+- **Compiling with real threads is genuinely easy**: `--target=wasm32-unknown-wasip1-threads`,
+  `-pthread`, `-DLLVM_ENABLE_THREADS=ON`, plus
+  `-Wl,--import-memory -Wl,--shared-memory` (needed so the module's memory
+  is an *import* -- shareable across instances -- rather than
+  self-owned/exported, which is wasi-sdk's odd default even with
+  `-pthread` given). One real source patch needed:
+  `lld/MachO/Driver.cpp`'s unconditional `madvise()` call (dead code for a
+  wasm-only build, but still compiled into `liblldMachO.a` and apparently
+  reachable only once threading is on -- see that commit's message for
+  detail). Both `clang.wasm` and `lld.wasm` build and link clean.
+- **`node:wasi`'s `WASI` class does NOT support this at all** -- confirmed
+  empirically: `wasi.start(instance)` unconditionally throws
+  `"instance.exports.memory property must be a WebAssembly.Memory object"`,
+  because it hard-requires an *exported* memory, and a wasi-threads module
+  by construction can only have an *imported* one (so multiple instances
+  can share it). Worked around by hand-rolling the small subset of
+  `wasi_snapshot_preview1` actually needed
+  (`ai-notes/wasi_thread_syscalls.mjs`) instead of using `node:wasi` at
+  all for anything touching a threaded module. **A real host (e.g.
+  `wasm-wasi-core` in VS Code for Web) needs to be checked for the same
+  limitation** before assuming it'll "just work" there -- don't assume
+  the browser-side WASI runtime handles imported memory correctly without
+  verifying.
+- **thread-spawn turned out easier than subprocess-spawn, not harder**:
+  real `pthread_create()` semantics return as soon as the thread is
+  *created*, not when it finishes, so the host just allocates a tid and
+  fires off a Worker -- no `Atomics.wait` blocking needed for the spawn
+  call itself (unlike `cc1`, where the caller genuinely needs the exit
+  code back). Mutex/condvar/join synchronization needs *zero* additional
+  host JS at all -- it's wasm-level atomic instructions operating on the
+  shared memory, handled entirely by the engine.
+- **`wasi.thread-spawn`/`env.memory` are *required* imports, not an
+  optional hook like `Program.inc`'s spawn mechanism** -- this is
+  wasi-libc/libpthread's own fixed ABI (the "wasi-threads" proposal), not
+  something we designed, so there's no way to make a threads-enabled
+  module self-contained-by-default the way `Program.inc`'s table hook is.
+  Any module built with real thread support *requires* a host to supply
+  these to instantiate at all.
+- **NOT addressed, genuinely open**: real file I/O consistency across
+  threads. The user relayed three options from a separate discussion: (1)
+  one dedicated I/O-owning worker that every other worker's WASI layer
+  RPCs to for `fd_read`/`fd_open`/`fd_write`/`fd_seek`; (2) each thread
+  does real I/O itself, coordinating file *position* via shared memory +
+  `pread`-style explicit offsets (no implicit shared cursor); (3) a hybrid
+  -- one real I/O owner, others RPC to it (this is actually the same
+  shape as option 1, just phrased from the "which worker already has
+  real file access" angle). Assessment, not yet implemented: **(1)/(3)
+  is the better direction** -- it reuses the exact synchronous
+  cross-worker RPC-via-`Atomics.wait` pattern `wasi_spawn_shim.mjs`
+  already proved out for subprocess spawning, whereas (2) requires every
+  WASI syscall path through wasi-libc's pthread layer to consistently
+  avoid implicit shared file-position state, which isn't guaranteed and
+  is much easier to get subtly wrong. This prototype's test program does
+  no file I/O at all, so it sidesteps the question entirely rather than
+  answering it -- next step if this gets picked up again.
+- **Also not yet checked**: whether `clang.wasm`/`lld.wasm` (as opposed to
+  this standalone pthread test) would actually *call* `thread-spawn` for
+  any real workload -- `LLVM_ENABLE_THREADS=ON` only makes threading
+  *available*; `ThreadPoolStrategy`'s default worker-count heuristics
+  decide whether it's actually used for a given work size (see the
+  "Multi-file parallelism" section above for where `parallelFor` is
+  exercised in `lld/wasm/Writer.cpp`). Worth instrumenting/observing
+  before investing further in the file-I/O design above.
+
 ## Next milestone: a real browser-based JS host
 
 Compile-and-link "Hello World" works end to end (see STATUS at top) —
