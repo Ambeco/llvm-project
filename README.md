@@ -193,6 +193,24 @@ provide functionality no WASI host does by default:
 - (Optional) provide a `$COLUMNS` environment variable if terminal-width-
   aware output formatting matters; there's no `ioctl`/`TIOCGWINSZ` to query
   it from.
+- **For compiling multiple files, run one driver instance per file
+  concurrently** rather than one driver invocation per file in sequence.
+  Each top-level `clang.wasm` instance is already fully isolated (its own
+  linear memory, no sharing) the moment it's instantiated, so this needs
+  no wasm-side changes at all -- just run N Workers, each doing its own
+  `WebAssembly.instantiate` + `installSpawnHook` + `wasi.start()`, same
+  shape as the single-file case just repeated. **Implemented** as a proof
+  of concept in `ai-notes/wasi_driver_worker.mjs` +
+  `ai-notes/run_clang_parallel_smoketest.mjs`: compiling 8 files
+  concurrently this way took ~156ms wall-clock vs. ~89ms for 1 file --
+  nowhere near the ~712ms sequential compilation would take, confirming
+  real concurrency. This is deliberately *not* the same thing as giving
+  clang.wasm real multithreading (`LLVM_ENABLE_THREADS`, `std::thread`,
+  etc.) -- that would need actual shared linear memory across instances
+  (a different target triple, `-pthread`, `-matomics`, and implementing
+  the `wasi-threads` host ABI), a materially bigger and separate effort
+  not attempted here. Independent per-file compilation is the cheap,
+  already-available win; real in-module threading remains future work.
 
 Welcome to the LLVM project!
 

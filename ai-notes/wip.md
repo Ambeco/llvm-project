@@ -299,6 +299,56 @@ dir — that's needlessly slow) and do a full fresh `cmake` configure.
   as before (see README) — `CLANG_SPAWN_CC1=ON` means `Enable()` is never
   actually called by the driver, so this is dead code in practice.
 
+## Multi-file parallelism: cheap win taken, real threading deferred
+
+`build.bat` sets `-DLLVM_ENABLE_THREADS=OFF`. Investigated 2026-09-04 what
+that actually gates and whether the table-hook pattern (used for spawn)
+could cheaply recover any performance:
+
+- **What it gates, confirmed by grep**: the entire `StdThreadPool`/
+  `ThreadPoolExecutor`/`TaskGroup::spawn`/`parallelFor` machinery in
+  `llvm/lib/Support/{ThreadPool,Parallel}.cpp` -- with it off, everything
+  routes through a `SingleThreadExecutor` instead, sequentially. This is
+  genuinely exercised in our own link path, not just theoretical:
+  `lld/wasm/Writer.cpp` uses `parallelForEach`/`parallelFor` to write
+  output sections and hash chunks (for the build-ID) concurrently. Scales
+  with section/chunk count, so real but modest at our project's typical
+  scale.
+- **Why the table-hook trick from Program.inc doesn't transfer**: real
+  `std::thread`/pthread semantics need actual *shared linear memory across
+  instances*, declared into the module at compile time -- not something a
+  post-instantiation function-pointer swap can retrofit. Doing this for
+  real would mean: building against `wasm32-wasip1-threads` (wasi-sdk
+  already ships this sysroot variant, sitting unused alongside plain
+  `wasm32-wasip1`), `-pthread` + `-matomics -mbulk-memory` compile flags,
+  and implementing the real `wasi-threads` host ABI (host provides
+  `wasi_thread_spawn(start_arg) -> tid`; each call spins up a Worker
+  running a *new instantiation of the same module against the same shared
+  `WebAssembly.Memory`*, which then calls the module's own exported
+  `wasi_thread_start(tid, start_arg)`). In a browser this additionally
+  needs cross-origin isolation (COOP/COEP headers) for `SharedArrayBuffer`
+  to exist at all. Materially bigger and separate from anything done so
+  far -- **not attempted, deliberately deferred**.
+- **The cheap win, taken instead**: the parallelism that actually matters
+  most for a typical multi-file project -- compiling several files
+  concurrently -- needs *no* wasm-side changes, since each top-level
+  `clang.wasm` driver instance is already fully isolated (fresh linear
+  memory) the moment it's instantiated. Just run N Workers, each doing its
+  own instantiate + `installSpawnHook` + `wasi.start()` -- literally the
+  existing single-file shape, repeated. Implemented in
+  `ai-notes/wasi_driver_worker.mjs` + `ai-notes/run_clang_parallel_smoketest.mjs`,
+  and it measurably works: 1 file ~89ms, 4 files ~131ms, 8 files ~156ms --
+  nowhere near the ~356ms/~712ms linear scaling sequential compilation
+  would show (also visible directly in the interleaved per-file `cc1`
+  spawn logs, proving it's not just fast, it's actually concurrent).
+- **Where this leaves things**: independent-file parallelism (this
+  project's realistic common case -- a multi-file C/C++ project) is
+  solved cheaply. Real in-module threading (`LLVM_ENABLE_THREADS=ON`, for
+  things like ThinLTO backend parallelism or parallelizing work *within* a
+  single huge translation unit) remains genuinely unimplemented and would
+  be a separate, substantial effort if ever needed -- don't reach for it
+  without a concrete case that the cheap win above doesn't already cover.
+
 ## Next milestone: a real browser-based JS host
 
 Compile-and-link "Hello World" works end to end (see STATUS at top) —
