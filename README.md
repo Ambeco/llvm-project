@@ -32,14 +32,12 @@ should only ever be asked to take the first kind of change below:
 
 #### `upstream-fixes`
 
-- `llvm/include/llvm/Support/Compiler.h` and
-  `clang/include/clang/Support/Compiler.h`: a pre-existing upstream typo,
-  unrelated to WASI specifically -- both checked the never-defined
-  `__WASM__` instead of the real predefined macro `__wasm__`, silently
-  leaving `LLVM_TEMPLATE_ABI`/`CLANG_TEMPLATE_ABI` undefined for any wasm
-  target and producing bizarre "explicit instantiation ... does not refer
-  to a template" errors. (The one outright bug in this list -- wrong
-  regardless of WASI.)
+(Originally included a fix for a real upstream typo -- `Compiler.h`
+checked the never-defined `__WASM__` instead of `__wasm__` -- but once
+this branch was rebased onto `llvm-project`'s current `main`, that
+cherry-pick came back empty: the typo was already fixed independently
+upstream. Dropped from this branch as redundant; not something to redo.)
+
 - `llvm/include/llvm/ADT/bit.h`: recognize `__wasi__` as a platform with a
   usable `<endian.h>` (wasi-libc has one; it just wasn't in the OS list).
 - `llvm/cmake/modules/HandleLLVMOptions.cmake`: treat the wasm32-wasi target
@@ -68,15 +66,18 @@ should only ever be asked to take the first kind of change below:
   same as an ordinary lookup failure), no `posix_madvise` (no-op, same as
   other platforms without madvise), no `umask`/real `fchown`, no on-disk
   path for the running executable (`getMainExecutable` returns `""`).
-
-#### `wasm-wasi` (additionally)
-
 - `llvm/lib/Support/LockFileManager.cpp`: no `getsid()` to check whether a
   lock's owning process is still alive, and no real multi-process contention
   to detect in the first place on this target (each build runs in its own
-  isolated module instance). Conservatively assume the lock is held -- a
-  judgment call about missing functionality, same category as the
-  loud-failure changes below, just landed on a quiet default instead.
+  isolated module instance). Conservatively assume the lock is held.
+  Reclassified here from an earlier pass that put it on `wasm-wasi` as a
+  "policy choice" -- [llvm/llvm-project#92677](https://github.com/llvm/llvm-project/pull/92677)
+  reaches the identical fix via the identical reasoning, which is real
+  external validation this is a mechanical fallback like the rest of this
+  list, not a project-specific stance.
+
+#### `wasm-wasi` (additionally)
+
 - `llvm/lib/Support/CrashRecoveryContext.cpp`: WASI has no signal delivery
   and no working `setjmp`/`longjmp`, so real crash recovery is impossible in
   a single module instance; `Enable()` now fails loudly instead of silently
@@ -98,7 +99,14 @@ should only ever be asked to take the first kind of change below:
   signal) becomes a silent no-op -- nothing depends on it succeeding. The
   underlying cleanup machinery (`RemoveFileOnSignal`, `RunInterruptHandlers`,
   `CleanupOnSignal`) stays fully functional and exported, for a JS host to
-  call directly instead of relying on a signal to trigger it.
+  call directly instead of relying on a signal to trigger it. **Deliberately
+  different from [#92677](https://github.com/llvm/llvm-project/pull/92677)'s
+  approach**: that PR intercepts one layer up, in `Signals.cpp` itself
+  (bypassing `Unix/Signals.inc` for WASI entirely), and stubs
+  `RunInterruptHandlers`/`RemoveFileOnSignal`/`CleanupOnSignal` to silent
+  no-ops along with everything else. That would make our own JS-host cleanup
+  contract (see "JS Framework" below) impossible to implement -- those three
+  functions have to stay real for a host to call them. Not a style choice.
 - `llvm/lib/Support/Unix/Watchdog.inc`: no `alarm()`/signals, so the
   watchdog timer is a no-op; real timeout enforcement is expected to happen
   by the JS host terminating the Worker (see below).
