@@ -1,49 +1,56 @@
 # WIP: getting `clang` (the driver) to build for wasm32-wasip1
 
-**STATUS as of 2026-09-03: full compile-and-link "Hello World" works
-end to end.** `ai-notes/run_clang_link_smoketest.mjs` compiles a
-`#include <stdio.h>` "Hello, world!" translation unit, links it with a
-real spawned `wasm-ld` into a genuine `hello.wasm`, then actually *runs*
-that binary and gets the correct output. This was the milestone this file
-was tracking — read on for how it was reached, then see "Next milestone"
-for what's actually left (a real browser-based JS host, not this Node
-reference implementation).
+**STATUS as of 2026-09-03: full compile-and-link "Hello World" works end
+to end, AND everything is now rebased onto llvm-project's real, current
+`main` (LLVM 24.0.0git) instead of the stale `release/23.x` snapshot this
+whole effort started from.** `ai-notes/run_clang_link_smoketest.mjs`
+compiles a `#include <stdio.h>` "Hello, world!" translation unit, links it
+with a real spawned `wasm-ld` into a genuine `hello.wasm`, then actually
+*runs* that binary and gets the correct output -- verified again after the
+`main` rebase, still passes. This was the milestone this file was tracking
+— read on for how it was reached, then see "Next milestone" for what's
+actually left (a real browser-based JS host, not this Node reference
+implementation).
+
+**The `main` rebase went essentially perfectly**: all 18 non-typo commits
+across `upstream-fixes`/`wasm-wasi` cherry-picked cleanly (a few
+auto-merges, zero manual conflict resolution needed) onto a shallow fetch
+of `main` (`git fetch --depth=1 origin main` -- keeps disk usage down,
+no need for full history). The only real breakage was self-inflicted: two
+smoke test scripts hardcoded `build/lib/clang/23` (the resource dir is
+named after `LLVM_VERSION_MAJOR`, which is now 24) -- fixed by picking the
+highest-numbered directory instead of hardcoding one, so this doesn't
+break again on the *next* rebase either.
 
 Read `AGENTS.md` first for the general approach.
 
 ## Current state
 
-Git history is split into **three** branches, all rebuilt with
-`Assisted-by:` trailers per llvm-project's AI-contribution policy (not
-`Co-Authored-By:` — a deliberate exception to this session's usual
-default, specific to this repo):
+Git history is split into **two** branches (there was briefly a third,
+`fix-webasm`, created specifically to test a `main`-based rebase before
+committing to it everywhere -- once that rebase proved clean, it was
+folded back into `upstream-fixes` and deleted; don't go looking for it),
+both now based on a shallow fetch of `llvm-project`'s real, current `main`
+(`git fetch --depth=1 origin main` -- keeps disk usage down, no full
+history needed), both rebuilt with `Assisted-by:` trailers per
+llvm-project's AI-contribution policy (not `Co-Authored-By:` — a
+deliberate exception to this session's usual default, specific to this
+repo):
 
-- **`fix-webasm`** — based directly on `llvm-project`'s real, current
-  `main` (fetched shallow: `git fetch --depth=1 origin main`, then
-  `git branch -f fix-webasm FETCH_HEAD`). The actual PR-ready candidate:
-  6 commits, cherry-picked from `upstream-fixes` (see below) with the same
-  hashes' patches re-applied onto `main`. One commit dropped entirely --
-  the `__WASM__`-typo fix -- because `main` *already has the correct
-  `__wasm__` spelling*; that bug was independently fixed upstream at some
-  point after our `release/23.x` base was cut. Carries none of this fork's
-  own `README.md`/`ai-notes/` changes (none of the 6 commits touch them),
-  which is correct: a real PR shouldn't carry fork-specific docs. **Check
-  which of the remaining 6 commits, if any, get superseded the same way on
-  your next rebase** -- don't assume the list is final.
-- **`upstream-fixes`** — the original, based on this repo's actual
-  `release/23.x` snapshot (`ea7d852a7`, "Bump version to 23.1.0" -- NOT
-  `main`; see the "292 commits ahead" GitHub-compare confusion earlier
-  this session for why that distinction matters). Still 7 commits,
-  including the now-upstream-redundant typo fix -- kept as-is because
-  *our own local build* (`build.bat`, `wasm-wasi`) is based on this same
-  snapshot, and this typo genuinely still needs fixing there. Don't drop
-  it here; `fix-webasm` is the only branch where it's actually redundant.
-- **`wasm-wasi`** (based on `upstream-fixes`, NOT `fix-webasm`) — the
-  project-specific branch: everything that asserts an opinionated policy
-  (loud-failure-on-missing-functionality, `LockFileManager`'s conservative
-  fallback) plus all the README/ai-notes documentation and the actual
-  spawn-shim/JS-host reference implementation. This is what `build.bat`
-  and the smoke tests actually run against.
+- **`upstream-fixes`** — 6 commits (down from 7: the `__WASM__`-typo fix
+  was dropped entirely, since `main` already has the correct `__wasm__`
+  spelling -- independently fixed upstream at some point after our
+  original `release/23.x` base was cut). Scoped to changes defensible on
+  their own terms (an outright bug, or a mechanical extension of a
+  platform-support pattern the codebase already uses elsewhere) -- the
+  actual PR-ready candidate. **Check whether any of the remaining 6
+  commits get superseded the same way on your *next* rebase** -- don't
+  assume this list is permanently final; `main` moves fast.
+- **`wasm-wasi`** (based on `upstream-fixes`) — everything project-specific:
+  the opinionated policy commits (loud-failure-on-missing-functionality,
+  `LockFileManager`'s conservative fallback), all README/ai-notes
+  documentation, and the spawn-shim/JS-host reference implementation. This
+  is what `build.bat` and the smoke tests actually run against.
 
 **Be conservative about what actually gets proposed upstream** — see
 README.md's "Changes" section for the detailed criterion (mechanical
@@ -53,20 +60,28 @@ if it looks wrong on a fresh read — the split was reconsidered and rebuilt
 once already this session after a first pass put a policy-choice commit
 (`LockFileManager`) in the wrong branch.
 
-**Before opening any actual PR from `fix-webasm`**, diff/compare against
-[llvm/llvm-project#92677](https://github.com/llvm/llvm-project/pull/92677)
+**Before opening any actual PR from `upstream-fixes`**, diff/compare
+against [llvm/llvm-project#92677](https://github.com/llvm/llvm-project/pull/92677)
 (open, unmerged, doing very similar work across almost the same files) —
 see "Prior art" below for why it stalled and why our narrower scope
 (no threading/`std::mutex` changes at all) sidesteps its actual blocker.
 
-All three branches have been pushed to the `fork` remote
-(`github.com/Ambeco/llvm-project`) as of the last update to this file.
-No PR has been opened anywhere yet — hold off until asked. `fix-webasm`
-in particular has never been pushed before its first push (no force needed
-there); `upstream-fixes`/`wasm-wasi` have been force-pushed at least once
-after a history rewrite earlier this session -- if you rewrite them again,
-expect to need `--force` again (fine for `fork`; never touch `origin`,
-`llvm/llvm-project`, with anything but a normal PR branch push).
+Both branches have been pushed to the `fork` remote
+(`github.com/Ambeco/llvm-project`) as of the last update to this file --
+force-pushed, since this was a full rebase onto a different base commit
+entirely (expect to need `--force` again on any future rebase; fine for
+`fork`, never touch `origin`/`llvm/llvm-project` with anything but a
+normal PR branch push). No PR has been opened anywhere yet — hold off
+until asked.
+
+**Reproducing this rebase, if it needs doing again**: shallow-fetch
+`main`, retarget the branch, cherry-pick each `upstream-fixes` commit in
+order (skip any that come back empty -- already fixed upstream), then
+cherry-pick each `wasm-wasi`-only commit on top in order. All 18 commits
+applied cleanly last time with zero manual conflict resolution -- if that
+changes, investigate the specific conflicting file the normal way (check
+what changed on `main` since our patch was written) rather than assuming
+the patch is still correct as-is.
 
 To reproduce or extend the build, just run `build.bat` from the repo root —
 it's fully in sync with the working configuration. It's an incremental
