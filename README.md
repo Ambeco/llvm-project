@@ -75,6 +75,21 @@ upstream. Dropped from this branch as redundant; not something to redo.)
   reaches the identical fix via the identical reasoning, which is real
   external validation this is a mechanical fallback like the rest of this
   list, not a project-specific stance.
+- `llvm/lib/Support/Unix/Program.inc`: real subprocess spawning
+  (`Execute`/`Wait`, i.e. `posix_spawn`) doesn't exist on WASI. `Execute()`
+  now calls through `CurrentSpawnHook`, a plain C function pointer -- on
+  wasm32 that's just an index into the module's own indirect-call table, so
+  this needs **no wasm import and no host cooperation** just to link or
+  instantiate the module; it defaults to a stub that fails loudly
+  (`report_fatal_error`). This is genuinely self-contained, not a
+  project-specific policy call: a host that wants real subprocess support
+  can, *after* instantiation, grow the module's exported indirect-call
+  table (module must be linked with `--export-table`/`--growable-table`;
+  see below), write its own function into the new slot, and call the
+  exported `__wasi_shim_set_spawn_hook()` to install it -- entirely
+  optional, entirely post-instantiation. See `wasm-wasi`'s
+  `ai-notes/wasi_spawn_shim.mjs` for a reference host doing exactly this,
+  and "JS Framework" below for what a real host provides.
 
 #### `wasm-wasi` (additionally)
 
@@ -83,17 +98,6 @@ upstream. Dropped from this branch as redundant; not something to redo.)
   a single module instance; `Enable()` now fails loudly instead of silently
   pretending to work. The build relies on `-DCLANG_SPAWN_CC1=ON` (see
   `build.bat`) so `Enable()` is never actually called by the driver.
-- `llvm/lib/Support/Unix/Program.inc`: real subprocess spawning
-  (`Execute`/`Wait`, i.e. `posix_spawn`) doesn't exist on WASI. `Execute()`
-  now serializes argv/env into wasm linear memory and calls out to a
-  JS-provided `env.__wasi_shim_spawn_sync(ptr, len) -> i32` import that runs
-  the child synchronously and returns its exit code; `Wait()` just returns
-  the result `Execute()` already stashed, since there's no separate
-  spawned-but-not-yet-waited-on state to model. I/O redirection, timeouts,
-  polling, and detached processes aren't supported yet -- those fail loudly
-  rather than being silently ignored. See `ai-notes/wasi_spawn_shim.mjs` for
-  a reference host (Node `worker_threads`) and "JS Framework" below for what
-  a real host is expected to provide instead.
 - `llvm/lib/Support/Unix/Signals.inc`: WASI can't install real signal
   handlers, so handler registration (crash backtraces, Ctrl-C, cleanup-on-
   signal) becomes a silent no-op -- nothing depends on it succeeding. The
@@ -124,33 +128,49 @@ for `-ldl`). `_GNU_SOURCE` is also set globally in `CMAKE_C_FLAGS`/
 declarations unless `__STRICT_ANSI__` is defined, which LLVM's `-std=c++17`
 (not `-std=gnu++17`) does -- this one flag fixed a large batch of
 `sigfillset`/`siginfo_t`/`SA_NODEFER`-style "undeclared identifier" errors
-that individually looked like missing-symbol bugs.
+that individually looked like missing-symbol bugs. `-Wl,--export-table
+-Wl,--growable-table` are also required, for `Unix/Program.inc`'s spawn
+hook (see above): the first exports the module's indirect-call table so a
+JS host can find it at all, the second removes its fixed maximum size so
+`Table.prototype.grow()` doesn't fail once a host tries to add a slot to it.
 
 ### JS Framework
 
 Running the resulting `clang.wasm` requires the hosting JavaScript to
 provide functionality no WASI host does by default:
 
-- **Custom host-provided functions**, to unlock functionality currently
-  stubbed out as a hard failure:
-  - `env.__wasi_shim_spawn_sync(ptr, len) -> i32`: the process-spawning
-    primitive backing `llvm::sys::ExecuteAndWait`/`Wait` (`Unix/Program.inc`)
-    -- needed for `cc1` invocation (the build forces `-DCLANG_SPAWN_CC1=ON`,
-    so every `cc1` invocation goes through this path) and for invoking
-    `wasm-ld` for linking. **Implemented** as a proof of concept in
-    `ai-notes/wasi_spawn_shim.mjs` + `ai-notes/wasi_spawn_worker.mjs`, using
-    Node `worker_threads` + `Atomics.wait` to block the calling instance
-    synchronously while a second wasm instance (in its own Worker) runs the
-    child to completion -- resolving, per spawn request, to either the
-    *same* wasm module (`cc1`, which lives inside `clang.wasm` itself) or a
-    genuinely different one (`wasm-ld`), by resolving `argv[0]` against the
-    preopen map (see `resolveGuestPath()` in the shim). Verified end to end
-    by `ai-notes/run_clang_link_smoketest.mjs`: compiles, links, and *runs*
-    a real "Hello, world!" through this exact path. A real extension should
-    follow the same shape with a browser Worker instead: decode the wire
-    format documented next to the import declaration in `Unix/Program.inc`,
-    resolve which binary to load, run the child argv in a fresh Worker +
-    wasm instance, and resolve with its exit code.
+- **Install a spawn hook after instantiation**, to unlock functionality
+  that otherwise fails loudly the moment anything tries to use it. No wasm
+  import is required for `clang.wasm` to instantiate at all -- see
+  `Unix/Program.inc` for why this is a table-indirect function pointer, not
+  an import. A host that wants real subprocess support (needed for `cc1`
+  invocation -- the build forces `-DCLANG_SPAWN_CC1=ON`, so every `cc1`
+  invocation goes through this path -- and for invoking `wasm-ld` for
+  linking) does, after `WebAssembly.instantiate()`:
+  1. Grow `instance.exports.__indirect_function_table` by one slot
+     (`table.grow(1)` -- needs the module linked with
+     `-Wl,--export-table -Wl,--growable-table`; see "Build note" above).
+  2. Wrap a JS callback as a typed wasm function
+     (`new WebAssembly.Function({parameters: ['i32','i32'], results:
+     ['i32']}, jsFn)` -- needs Node's `--experimental-wasm-type-reflection`
+     flag; unflagged in modern browsers already) and write it into that
+     slot (`table.set(newIndex, wrapped)`).
+  3. Call `instance.exports.__wasi_shim_set_spawn_hook(newIndex)`.
+
+  **Implemented** as a proof of concept in `ai-notes/wasi_spawn_shim.mjs`
+  (`installSpawnHook()`) + `ai-notes/wasi_spawn_worker.mjs`, using Node
+  `worker_threads` + `Atomics.wait` to block the calling instance
+  synchronously while a second wasm instance (in its own Worker) runs the
+  child to completion -- resolving, per spawn request, to either the
+  *same* wasm module (`cc1`, which lives inside `clang.wasm` itself) or a
+  genuinely different one (`wasm-ld`), by resolving `argv[0]` against the
+  preopen map (see `resolveGuestPath()` in the shim). Verified end to end
+  by `ai-notes/run_clang_link_smoketest.mjs`: compiles, links, and *runs* a
+  real "Hello, world!" through this exact path. A real extension should
+  follow the same shape with a browser Worker instead: decode the wire
+  format documented next to `CurrentSpawnHook` in `Unix/Program.inc`,
+  resolve which binary to load, run the child argv in a fresh Worker +
+  wasm instance, and resolve with its exit code.
   - (Lower priority) a Unix-domain-socket primitive backing
     `raw_socket_stream`/`ListeningSocket`, if some future feature needs it.
     Nothing in a normal compile currently does.
