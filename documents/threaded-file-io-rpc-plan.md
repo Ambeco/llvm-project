@@ -36,9 +36,21 @@ thread opens one fd, hands the plain int to 4 worker threads, each
 `pwrite()`s at a distinct offset using that same fd -- previously failed
 with EBADF) directly with the wasi-sdk clang plus this shim linked in
 (not yet through clang.wasm itself), ran it under the existing
-`ai-notes/wasi_thread_hook.mjs` harness, and confirmed via host-side file
-inspection that both Case A and Case B now produce fully correct,
-interleaved output. This is the smoketest program `run_clang_threaded_io_smoketest.mjs`
+`ai-notes/wasi_thread_hook.mjs` harness, and confirmed via **both**
+host-side file inspection **and** the program's own in-process
+`fopen`/`fread` reopen-and-verify check that Case A and Case B now
+produce fully correct, interleaved output (58 bytes each, matching a
+no-shim baseline build's Case B exactly). The in-process check matters:
+an earlier version of the shim (wrapping only `open`/`openat`/`read`/
+`write`/`pread`/`pwrite`/`readv`/`writev`/`close`) passed the host-side
+check but silently broke the in-process `fopen`+`fread` path for both
+cases (0 bytes instead of 58) -- caught by comparing against a
+freshly-built no-shim baseline rather than trusting the shimmed build's
+own "all threads reported success" line. See "Interception point note"
+in the shim's own file header for the root cause (wasi-libc's `fopen()`
+bypasses `open`/`openat` entirely) and the fix (wrap
+`__wasilibc_nocwd_openat_nomode`, `fcntl`, and `__isatty` instead/as
+well). This is the smoketest program `run_clang_threaded_io_smoketest.mjs`
 already describes; a version of that script driving clang.wasm itself to
 produce this same shimmed binary (rather than compiling it by hand as
 done here) is the natural next verification step once step 6 (build
