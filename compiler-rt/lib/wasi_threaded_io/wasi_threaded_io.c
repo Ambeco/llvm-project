@@ -10,52 +10,85 @@
 // normal pthread program -- main thread opens a file, hands the plain
 // `int` fd to worker threads, each thread reads/writes using that same fd
 // number -- fails with EBADF, because the fd number is only meaningful in
-// whichever thread's table it was allocated from.
+// whichever thread's table it was allocated from. And symmetrically:
+// whichever thread opens a file (main or a worker), every OTHER thread
+// that later touches that fd needs the SAME fix -- there's no special
+// case for "the main thread happened to be the opener." Both directions
+// fall out of the single design below for free.
 //
 // This file fixes that *without any host support*, entirely inside the
 // compiled wasm module: one dedicated thread (spawned lazily, on first
 // use) owns the one real, canonical fd table by being the only thread
-// that ever calls the real open/read/write/... entry points. Every other
-// thread's call to open/read/write/pread/pwrite/readv/writev/close is
-// intercepted (via `-Wl,--wrap=`) and instead marshals its arguments to
-// the I/O thread through a single shared-memory mailbox, blocks (by
-// spinning -- see the note on memory.atomic.wait32 below), and receives
-// the real result back.
+// that ever actually calls the raw WASI syscall imports. Every other
+// thread's raw WASI call is intercepted and instead marshals its
+// arguments to the I/O thread through a single shared-memory mailbox,
+// blocks (by spinning -- see the note on memory.atomic.wait32 below), and
+// receives the real result back.
 //
 // See documents/threaded-file-io-rpc-plan.md for the full design
-// rationale this implements.
+// rationale this implements, including an earlier version of this file
+// that intercepted at the POSIX (open/read/write/...) layer instead --
+// kept there for the reasoning trail on why this raw-import layer
+// replaced it.
+//
+// ---- Why the raw WASI import layer, not the POSIX layer ----
+//
+// wasi-libc's own POSIX-ish functions (open/read/write/pread/pwrite/
+// close/fcntl/isatty/lseek, and FILE*-based fopen/fread/fwrite/fclose) are
+// all, eventually, thin wrappers around a small, fixed set of raw
+// WASI Preview1 imports: fd_read, fd_write, fd_pread, fd_pwrite,
+// fd_close, fd_seek, fd_fdstat_get, fd_fdstat_set_flags, and path_open.
+// An earlier version of this file wrapped the POSIX layer instead (via
+// `-Wl,--wrap=`) and broke twice during validation: `fopen()` bypasses
+// `open()`/`openat()` and calls a lower-level wasi-libc-internal
+// primitive directly, and `fdopen()` (which `fopen()` calls) runs
+// `fcntl()`/`isatty()` on the fd it just opened -- both silently missed
+// by wrapping only the "obvious" POSIX names. Those internal primitive
+// names (`__wasilibc_nocwd_openat_nomode`, `__isatty`, `__lseek`, ...) are
+// wasi-libc implementation details, not a stable contract, so new gaps
+// like that could reappear on a wasi-libc upgrade. The raw imports below
+// are the actual WASI Preview1 ABI: a small, spec'd, stable surface that
+// every one of those POSIX/stdio functions is contractually required to
+// fall through to, by construction -- there's no lower level to bypass.
+//
+// ---- The interception mechanism ----
+//
+// wasi-libc calls these raw imports through symbols named
+// `__imported_wasi_snapshot_preview1_<name>` (e.g.
+// `__imported_wasi_snapshot_preview1_fd_write`), declared but not
+// defined -- i.e. genuine wasm imports, resolved by the host at
+// instantiation time. Giving one of those exact symbol names a real
+// function body (as this file does, in the `__imported_wasi_snapshot_preview1_*`
+// definitions below) makes the linker use that definition instead of
+// importing it -- turning it from a wasm import into an ordinary defined
+// function, transparently redirecting *every* caller (raw POSIX code and
+// FILE*/stdio internals alike) with no `-Wl,--wrap=` or `-u` linker
+// flags needed at all. Confirmed empirically (see the session that added
+// this file) against the real wasi-sdk `libc.a`: no duplicate-symbol
+// error, and a test program's `printf`/stdio path and its raw `write()`
+// call both observably passed through the override.
+//
+// The dedicated I/O thread still needs its own way to reach the *real*
+// host import, since the module-wide symbol now points at our
+// definition. It gets one via a second, differently-named import
+// declaration for the identical (module, name) pair (`wasi_io_real_*`
+// below, using the `import_module`/`import_name` attributes directly) --
+// wasm allows multiple import entries for the same (module, name); the
+// host binds each to the same underlying host function independently.
+// Confirmed empirically too: both the override and this second import
+// coexist and both actually reach the host.
+//
+// `fd_prestat_get`/`fd_prestat_dir_name` are deliberately NOT
+// intercepted: they're only ever called once, very early during crt
+// startup on the main thread (populating the preopens table each thread
+// later reads from, as plain shared global data -- no interception
+// needed there either), before any thread this file's RPC needs to
+// reach exists.
 //
 // Usage: compile this file for a wasm32-wasi*-threads target (it compiles
 // to nothing -- an empty translation unit -- everywhere else, so it's
-// always safe to add to a build) and pass these extra linker flags (each
-// wrapped name needs BOTH -Wl,--wrap= and -Wl,-u, -- see "Linker gotcha"
-// in documents/threaded-file-io-rpc-plan.md for why the -u half matters):
-//
-//   -Wl,--wrap=__wasilibc_nocwd_openat_nomode -Wl,-u,__wasilibc_nocwd_openat_nomode \
-//   -Wl,--wrap=read     -Wl,-u,read     -Wl,--wrap=write  -Wl,-u,write  \
-//   -Wl,--wrap=pread    -Wl,-u,pread    -Wl,--wrap=pwrite -Wl,-u,pwrite \
-//   -Wl,--wrap=readv    -Wl,-u,readv    -Wl,--wrap=writev -Wl,-u,writev \
-//   -Wl,--wrap=close    -Wl,-u,close    -Wl,--wrap=fcntl  -Wl,-u,fcntl  \
-//   -Wl,--wrap=__isatty -Wl,-u,__isatty -Wl,--wrap=__lseek -Wl,-u,__lseek
-//
-// Interception point note: `open`/`openat` themselves are NOT wrapped --
-// wasi-libc's own `fopen()` bypasses them and calls the lower-level
-// `__wasilibc_nocwd_openat_nomode` (path already resolved to a preopen
-// dirfd + relative path by `__wasilibc_find_relpath`, which is pure
-// computation on an already-shared global table, not a host call, so it
-// needs no interception of its own) directly, so wrapping only
-// `open`/`openat` silently misses every `FILE*` (`fopen`/`fread`/etc.)
-// caller. Wrapping this one lower primitive instead catches raw
-// `open()`/`openat()` and `fopen()` uniformly, in one place. `fcntl` and
-// `__isatty` are wrapped too because `fdopen()` (which `fopen()` calls)
-// uses both on the fd it just opened, and both would otherwise resolve
-// the fd against the calling thread's own (empty, for that fd) table
-// instead of the server's -- this was found and fixed after an initial
-// version of this file passed the open/pwrite/close smoketest above but
-// silently broke `fopen`+`fread` on a cross-thread-visible fd (a real
-// regression, caught by comparing against a no-shim baseline rather than
-// trusting the program's own self-check -- see the smoketest program's
-// own comment about exactly this trap).
+// always safe to add to a build). No special link flags are required
+// (unlike the earlier `--wrap`-based version) -- just link the object in.
 //
 // Not yet wired into build.bat/CMake or the clang driver -- see
 // documents/threaded-file-io-rpc-plan.md's build order. For now, link
@@ -67,70 +100,84 @@
 
 #if defined(__wasi__) && defined(__wasm_atomics__)
 
-#include <errno.h>
-#include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
-#include <stdarg.h>
 #include <stdatomic.h>
-#include <string.h>
-#include <sys/types.h>
-#include <sys/uio.h>
-#include <unistd.h>
+#include <stdint.h>
 
-// The real, unwrapped entry points -- `-Wl,--wrap=X` renames the module's
-// own callers of `X` to call `__wrap_X` (defined below) and makes `X`'s
-// original definition reachable as `__real_X`. Only the dedicated I/O
-// thread ever calls these.
-int __real___wasilibc_nocwd_openat_nomode(int, const char *, int);
-ssize_t __real_read(int, void *, size_t);
-ssize_t __real_write(int, const void *, size_t);
-ssize_t __real_pread(int, void *, size_t, off_t);
-ssize_t __real_pwrite(int, const void *, size_t, off_t);
-ssize_t __real_readv(int, const struct iovec *, int);
-ssize_t __real_writev(int, const struct iovec *, int);
-int __real_close(int);
-int __real_fcntl(int, int, ...);
-int __real___isatty(int);
-off_t __real___lseek(int, off_t, int);
+// ---- The real, unwrapped imports -- only the I/O server thread calls these.
+//
+// Each is a second, independent import of the same (module, name) pair
+// that `__imported_wasi_snapshot_preview1_<name>` below is normally bound
+// to -- see the file header comment above.
+#define WASI_IMPORT(name)                                                    \
+  __attribute__((import_module("wasi_snapshot_preview1"), import_name(#name)))
+
+WASI_IMPORT(fd_close) extern int32_t wasi_io_real_fd_close(int32_t fd);
+WASI_IMPORT(fd_fdstat_get)
+extern int32_t wasi_io_real_fd_fdstat_get(int32_t fd, int32_t retptr0);
+WASI_IMPORT(fd_fdstat_set_flags)
+extern int32_t wasi_io_real_fd_fdstat_set_flags(int32_t fd, int32_t flags);
+WASI_IMPORT(fd_seek)
+extern int32_t wasi_io_real_fd_seek(int32_t fd, int64_t offset,
+                                     int32_t whence, int32_t retptr0);
+WASI_IMPORT(fd_write)
+extern int32_t wasi_io_real_fd_write(int32_t fd, int32_t iovs,
+                                      int32_t iovs_len, int32_t retptr0);
+WASI_IMPORT(fd_read)
+extern int32_t wasi_io_real_fd_read(int32_t fd, int32_t iovs,
+                                     int32_t iovs_len, int32_t retptr0);
+WASI_IMPORT(fd_pwrite)
+extern int32_t wasi_io_real_fd_pwrite(int32_t fd, int32_t iovs,
+                                       int32_t iovs_len, int64_t offset,
+                                       int32_t retptr0);
+WASI_IMPORT(fd_pread)
+extern int32_t wasi_io_real_fd_pread(int32_t fd, int32_t iovs,
+                                      int32_t iovs_len, int64_t offset,
+                                      int32_t retptr0);
+WASI_IMPORT(path_open)
+extern int32_t wasi_io_real_path_open(int32_t dirfd, int32_t dirflags,
+                                       int32_t path, int32_t path_len,
+                                       int32_t oflags, int64_t rights_base,
+                                       int64_t rights_inheriting,
+                                       int32_t fdflags, int32_t retptr0);
+
+#undef WASI_IMPORT
 
 enum io_op {
-  IO_OPENAT_NOMODE,
-  IO_READ,
-  IO_WRITE,
-  IO_PREAD,
-  IO_PWRITE,
-  IO_READV,
-  IO_WRITEV,
-  IO_CLOSE,
-  IO_FCNTL,
-  IO_ISATTY,
-  IO_LSEEK,
+  IO_FD_CLOSE,
+  IO_FD_FDSTAT_GET,
+  IO_FD_FDSTAT_SET_FLAGS,
+  IO_FD_SEEK,
+  IO_FD_WRITE,
+  IO_FD_READ,
+  IO_FD_PWRITE,
+  IO_FD_PREAD,
+  IO_PATH_OPEN,
 };
 
-// All threads share one linear memory, so pointers (path, buf, iov) can be
-// handed across as-is -- no serialization needed, just a plain struct copy.
+// All threads share one linear memory, so pointer-shaped fields (path,
+// iovs, retptr0) are just plain i32 addresses -- the server thread
+// dereferences them directly, including writing results (byte counts,
+// the new seek offset, a fdstat struct, ...) straight into the caller's
+// own retptr0 buffer. No result data needs to travel back through the
+// mailbox at all; only the raw WASI errno return code does.
 struct io_request {
   enum io_op op;
-  int fd;
-  int dirfd;
-  const char *path;
-  int oflags;
-  void *buf;
-  size_t count;
-  const struct iovec *iov;
-  int iovcnt;
-  off_t offset;
-  long fcntl_arg; // fcntl()'s optional 3rd argument, forwarded as a plain
-                   // word -- int and pointer are both 32 bits on wasm32,
-                   // so this covers both without needing to know which
-                   // fcntl command was requested.
-  int whence;      // lseek()'s 3rd argument.
-};
-
-struct io_response {
-  long long ret;
-  int err;
+  int32_t fd;
+  int32_t iovs;
+  int32_t iovs_len;
+  int64_t offset;
+  int32_t whence;
+  int32_t retptr0;
+  int32_t dirfd;
+  int32_t dirflags;
+  int32_t path;
+  int32_t path_len;
+  int32_t oflags;
+  int64_t rights_base;
+  int64_t rights_inheriting;
+  int32_t fdflags;
 };
 
 enum mbox_state { MBOX_IDLE = 0, MBOX_REQUEST = 1, MBOX_RESPONSE = 2 };
@@ -143,70 +190,50 @@ static struct {
   _Atomic int state;
   _Atomic int submit_lock;
   struct io_request req;
-  struct io_response resp;
+  _Atomic int32_t resp_ret;
 } g_mbox;
 
 static pthread_once_t g_io_once = PTHREAD_ONCE_INIT;
 static _Atomic int g_io_thread_ready = 0;
 
-// Forward decl -- t_is_io_thread's definition sits next to do_real_io()
-// below, where it's easiest to explain, but on_io_thread() (used by every
-// __wrap_* function further down) needs it declared first.
-static _Thread_local int t_is_io_thread;
-
-static long long do_real_io(struct io_request *r, int *out_err) {
-  long long ret;
-  switch (r->op) {
-  case IO_OPENAT_NOMODE:
-    ret = __real___wasilibc_nocwd_openat_nomode(r->dirfd, r->path, r->oflags);
-    break;
-  case IO_READ:
-    ret = __real_read(r->fd, r->buf, r->count);
-    break;
-  case IO_WRITE:
-    ret = __real_write(r->fd, r->buf, r->count);
-    break;
-  case IO_PREAD:
-    ret = __real_pread(r->fd, r->buf, r->count, r->offset);
-    break;
-  case IO_PWRITE:
-    ret = __real_pwrite(r->fd, r->buf, r->count, r->offset);
-    break;
-  case IO_READV:
-    ret = __real_readv(r->fd, r->iov, r->iovcnt);
-    break;
-  case IO_WRITEV:
-    ret = __real_writev(r->fd, r->iov, r->iovcnt);
-    break;
-  case IO_CLOSE:
-    ret = __real_close(r->fd);
-    break;
-  case IO_FCNTL:
-    ret = __real_fcntl(r->fd, r->oflags, r->fcntl_arg);
-    break;
-  case IO_ISATTY:
-    ret = __real___isatty(r->fd);
-    break;
-  case IO_LSEEK:
-    ret = __real___lseek(r->fd, r->offset, r->whence);
-    break;
-  default:
-    *out_err = EINVAL;
-    return -1;
-  }
-  *out_err = (ret < 0) ? errno : 0;
-  return ret;
-}
-
 // Set as the first statement of io_server_main(), before anything else
 // (including the g_io_thread_ready store below) can run on this thread.
 // Deliberately thread-local rather than comparing pthread_self() against
-// a shared g_io_thread global: g_io_thread is written by the *parent* in
-// pthread_create() and could otherwise be read here before that write is
-// visible, making the server appear not-yet-ready to itself and RPC to
-// itself -- a guaranteed deadlock. A thread-local set by the thread about
-// itself has no such ordering dependency.
+// a shared "which thread is the server" global: such a global is written
+// by the *parent* in pthread_create() and could be read here before that
+// write is visible, making the server appear not-yet-itself to itself
+// and RPC to itself -- a guaranteed deadlock. A thread-local a thread
+// sets about itself has no such ordering dependency.
 static _Thread_local int t_is_io_thread = 0;
+
+static int32_t do_real_io(struct io_request *r) {
+  switch (r->op) {
+  case IO_FD_CLOSE:
+    return wasi_io_real_fd_close(r->fd);
+  case IO_FD_FDSTAT_GET:
+    return wasi_io_real_fd_fdstat_get(r->fd, r->retptr0);
+  case IO_FD_FDSTAT_SET_FLAGS:
+    return wasi_io_real_fd_fdstat_set_flags(r->fd, r->fdflags);
+  case IO_FD_SEEK:
+    return wasi_io_real_fd_seek(r->fd, r->offset, r->whence, r->retptr0);
+  case IO_FD_WRITE:
+    return wasi_io_real_fd_write(r->fd, r->iovs, r->iovs_len, r->retptr0);
+  case IO_FD_READ:
+    return wasi_io_real_fd_read(r->fd, r->iovs, r->iovs_len, r->retptr0);
+  case IO_FD_PWRITE:
+    return wasi_io_real_fd_pwrite(r->fd, r->iovs, r->iovs_len, r->offset,
+                                   r->retptr0);
+  case IO_FD_PREAD:
+    return wasi_io_real_fd_pread(r->fd, r->iovs, r->iovs_len, r->offset,
+                                  r->retptr0);
+  case IO_PATH_OPEN:
+    return wasi_io_real_path_open(r->dirfd, r->dirflags, r->path, r->path_len,
+                                   r->oflags, r->rights_base,
+                                   r->rights_inheriting, r->fdflags,
+                                   r->retptr0);
+  }
+  return 28; // __WASI_ERRNO_INVAL -- unreachable in practice.
+}
 
 static void *io_server_main(void *arg) {
   (void)arg;
@@ -219,10 +246,8 @@ static void *io_server_main(void *arg) {
     while (atomic_load_explicit(&g_mbox.state, memory_order_acquire) !=
            MBOX_REQUEST)
       sched_yield();
-    int err = 0;
-    long long ret = do_real_io(&g_mbox.req, &err);
-    g_mbox.resp.ret = ret;
-    g_mbox.resp.err = err;
+    int32_t ret = do_real_io(&g_mbox.req);
+    atomic_store_explicit(&g_mbox.resp_ret, ret, memory_order_relaxed);
     atomic_store_explicit(&g_mbox.state, MBOX_RESPONSE, memory_order_release);
   }
   return NULL;
@@ -250,7 +275,7 @@ static void start_io_thread(void) {
 // deadlocking.
 static int on_io_thread(void) { return t_is_io_thread; }
 
-static long long do_rpc(struct io_request *r, int *out_err) {
+static int32_t do_rpc(struct io_request *r) {
   pthread_once(&g_io_once, start_io_thread);
 
   int expected = 0;
@@ -276,179 +301,130 @@ static long long do_rpc(struct io_request *r, int *out_err) {
          MBOX_RESPONSE)
     sched_yield();
 
-  long long ret = g_mbox.resp.ret;
-  *out_err = g_mbox.resp.err;
+  int32_t ret = atomic_load_explicit(&g_mbox.resp_ret, memory_order_relaxed);
   atomic_store_explicit(&g_mbox.state, MBOX_IDLE, memory_order_release);
   atomic_store_explicit(&g_mbox.submit_lock, 0, memory_order_release);
   return ret;
 }
 
-// ---- wrapped entry points (need -Wl,--wrap=<name> at link time each) ----
+// ---- The intercepted imports themselves --------------------------------
 //
-// open()/openat() themselves are deliberately NOT wrapped -- see the file
-// header comment. This one catches both of them and fopen().
-int __wrap___wasilibc_nocwd_openat_nomode(int dirfd, const char *path,
-                                           int oflags) {
+// Each of these takes over a wasm import wasi-libc otherwise resolves
+// against the host directly -- see the file header comment.
+
+int32_t __imported_wasi_snapshot_preview1_fd_close(int32_t fd) {
   if (on_io_thread())
-    return __real___wasilibc_nocwd_openat_nomode(dirfd, path, oflags);
+    return wasi_io_real_fd_close(fd);
+  struct io_request r = {.op = IO_FD_CLOSE, .fd = fd};
+  return do_rpc(&r);
+}
+
+int32_t __imported_wasi_snapshot_preview1_fd_fdstat_get(int32_t fd,
+                                                          int32_t retptr0) {
+  if (on_io_thread())
+    return wasi_io_real_fd_fdstat_get(fd, retptr0);
+  struct io_request r = {.op = IO_FD_FDSTAT_GET, .fd = fd, .retptr0 = retptr0};
+  return do_rpc(&r);
+}
+
+int32_t
+__imported_wasi_snapshot_preview1_fd_fdstat_set_flags(int32_t fd,
+                                                       int32_t flags) {
+  if (on_io_thread())
+    return wasi_io_real_fd_fdstat_set_flags(fd, flags);
   struct io_request r = {
-      .op = IO_OPENAT_NOMODE, .dirfd = dirfd, .path = path, .oflags = oflags};
-  int err = 0;
-  long long ret = do_rpc(&r, &err);
-  if (ret < 0)
-    errno = err;
-  return (int)ret;
+      .op = IO_FD_FDSTAT_SET_FLAGS, .fd = fd, .fdflags = flags};
+  return do_rpc(&r);
 }
 
-ssize_t __wrap_read(int fd, void *buf, size_t count) {
+int32_t __imported_wasi_snapshot_preview1_fd_seek(int32_t fd, int64_t offset,
+                                                   int32_t whence,
+                                                   int32_t retptr0) {
   if (on_io_thread())
-    return __real_read(fd, buf, count);
-  struct io_request r = {.op = IO_READ, .fd = fd, .buf = buf, .count = count};
-  int err = 0;
-  long long ret = do_rpc(&r, &err);
-  if (ret < 0)
-    errno = err;
-  return (ssize_t)ret;
-}
-
-ssize_t __wrap_write(int fd, const void *buf, size_t count) {
-  if (on_io_thread())
-    return __real_write(fd, buf, count);
-  struct io_request r = {
-      .op = IO_WRITE, .fd = fd, .buf = (void *)buf, .count = count};
-  int err = 0;
-  long long ret = do_rpc(&r, &err);
-  if (ret < 0)
-    errno = err;
-  return (ssize_t)ret;
-}
-
-ssize_t __wrap_pread(int fd, void *buf, size_t count, off_t offset) {
-  if (on_io_thread())
-    return __real_pread(fd, buf, count, offset);
-  struct io_request r = {
-      .op = IO_PREAD, .fd = fd, .buf = buf, .count = count, .offset = offset};
-  int err = 0;
-  long long ret = do_rpc(&r, &err);
-  if (ret < 0)
-    errno = err;
-  return (ssize_t)ret;
-}
-
-ssize_t __wrap_pwrite(int fd, const void *buf, size_t count, off_t offset) {
-  if (on_io_thread())
-    return __real_pwrite(fd, buf, count, offset);
-  struct io_request r = {.op = IO_PWRITE,
+    return wasi_io_real_fd_seek(fd, offset, whence, retptr0);
+  struct io_request r = {.op = IO_FD_SEEK,
                           .fd = fd,
-                          .buf = (void *)buf,
-                          .count = count,
-                          .offset = offset};
-  int err = 0;
-  long long ret = do_rpc(&r, &err);
-  if (ret < 0)
-    errno = err;
-  return (ssize_t)ret;
+                          .offset = offset,
+                          .whence = whence,
+                          .retptr0 = retptr0};
+  return do_rpc(&r);
 }
 
-ssize_t __wrap_readv(int fd, const struct iovec *iov, int iovcnt) {
+int32_t __imported_wasi_snapshot_preview1_fd_write(int32_t fd, int32_t iovs,
+                                                    int32_t iovs_len,
+                                                    int32_t retptr0) {
   if (on_io_thread())
-    return __real_readv(fd, iov, iovcnt);
-  struct io_request r = {.op = IO_READV, .fd = fd, .iov = iov, .iovcnt = iovcnt};
-  int err = 0;
-  long long ret = do_rpc(&r, &err);
-  if (ret < 0)
-    errno = err;
-  return (ssize_t)ret;
+    return wasi_io_real_fd_write(fd, iovs, iovs_len, retptr0);
+  struct io_request r = {.op = IO_FD_WRITE,
+                          .fd = fd,
+                          .iovs = iovs,
+                          .iovs_len = iovs_len,
+                          .retptr0 = retptr0};
+  return do_rpc(&r);
 }
 
-ssize_t __wrap_writev(int fd, const struct iovec *iov, int iovcnt) {
+int32_t __imported_wasi_snapshot_preview1_fd_read(int32_t fd, int32_t iovs,
+                                                   int32_t iovs_len,
+                                                   int32_t retptr0) {
   if (on_io_thread())
-    return __real_writev(fd, iov, iovcnt);
-  struct io_request r = {
-      .op = IO_WRITEV, .fd = fd, .iov = iov, .iovcnt = iovcnt};
-  int err = 0;
-  long long ret = do_rpc(&r, &err);
-  if (ret < 0)
-    errno = err;
-  return (ssize_t)ret;
+    return wasi_io_real_fd_read(fd, iovs, iovs_len, retptr0);
+  struct io_request r = {.op = IO_FD_READ,
+                          .fd = fd,
+                          .iovs = iovs,
+                          .iovs_len = iovs_len,
+                          .retptr0 = retptr0};
+  return do_rpc(&r);
 }
 
-int __wrap_close(int fd) {
+int32_t __imported_wasi_snapshot_preview1_fd_pwrite(int32_t fd, int32_t iovs,
+                                                     int32_t iovs_len,
+                                                     int64_t offset,
+                                                     int32_t retptr0) {
   if (on_io_thread())
-    return __real_close(fd);
-  struct io_request r = {.op = IO_CLOSE, .fd = fd};
-  int err = 0;
-  long long ret = do_rpc(&r, &err);
-  if (ret < 0)
-    errno = err;
-  return (int)ret;
+    return wasi_io_real_fd_pwrite(fd, iovs, iovs_len, offset, retptr0);
+  struct io_request r = {.op = IO_FD_PWRITE,
+                          .fd = fd,
+                          .iovs = iovs,
+                          .iovs_len = iovs_len,
+                          .offset = offset,
+                          .retptr0 = retptr0};
+  return do_rpc(&r);
 }
 
-// fdopen() (which fopen() calls) runs fcntl()/__isatty() on the fd it just
-// opened to decide the stream's buffering mode -- both need routing too,
-// or they silently resolve the (now server-owned) fd against the calling
-// thread's own table instead. Only F_GETFL/F_SETFL-style commands with a
-// plain int (or no) 3rd argument are meaningfully supported here: a
-// command whose 3rd argument is itself a pointer into this thread's own
-// memory (e.g. F_GETLK/F_SETLK's `struct flock *`) is still forwarded as
-// a bare word and dereferenced correctly regardless of which thread
-// dereferences it, since all threads share one linear memory -- so this
-// isn't actually a limitation for wasm, just calling out that the
-// request struct's field is untyped on purpose.
-int __wrap_fcntl(int fd, int cmd, ...) {
-  // Only pull the variadic argument for commands that actually pass one
-  // (F_GETFD/F_GETFL do not) -- reading a va_arg that was never supplied
-  // is undefined behavior, not just a wrong value, and F_GETFL is exactly
-  // what fdopen() calls on every fopen().
-  long arg = 0;
-  switch (cmd) {
-  case F_DUPFD:
-  case F_SETFD:
-  case F_SETFL:
-  case F_GETLK:
-  case F_SETLK:
-  case F_SETLKW: {
-    va_list ap;
-    va_start(ap, cmd);
-    arg = va_arg(ap, long);
-    va_end(ap);
-    break;
-  }
-  default:
-    break; // e.g. F_GETFD, F_GETFL: no 3rd argument.
-  }
+int32_t __imported_wasi_snapshot_preview1_fd_pread(int32_t fd, int32_t iovs,
+                                                    int32_t iovs_len,
+                                                    int64_t offset,
+                                                    int32_t retptr0) {
   if (on_io_thread())
-    return __real_fcntl(fd, cmd, arg);
-  struct io_request r = {
-      .op = IO_FCNTL, .fd = fd, .oflags = cmd, .fcntl_arg = arg};
-  int err = 0;
-  long long ret = do_rpc(&r, &err);
-  if (ret < 0)
-    errno = err;
-  return (int)ret;
+    return wasi_io_real_fd_pread(fd, iovs, iovs_len, offset, retptr0);
+  struct io_request r = {.op = IO_FD_PREAD,
+                          .fd = fd,
+                          .iovs = iovs,
+                          .iovs_len = iovs_len,
+                          .offset = offset,
+                          .retptr0 = retptr0};
+  return do_rpc(&r);
 }
 
-int __wrap___isatty(int fd) {
+int32_t __imported_wasi_snapshot_preview1_path_open(
+    int32_t dirfd, int32_t dirflags, int32_t path, int32_t path_len,
+    int32_t oflags, int64_t rights_base, int64_t rights_inheriting,
+    int32_t fdflags, int32_t retptr0) {
   if (on_io_thread())
-    return __real___isatty(fd);
-  struct io_request r = {.op = IO_ISATTY, .fd = fd};
-  int err = 0;
-  long long ret = do_rpc(&r, &err);
-  if (ret < 0)
-    errno = err;
-  return (int)ret;
-}
-
-off_t __wrap___lseek(int fd, off_t offset, int whence) {
-  if (on_io_thread())
-    return __real___lseek(fd, offset, whence);
-  struct io_request r = {
-      .op = IO_LSEEK, .fd = fd, .offset = offset, .whence = whence};
-  int err = 0;
-  long long ret = do_rpc(&r, &err);
-  if (ret < 0)
-    errno = err;
-  return (off_t)ret;
+    return wasi_io_real_path_open(dirfd, dirflags, path, path_len, oflags,
+                                   rights_base, rights_inheriting, fdflags,
+                                   retptr0);
+  struct io_request r = {.op = IO_PATH_OPEN,
+                          .dirfd = dirfd,
+                          .dirflags = dirflags,
+                          .path = path,
+                          .path_len = path_len,
+                          .oflags = oflags,
+                          .rights_base = rights_base,
+                          .rights_inheriting = rights_inheriting,
+                          .fdflags = fdflags,
+                          .retptr0 = retptr0};
+  return do_rpc(&r);
 }
 
 #endif // defined(__wasi__) && defined(__wasm_atomics__)

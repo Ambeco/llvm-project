@@ -1,62 +1,137 @@
 # Plan: dedicated file-I/O thread + in-wasm RPC
 
 Status: **implemented and verified for the "output program" case** (steps
-1-5 of the build order below). Not yet wired into build.bat/CMake or the
-clang driver (step 6, and linking this into clang.wasm itself, remain
-future work).
+1-5 of the build order below), on its **second design** -- see "What's
+built" immediately below, and "Superseded design" further down for the
+first version's history (kept because the reasoning for abandoning it,
+and a real bug it caught, are both still useful). Not yet wired into
+build.bat/CMake or the clang driver (step 6, and linking this into
+clang.wasm itself, remain future work) beyond build.bat compiling the
+shim into its own archive (see "Build system" below).
 
-## What's built
+## What's built (current design: raw WASI import interception)
 
 `compiler-rt/lib/wasi_threaded_io/wasi_threaded_io.c` -- a single C file,
-entirely `#if defined(__wasi__) && defined(__wasm_atomics__)`-guarded (compiles
-to nothing on every other target, including the plain non-threaded
-`wasm32-unknown-wasip1` compiler-rt pass in build.bat, which lacks
-`+atomics`). It:
+entirely `#if defined(__wasi__) && defined(__wasm_atomics__)`-guarded
+(compiles to nothing on every other target, including the plain
+non-threaded `wasm32-unknown-wasip1` compiler-rt pass in build.bat, which
+lacks `+atomics`). It:
 
 - Spawns one dedicated I/O-server pthread, lazily on first use
   (`pthread_once`), with an explicit generous stack
   (`pthread_attr_setstacksize`) per constraint 3 below.
-- Intercepts `open`/`openat`/`read`/`write`/`pread`/`pwrite`/`readv`/
-  `writev`/`close` via `-Wl,--wrap=`, and marshals every one of them --
-  from every thread, main included -- to the server thread through a
+- Intercepts the raw WASI Preview1 imports `fd_close`/`fd_fdstat_get`/
+  `fd_fdstat_set_flags`/`fd_seek`/`fd_write`/`fd_read`/`fd_pwrite`/
+  `fd_pread`/`path_open` -- **not** the POSIX layer (`open`/`read`/
+  `write`/...) an earlier version of this file wrapped; see "Why the raw
+  WASI import layer, not the POSIX layer" in the file's own header
+  comment for the full reasoning. Every intercepted call, from every
+  thread including main, marshals to the server thread through a
   single-slot shared-memory mailbox guarded by a spinlock plus a
   plain-atomic-load spin for the response (never `memory.atomic.wait32`;
-  see constraint 1 below, which was corrected from the original plan).
-- Only the server thread ever calls the real `__real_*` entry points, so
+  see constraint 1 below).
+- Only the server thread ever calls the real `wasi_io_real_*` imports, so
   it's the sole owner of the one real fd table -- fixing the shared-fd-
-  across-threads gap directly.
+  across-threads gap directly, symmetrically regardless of which thread
+  (main or a worker) happens to be the one that opened the fd. See
+  "Main-thread-opens, workers-read/write is not a special case" below --
+  a question raised, and answered, while building this design.
 
-**Required link flags** (see the file's own header comment for the
-canonical list): for every wrapped name `X`, pass both
-`-Wl,--wrap=X` **and** `-Wl,-u,X`. The `-u` half is not optional --
-see "Linker gotcha found while validating" below.
+**No special link flags required** -- this is the main practical
+advantage over the superseded `-Wl,--wrap=`-based design: giving a
+function body to the exact symbol name wasi-libc calls its raw imports
+through (`__imported_wasi_snapshot_preview1_<name>`) turns that import
+into an ordinary defined function at link time, with no `--wrap`/`-u`
+flags, no `--allow-multiple-definition`, nothing beyond linking the
+object in. The dedicated I/O thread reaches the *real* host import via a
+second, differently-named import declaration for the identical
+`(module, name)` pair (`wasi_io_real_fd_write` etc., declared with the
+`import_module`/`import_name` attributes directly) -- wasm permits
+multiple import entries for one `(module, name)`, and the host binds
+each independently to the same underlying function. Confirmed
+empirically before writing the real shim (a standalone repro: a program
+linked normally against the real `libc.a`, with an
+`__imported_wasi_snapshot_preview1_fd_write` override plus a
+`real_fd_write`-named second import) -- no duplicate-symbol error, and
+both the test program's `printf` (stdio) path and its raw `write()` call
+were observably intercepted (a `[intercepted]` marker byte written by
+the override function preceded both outputs when run under Node's WASI
+host).
 
-**Verified**: compiled `ai-notes/`'s `hello_threads_io.c` (Case A: main
-thread opens one fd, hands the plain int to 4 worker threads, each
-`pwrite()`s at a distinct offset using that same fd -- previously failed
-with EBADF) directly with the wasi-sdk clang plus this shim linked in
-(not yet through clang.wasm itself), ran it under the existing
-`ai-notes/wasi_thread_hook.mjs` harness, and confirmed via **both**
-host-side file inspection **and** the program's own in-process
-`fopen`/`fread` reopen-and-verify check that Case A and Case B now
-produce fully correct, interleaved output (58 bytes each, matching a
-no-shim baseline build's Case B exactly). The in-process check matters:
-an earlier version of the shim (wrapping only `open`/`openat`/`read`/
-`write`/`pread`/`pwrite`/`readv`/`writev`/`close`) passed the host-side
-check but silently broke the in-process `fopen`+`fread` path for both
-cases (0 bytes instead of 58) -- caught by comparing against a
-freshly-built no-shim baseline rather than trusting the shimmed build's
-own "all threads reported success" line. See "Interception point note"
-in the shim's own file header for the root cause (wasi-libc's `fopen()`
-bypasses `open`/`openat` entirely) and the fix (wrap
-`__wasilibc_nocwd_openat_nomode`, `fcntl`, and `__isatty` instead/as
-well). This is the smoketest program `run_clang_threaded_io_smoketest.mjs`
-already describes; a version of that script driving clang.wasm itself to
-produce this same shimmed binary (rather than compiling it by hand as
-done here) is the natural next verification step once step 6 (build
-system / driver wiring) happens.
+**Verified** the same way as the superseded design was (see that
+section for exact methodology): `ai-notes/hello_threads_io.c`'s Case A
+and Case B both produce correct output (58 bytes, matching a no-shim
+baseline) via both host-side file inspection and the program's own
+in-process `fopen`/`fread` check -- full parity with the previous
+design's verified result, but with zero required link flags. Additionally
+verified the reverse of Case A specifically (see next section): a new
+`main_opens.c` test where the *main* thread opens the file and four
+*worker* threads `pwrite()` to it -- correct 59-byte interleaved output,
+no special-casing needed anywhere in the implementation for "who opened
+it."
 
-## Linker gotcha found while validating (`-Wl,-u,<sym>` is required)
+## Main-thread-opens, workers-read/write is not a special case
+
+Raised as an open question: what happens when the *main* thread opens a
+file and other threads read/write it -- doesn't the main thread need
+special handling (e.g. proxying I/O for other threads itself, or a
+shared-atomic-offset scheme ignoring each thread's private fd table)?
+
+**No special handling needed, and neither workaround is required.** Both
+of those would only be necessary under the *original*, since-corrected
+version of constraint 1 below (main thread keeps calling its own real
+WASI imports directly, only worker threads RPC out) -- under that
+design, a file main opens lives in main's own fd table, invisible to the
+server thread other workers RPC to, so yes, you'd need one of the two
+workarounds the question describes. But that version of constraint 1 was
+already corrected before any code was written (see below): **every**
+thread, main included, routes through the RPC and only the server thread
+ever touches a real fd. Under that design, "main opened it" and "a
+worker opened it" are the identical case -- the fd lives in the server's
+table either way, and whichever thread later touches that fd number (main
+or any worker) reaches the same table through the same RPC. Verified
+directly with `main_opens.c` (described above): main opens, four workers
+`pwrite()` concurrently, correct interleaved result, no thread-identity
+logic involved beyond the existing `on_io_thread()` check (which only
+ever answers "am I the dedicated server," never "did I open this fd").
+
+The design's actual constraint is orthogonal to *who opens a file*: it's
+about *what "share a fd" means for non-positional `read()`/`write()`* --
+if multiple threads plain-`read()`/`write()` (not `pread`/`pwrite`) the
+*same* fd concurrently, they race on that fd's single shared file-offset
+cursor, same as they would in a real native multi-threaded process (this
+is standard, expected POSIX behavior, not something this design
+introduces or could fix -- it's exactly why `hello_threads_io.c`'s
+shared-fd case deliberately uses `pwrite`, not `write`). The single
+mailbox actually serializes concurrent requests more strictly than a
+real OS-level shared fd would (only one request in flight at a time), so
+if anything this design is less racy than native hardware concurrency
+here, not more.
+
+## Superseded design: POSIX-layer `-Wl,--wrap=` interception
+
+Kept for the reasoning trail on why it was replaced, and because a real
+regression it caught (see below) is a useful cautionary example on its
+own. The current design (above) supersedes all of this section.
+
+The first working version of the shim intercepted `open`/`openat`/
+`read`/`write`/`pread`/`pwrite`/`readv`/`writev`/`close` via
+`-Wl,--wrap=`, requiring `-Wl,-u,<sym>` alongside every `--wrap=<sym>`
+(see "Linker gotcha" below). It passed `hello_threads_io.c`'s raw-syscall
+Case A/B, but a follow-up no-shim-baseline comparison (prompted by
+review, not by this session's own testing) showed it silently broke the
+program's in-process `fopen()`+`fread()` self-check for *both* cases (0
+bytes read instead of 58) -- because `fopen()` calls a wasi-libc-internal
+primitive (`__wasilibc_nocwd_openat_nomode`) that bypasses `open`/
+`openat` entirely, and `fdopen()` (which `fopen()` calls) runs `fcntl()`/
+`isatty()` on the fd it just opened, both of which also weren't wrapped.
+Fixed at the time by wrapping those additional, wasi-libc-*internal*
+names instead/as well -- but internal names aren't a stable contract
+(confirmed by the fact that this gap existed at all), which is exactly
+what motivated moving to the raw WASI import layer instead: a small,
+spec'd, stable surface with no lower level left to bypass.
+
+## Linker gotcha found while validating the superseded design (`-Wl,-u,<sym>` is required)
 
 `-Wl,--wrap=pread` alone silently produces a broken build: if nothing
 else in the link calls plain `pread()`, nothing forces wasm-ld to pull
