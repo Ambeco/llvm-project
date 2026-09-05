@@ -11,8 +11,10 @@ Clang](https://github.com/llvm/llvm-project) for some minor adjustments
 enabling Clang to be compiled to wasi+wasm, for eventual use in a Visual
 Studio Code for Web extension that compiles and runs (and ideally debugs)
 C++ programs without any local install. It's built with `wasi-sdk` against
-the `wasm32-wasip1` target; see `build.bat` for the full toolchain
-invocation.
+the `wasm32-wasip1-threads` target (clang.wasm/lld.wasm run with real
+`LLVM_ENABLE_THREADS=ON` multithreading; *compiled output* still defaults
+to plain, non-threaded `wasm32-wasip1` unless the user asks otherwise);
+see `build.bat` for the full toolchain invocation.
 
 ### Changes
 
@@ -204,13 +206,74 @@ provide functionality no WASI host does by default:
   `ai-notes/run_clang_parallel_smoketest.mjs`: compiling 8 files
   concurrently this way took ~156ms wall-clock vs. ~89ms for 1 file --
   nowhere near the ~712ms sequential compilation would take, confirming
-  real concurrency. This is deliberately *not* the same thing as giving
-  clang.wasm real multithreading (`LLVM_ENABLE_THREADS`, `std::thread`,
-  etc.) -- that would need actual shared linear memory across instances
-  (a different target triple, `-pthread`, `-matomics`, and implementing
-  the `wasi-threads` host ABI), a materially bigger and separate effort
-  not attempted here. Independent per-file compilation is the cheap,
-  already-available win; real in-module threading remains future work.
+  real concurrency. This is a *different* mechanism from clang.wasm's own
+  real in-module multithreading (below) -- process-like isolation (no
+  shared memory) versus real shared-memory threads -- and remains the
+  cheaper, always-available option for the common case (an independent
+  compile per file in a multi-file project), regardless of whether
+  in-module threading ever helps a given single compile.
+- **Real in-module multithreading is also implemented**: `clang.wasm`/
+  `lld.wasm` are built against `wasm32-unknown-wasip1-threads` with
+  `-DLLVM_ENABLE_THREADS=ON` (see `build.bat`) -- real `std::thread`/
+  pthreads, real shared `WebAssembly.Memory`, real `wasi.thread-spawn`.
+  This needs a host that supplies the "install a spawn hook" mechanism
+  above *and* separately implements the `wasi-threads` ABI: construct a
+  shared `WebAssembly.Memory` matching the module's declared min/max
+  limits (`WebAssembly.Module.imports()` doesn't expose these -- parse the
+  raw import section by hand, see `ai-notes/wasi_thread_hook.mjs`'s
+  `readImportedMemoryLimits()`), supply it as `env.memory` to every
+  instance (including the first/main one -- the module no longer owns its
+  memory at all), and implement `wasi.thread-spawn(start_arg) -> tid`: on
+  each call, spin up a Worker, instantiate the same module against that
+  same shared memory, and call its exported `wasi_thread_start(tid,
+  start_arg)`. Unlike subprocess spawn, this never has to block: real
+  `pthread_create()` semantics return as soon as the thread exists, not
+  when it finishes, so the host just allocates a `tid` and returns.
+  Mutex/condvar/join synchronization needs *no* additional host code at
+  all -- it's wasm's own `memory.atomic.wait32`/`notify` instructions
+  operating on the shared memory, handled entirely by the engine.
+  **Implemented** in `ai-notes/wasi_thread_hook.mjs` +
+  `ai-notes/wasi_thread_worker.mjs`; verified end to end both standalone
+  (`ai-notes/run_wasi_threads_prototype.mjs`: 4 real pthreads, a
+  mutex-protected shared counter, exactly correct after concurrent
+  increments) and wired into the real `clang.wasm`/`lld.wasm` build (all
+  four smoke tests pass). One real host-side gotcha:
+  [`node:wasi`](https://nodejs.org/api/wasi.html)'s `WASI` class
+  hard-requires `instance.exports.memory` and throws otherwise -- it does
+  not support a module whose memory is *imported*, which every
+  wasi-threads module's must be. Worked around with `makeFakeInstance()`:
+  a plain object duck-typing an `Instance` (node:wasi only ever reads
+  `.exports` off whatever it's given), with `memory` added and -- for
+  anything that isn't the main/command instance -- `_start` removed so
+  `wasi.initialize()` doesn't refuse it. **Check whether a real browser
+  WASI host (e.g. VS Code for Web's `wasm-wasi-core`) has the same
+  limitation before assuming it "just works" there** -- see
+  `documents/vscode-wasi-host.md` (its `host.initialize(memory ??
+  instance)` fallback suggests it was actually built with this case in
+  mind, unlike `node:wasi`, but this hasn't been verified by actually
+  running against it).
+  Two build-only gotchas, no source patch needed: `wasm-ld` defaults a
+  shared memory's max to its min unless `--max-memory` is passed
+  explicitly (clang started with ~7MB of heap and crashed on its first
+  allocation before this was set to 2GiB), and `clang.wasm`'s own default
+  target now being the `-threads` triple meant `compiler-rt`'s builtins
+  needed a second, separate build pass targeting plain `wasm32-wasip1` --
+  see `build.bat` and `ai-notes/wip.md` for both.
+  **Not yet observed**: whether any of this project's own smoke-test
+  workloads (tiny "Hello World" compiles) are actually large enough to
+  trigger a real `thread-spawn` call at all -- `LLVM_ENABLE_THREADS=ON`
+  only makes threading *available*; nothing in these particular tests has
+  been confirmed to actually use it yet.
+  **Genuinely open, not addressed**: real file I/O consistency across
+  threads (multiple threads of one process doing concurrent
+  `fd_read`/`fd_write` against the same mounted filesystem) -- the
+  standalone prototype does no file I/O at all, so it sidesteps this
+  entirely. See `ai-notes/wip.md` for an assessment of the options (a
+  centralized I/O-owner thread other threads RPC to, versus each thread
+  doing real I/O with `pread`-style explicit offsets) -- leaning toward
+  the RPC approach, since it reuses the same synchronous cross-worker
+  pattern already proven for subprocess spawning, but neither is
+  implemented.
 
 Welcome to the LLVM project!
 

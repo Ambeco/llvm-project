@@ -1,6 +1,40 @@
 # WIP: getting `clang` (the driver) to build for wasm32-wasip1
 
-**STATUS as of 2026-09-04: `Unix/Program.inc`'s spawn mechanism is now a
+**STATUS as of 2026-09-04 (later): real threading is now enabled in the
+*primary* build, not just prototyped on a side branch.** `build.bat`
+builds `clang.wasm`/`lld.wasm` against `wasm32-unknown-wasip1-threads`
+with `-DLLVM_ENABLE_THREADS=ON`, and all four smoke tests (`--version`,
+compile, compile+link+run, 4-file parallel compile) pass against this real
+build. Two real gotchas surfaced going from "the standalone prototype
+works" to "the real 100+MB clang.wasm works," both fixed in `build.bat`,
+neither needing a source patch:
+1. `wasm-ld` defaults a shared memory's `max` to its `min` unless
+   `--max-memory` is passed explicitly -- clang started with ~7MB of heap
+   and hit `report_bad_alloc_error` on its very first `DenseMap`
+   allocation before this was set to an explicit 2GiB.
+2. `clang.wasm`'s own default target is now the `-threads` triple, so
+   `COMPILER_RT_DEFAULT_TARGET_ONLY` only built `libclang_rt.builtins.a`
+   for *that* triple -- but `clang.wasm` still needs to compile plain,
+   non-threaded `wasm32-wasip1` *output* by default. Fixed with a second,
+   separate `compiler-rt`-only build pass in `build.bat`, copied into the
+   main build's resource dir. **This is the one part of `build.bat` that's
+   still a bit fragile** -- it hardcodes the `24` in
+   `lib/clang/24/lib/wasm32-unknown-wasip1/`, matching the current LLVM
+   major version; will need updating (or better, made version-agnostic
+   the way the JS smoke tests' `findResourceDir()` already is) on the next
+   `main` rebase.
+
+On the JS-host side, `node:wasi`'s hard requirement on
+`instance.exports.memory` (confirmed empirically, see the
+`experiment-wasi-threads` findings above) meant switching from the
+standalone prototype's hand-rolled minimal `wasi_snapshot_preview1`
+subset to node:wasi's *real* implementation, via the same
+`makeFakeInstance()` duck-typing trick -- necessary because clang.wasm
+does real file I/O (unlike the pthread-mutex test program), which the
+hand-rolled subset was never going to cover correctly.
+
+Previous STATUS (2026-09-04, earlier): `Unix/Program.inc`'s spawn
+mechanism is now a
 table-indirect function pointer, not a required wasm import -- and moved
 to `upstream-fixes` as a result.** `clang.wasm` instantiates with *zero*
 custom imports (just the standard WASI ones); a JS host that wants real
@@ -349,13 +383,16 @@ could cheaply recover any performance:
   be a separate, substantial effort if ever needed -- don't reach for it
   without a concrete case that the cheap win above doesn't already cover.
 
-## `experiment-wasi-threads` branch: real threading, prototyped 2026-09-04
+## Real threading: prototyped, then merged into `wasm-wasi` for real
 
 Explored how hard real `wasm32-wasip1-threads` support actually is, per
-the user's request ("see how hard multithreading is"), on a **separate
-branch** (`experiment-wasi-threads`, based on `wasm-wasi`) since this is
-exploratory and not (yet) something to fold into the main branches.
-Findings, most important first:
+the user's request ("see how hard multithreading is"), originally on a
+**separate branch** (`experiment-wasi-threads`, based on `wasm-wasi`).
+Once the prototype proved out, `wasm-wasi` was fast-forwarded onto it and
+threading was wired into the real `clang.wasm`/`lld.wasm` build (see the
+STATUS note at the top of this file) -- `experiment-wasi-threads` no
+longer exists as a separate branch; everything below describes work now
+on `wasm-wasi` directly. Findings, most important first:
 
 - **Real, working, verified pthreads in the browser/Node runtime model are
   achievable and not weird hacks** -- every mechanism involved
@@ -431,14 +468,20 @@ Findings, most important first:
   is much easier to get subtly wrong. This prototype's test program does
   no file I/O at all, so it sidesteps the question entirely rather than
   answering it -- next step if this gets picked up again.
-- **Also not yet checked**: whether `clang.wasm`/`lld.wasm` (as opposed to
-  this standalone pthread test) would actually *call* `thread-spawn` for
-  any real workload -- `LLVM_ENABLE_THREADS=ON` only makes threading
-  *available*; `ThreadPoolStrategy`'s default worker-count heuristics
-  decide whether it's actually used for a given work size (see the
-  "Multi-file parallelism" section above for where `parallelFor` is
-  exercised in `lld/wasm/Writer.cpp`). Worth instrumenting/observing
-  before investing further in the file-I/O design above.
+- **Checked, now answered**: does `clang.wasm`/`lld.wasm` actually *call*
+  `thread-spawn` for a real (if tiny) workload? For the "Hello World"
+  smoke tests -- one file, trivially small AST/object/link -- **no**: no
+  `[thread N]` log line ever appeared (that log fires unconditionally
+  whenever `wasi_thread_hook.mjs`'s spawn function runs). Confirms the
+  suspicion: `LLVM_ENABLE_THREADS=ON` only makes threading *available*;
+  `ThreadPoolStrategy`'s worker-count heuristics decide whether it's
+  actually used, and our test workload is far below whatever threshold
+  makes parallelizing worthwhile. Not yet tried: a large enough
+  compile/link (many sections/chunks, see `lld/wasm/Writer.cpp`'s
+  `parallelFor` call sites) to actually observe a real `thread-spawn`
+  call -- worth doing before assuming this milestone delivers any real
+  speedup yet, versus just "compiles and links correctly with threading
+  enabled, unexercised."
 
 ## Next milestone: a real browser-based JS host
 
