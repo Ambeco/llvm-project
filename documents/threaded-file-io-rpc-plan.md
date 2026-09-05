@@ -9,6 +9,141 @@ build.bat/CMake or the clang driver (step 6, and linking this into
 clang.wasm itself, remain future work) beyond build.bat compiling the
 shim into its own archive (see "Build system" below).
 
+## Two build configurations: what actually needs custom JavaScript
+
+Everything in this file so far is about *file-I/O correctness once real
+multithreading is already running*. That's a narrower question than "does
+clang.wasm need custom JS at all" -- worth separating out explicitly,
+because it's easy to conflate the two.
+
+**A specific design goal of this fork**: build `clang.wasm`/`lld.wasm`
+*without* threading (`build-single-threaded.bat`, target
+`wasm32-unknown-wasip1`, no `-pthread`, no `--import-memory`/
+`--shared-memory`) and get a module that **instantiates and runs on any
+plain WASI host, with zero custom JavaScript** -- no `wasi-threads`
+support, no imported memory, nothing beyond what a generic WASI
+implementation already provides. `build.bat` (the threaded configuration,
+target `wasm32-unknown-wasip1-threads`, `-pthread`,
+`-DLLVM_ENABLE_THREADS=ON`, `-Wl,--import-memory -Wl,--shared-memory`)
+trades that away deliberately, for the real multithreading `wip.md`'s
+"Real threading" section covers.
+
+**Important correction to how this was described earlier in this
+session**: "zero custom JavaScript" for the single-threaded build is true
+for *instantiating* the module and for any invocation that doesn't spawn
+a subprocess (`--version`, argument-diagnostics-only paths, or running
+`lld.wasm` directly against already-produced `.o` files -- the linker
+itself never spawns anything). It is **not** true for actually compiling
+or combined compile+linking anything, on *either* build configuration --
+that needs a small, non-threading piece of custom JS regardless of
+threading, described next.
+
+### Why any real compile needs custom JS, on both configurations
+
+Both `build.bat` and `build-single-threaded.bat` set
+`-DCLANG_SPAWN_CC1=ON`. This makes the driver always invoke `cc1` (the
+actual compilation step) as if it were a separate OS process --
+`clang/tools/driver/driver.cpp`'s `UseNewCC1Process` defaults to this
+CMake setting, and stays true unless overridden per-invocation with
+`-fintegrated-cc1` (more on why that override is a dead end below).
+Actually running that "subprocess" -- and, in a combined
+compile-and-link invocation, invoking the linker as a second "subprocess"
+the same way -- goes through `Command::Execute()`/`Wait()` in
+`llvm/lib/Support/Unix/Program.inc`. WASI has no process model at all (no
+`fork`/`exec`/`posix_spawn`), so this fork implements it as
+`CurrentSpawnHook`, a plain function-pointer slot in the module's own
+*exported, growable* indirect call table (`-Wl,--export-table
+-Wl,--growable-table`, present in **both** build configs' linker flags
+for exactly this reason -- it has nothing to do with threading). The
+**default hook fails loudly** (`report_fatal_error`), not silently --
+confirmed in `ai-notes/wip.md`'s "Known, deliberately-deferred work"
+section. So: **a JS host must, after instantiating the module**:
+
+- (d) grow the module's exported indirect-call table by one slot
+  (`WebAssembly.Table.prototype.grow`),
+- (e) write a `WebAssembly.Function`-wrapped JS callback into that slot
+  that actually implements "run a subprocess": spawn a Worker running a
+  *fresh instantiation* of the same module (for a `cc1` invocation) or of
+  `lld.wasm` (for a link step), wire up its argv/env/preopens/stdio, run
+  it to completion, and report the exit code back -- synchronously, from
+  the calling instance's point of view (`Atomics.wait` on a small
+  shared control buffer is the reference implementation's mechanism;
+  see below -- this is a *much* smaller use of shared memory than real
+  threading's whole-module-shared linear memory, and needs no
+  `-pthread`/`wasi-threads` support at all),
+- (f) call the module's exported `__wasi_shim_set_spawn_hook()` to
+  install that callback,
+
+or every real compile (and every combined compile+link invocation) on
+**either** build configuration fails loudly the moment it tries to spawn
+`cc1`. This is orthogonal to, and much smaller than, the real-threading
+hosting `ai-notes/wasi_thread_hook.mjs` implements -- no shared
+module-wide memory, no `wasi.thread-spawn`, no per-thread Workers running
+the *same* live instance. The reference implementation is
+`ai-notes/wasi_spawn_shim.mjs` (steps d/f) +
+`ai-notes/wasi_spawn_worker.mjs` (step e, the actual per-"process"
+Worker). `llvm/lib/Support/Unix/Program.inc`'s own commit message
+describes the mechanism directly: *"a host that wants real subprocess
+support can, after instantiation, grow the module's exported
+indirect-call table ... and call ... `__wasi_shim_set_spawn_hook()` to
+install it -- all without the module needing to declare any dependency
+on that host at link/instantiate time."* That last clause is the load-
+bearing one: the module's own `.wasm` file declares no import for this at
+all, so it still instantiates with zero custom JS -- it only *traps
+loudly* if nothing installs the hook before something tries to use it.
+
+### The flag that looks like an escape hatch, but isn't: `-fintegrated-cc1`
+
+`-fintegrated-cc1` asks the driver to skip the "subprocess" path above
+entirely and run `cc1` in the same process -- which sounds like it should
+make a compile work with *no* spawn-hook JS at all. It doesn't, on this
+fork, for two independent reasons:
+
+1. **It's silently overridden back off for any multi-job invocation.**
+   `Driver.cpp`'s `BuildJobs()` forces `J.InProcess = false` for every job
+   whenever there's more than one (`C.getJobs().size() > 1`) -- a normal
+   `clang -o out foo.c` is two jobs (compile, then link), so
+   `-fintegrated-cc1` has no effect on it regardless of build
+   configuration. It could only matter for a single-job invocation, e.g.
+   a bare `-c` compile with no link step.
+2. **Even then, it hits a different fatal stub.** `driver.cpp` calls
+   `llvm::CrashRecoveryContext::Enable()` unconditionally whenever
+   `UseNewCC1Process` is false (i.e. whenever `-fintegrated-cc1` actually
+   takes effect) -- and this fork's `CrashRecoveryContext::Enable()` is
+   itself a `report_fatal_error` stub on WASI (see the "WASI: fail loudly
+   on signal/subprocess/crash-recovery gaps we can't fill" commit): real
+   signal-based crash recovery is structurally impossible on this target
+   (a trap terminates the whole instance uncatchably; there's no signal
+   handler to install), and this fork deliberately chose to fail loudly
+   rather than silently degrade, on the explicit assumption that
+   `CLANG_SPAWN_CC1=ON` makes this path dead code in normal use.
+
+Net effect: **there is currently no way to get a real compile out of
+either build configuration with fully zero custom JS.** The zero-JS
+claim is real and worth keeping as a design goal for *instantiation and
+non-compiling invocations*, but a true zero-JS *compile* would require
+revisiting the `CrashRecoveryContext::Enable()` design choice (making it
+a graceful no-op instead of fatal, accepting reduced crash-recovery
+robustness) and building without `CLANG_SPAWN_CC1` -- not attempted, and
+not obviously a good trade, since it would mean giving up the
+process-boundary crash detection `CLANG_SPAWN_CC1=ON` currently buys.
+
+### Other flags that fail loudly rather than silently doing the wrong thing
+
+Not an exhaustive list, but the ones already hit in this project's
+history, all in `Unix/Program.inc`'s spawn mechanism and all
+`report_fatal_error`, never a silent no-op or wrong-answer: **I/O
+redirection, timeouts, polling, and detached-process support** for a
+spawned command aren't implemented. The concrete case already hit:
+clang's crash-reproducer regeneration path (triggered automatically on a
+`cc1` crash, or explicitly via `-fcrash-diagnostics`-family flags) needs
+I/O redirection to capture the reproducer subprocess's output, so a
+smoketest deliberately passes `-fno-crash-diagnostics` to avoid
+exercising it (see `ai-notes/run_clang_threaded_io_smoketest.mjs` and
+`ai-notes/run_clang_tls_repro.mjs`). Extending the spawn-hook wire format
+to cover these is possible but deliberately deferred -- nothing in a
+normal `-c`/`-o` compile invocation needs them.
+
 ## What's built (current design: raw WASI import interception)
 
 `compiler-rt/lib/wasi_threaded_io/wasi_threaded_io.c` -- a single C file,
