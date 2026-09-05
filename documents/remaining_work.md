@@ -3,26 +3,43 @@
 See `documents/design.md` for overall context and `ai-notes/wip.md` for
 the full narrative/detail behind each item below.
 
-## Next up: dedicated file-I/O thread + in-wasm RPC
+## Done: dedicated file-I/O thread + in-wasm RPC, wired into the driver
 
-The concrete next piece of work, already scoped as its own session — see
-`documents/threaded-file-io-rpc-plan.md` for the full design notes,
-constraints, and suggested build order. Summary: confirmed that sharing a
-plain fd across wasi-threads workers fails (`EBADF`), since each worker
-gets its own independent host WASI instance/fd table. Fix: one dedicated
-I/O-owning thread, every other thread RPCs to it over a shared-memory
-mailbox using wasm atomics. Not yet started. Key open questions to
-resolve before writing code:
-- Does wasi-libc's stdio (`fopen`/`fread`/etc.) bottom out directly at the
-  `__wasi_fd_*` import layer, bypassing a `-Wl,--wrap=`-based shim? (Needs
-  checking — determines whether an import-symbol override is the only
-  viable interception point.)
-- The I/O server must be a dedicated spawned thread, never the main
-  thread (`memory.atomic.wait32` traps on a real browser main/UI thread,
-  even though it works fine on Node's `worker_threads` main thread — a
-  trap our Node-only reference host wouldn't catch).
-- Needs linking into *both* clang.wasm itself and any `-pthread` output
-  binary clang.wasm produces.
+See `documents/threaded-file-io-rpc-plan.md` for the full design notes,
+constraints, and build order. Summary: confirmed that sharing a plain fd
+across wasi-threads workers fails (`EBADF`), since each worker gets its
+own independent host WASI instance/fd table. Fix: one dedicated
+I/O-owning thread, every other thread RPCs to it over a single-slot
+shared-memory mailbox (spinlock + plain-atomic spin, no
+`memory.atomic.wait32`), intercepting the raw WASI Preview1 import layer
+rather than the POSIX layer. **Implemented, built as a real compiler-rt
+component (`clang_rt.wasi_threaded_io`), and wired into
+`clang/lib/Driver/ToolChains/WebAssembly.cpp` so every `-pthread`
+WASI-threads output binary links it automatically** (opt out with
+`-mno-wasi-threaded-io`); verified end-to-end against a real rebuild of
+clang.wasm/lld.wasm, including the actual generated `wasm-ld` command
+line in both the shim-enabled and shim-disabled directions. The same
+change fixed an adjacent gap where `--shared-memory` was auto-added for
+`-pthread` WASI-threads targets but `--import-memory` never was.
+
+### Follow-up, not yet started: verify the single-threaded build is unaffected
+
+Confirm a `build-single-threaded.bat`-built clang.wasm (no `-pthread`,
+plain `wasm32-unknown-wasip1`) still produces ordinary, correct
+non-threaded output, and that `-mwasi-threaded-io`/`-mno-wasi-threaded-io`
+passed to it are silently inert rather than erroring. See
+`documents/threaded-file-io-rpc-plan.md`'s "Follow-up: verify the
+single-threaded build is unaffected" section for the exact checklist.
+Small, focused verification pass — a good candidate for its own short
+session rather than folding into whatever's next.
+
+### Still open (deferred, not scheduled): linking the shim into clang.wasm itself
+
+Whether/how to link `wasi_threaded_io` into clang.wasm's own binary
+(separate from the output programs it compiles) remains an open question.
+Earlier investigation suggested clang's own compile path may not exercise
+real threading enough for this to matter in practice — worth
+re-confirming before spending effort wiring it in there too.
 
 ## The real browser-based JS host (separate project, not started)
 

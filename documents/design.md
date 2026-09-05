@@ -131,18 +131,23 @@ itself can't run any code once terminated.
 
 ## Known limitations
 
-- **File I/O is not consistent across threads yet.** Each spawned
-  wasi-thread gets its own independent host WASI instance with its own
-  private fd table. A real pthread program's normal pattern — main thread
-  opens one fd, shares the plain `int` with worker threads, each thread
-  operates on that same fd number — fails with `EBADF`, since the fd
-  number is meaningless in another thread's table. Confirmed via
-  `ai-notes/run_clang_threaded_io_smoketest.mjs`. Planned fix: a dedicated
-  file-I/O thread that owns the real fd table, with every other thread
-  RPCing to it over a shared-memory mailbox + wasm atomics instead of
-  calling `open`/`read`/`write` directly — see
-  `documents/threaded-file-io-rpc-plan.md` for the detailed design (not
-  yet implemented).
+- **File I/O across threads: fixed, linked in automatically.** Each
+  spawned wasi-thread gets its own independent host WASI instance with
+  its own private fd table, so a real pthread program's normal pattern —
+  main thread opens one fd, shares the plain `int` with worker threads,
+  each thread operates on that same fd number — used to fail with
+  `EBADF`. Fixed by `compiler-rt/lib/wasi_threaded_io`: a dedicated
+  I/O-owning thread holds the real fd table, and every other thread
+  (including main) RPCs to it over a single-slot shared-memory mailbox by
+  intercepting the raw WASI Preview1 import layer. Built as a normal
+  compiler-rt component and linked automatically into every `-pthread`
+  WASI-threads output binary by the driver (opt out with
+  `-mno-wasi-threaded-io`); verified against a real rebuild of
+  clang.wasm/lld.wasm. See `documents/threaded-file-io-rpc-plan.md` for
+  the full design and verification detail. Still open: whether/how to
+  link the same shim into clang.wasm itself, and confirming the
+  single-threaded build (`build-single-threaded.bat`) is unaffected — see
+  `documents/remaining_work.md`.
 - **No subprocess I/O redirection, timeouts, polling, or detached
   processes.** `Unix/Program.inc`'s `Execute()`/`Wait()` fail loudly
   (`report_fatal_error`) rather than silently no-op'ing for these. Nothing
@@ -180,7 +185,8 @@ itself can't run any code once terminated.
 `lld.wasm` against `wasm32-unknown-wasip1-threads`. All smoke tests pass:
 `--version`, single-file compile, compile+link+run, 4-file parallel
 compile, threaded-output-program compile+link+run. The
-shared-fd-across-threads gap is confirmed and its fix is designed but not
-implemented (see `documents/remaining_work.md` and
-`documents/threaded-file-io-rpc-plan.md`). No PR has been opened upstream
+shared-fd-across-threads gap is fixed and wired into the driver, linked
+automatically into every `-pthread` WASI-threads output binary (see
+`documents/remaining_work.md` and `documents/threaded-file-io-rpc-plan.md`
+for detail and the still-open follow-ups). No PR has been opened upstream
 from `upstream-fixes` yet.

@@ -7,7 +7,10 @@ below, and "Superseded design" further down for the first version's
 history (kept because the reasoning for abandoning it, and a real bug it
 caught, are both still useful). `-pthread` WASI-threads output programs
 get this automatically now; `-mno-wasi-threaded-io` opts out. Still open:
-whether/how to link the same shim into clang.wasm itself (see step 6).
+whether/how to link the same shim into clang.wasm itself (see step 6), and
+confirming `build-single-threaded.bat`'s clang.wasm is unaffected by any
+of this (see "Follow-up: verify the single-threaded build is unaffected"
+below).
 
 ## Two build configurations: what actually needs custom JavaScript
 
@@ -460,8 +463,18 @@ in place, for the reasoning trail.
    `WantsSharedMemory()` already auto-added `--shared-memory` for
    `-pthread` WASI targets but never `--import-memory`, so a `-pthread`
    output program didn't even get a host-shareable memory without it --
-   now added unconditionally alongside `--shared-memory`, not gated by
-   the opt-out flag (a plain correctness fix, independent of file I/O).
+   now added alongside `--shared-memory`, not gated by the opt-out flag (a
+   plain correctness fix, independent of file I/O). Scoped specifically to
+   the `"-threads"` environment component of the triple (an advisor review
+   caught that `WantsSharedMemory()` is also true for plain `-pthread` on
+   e.g. `wasm32-wasip1`, or a `wasip2`/`wasip3` `-pthread` link through
+   `wasm-component-ld` -- neither of those is this fork's per-thread-Worker
+   hosting model, and an imported memory may not even be valid for a
+   wasm-component-ld output, so the fix intentionally does not reach
+   those). Likewise `WantsThreadedIoShim()` is gated on
+   `Triple.isOSWASI()`, so an explicit `-mwasi-threaded-io` on a
+   non-WASI target (e.g. `wasm32-emscripten`) is inert rather than
+   requesting a nonexistent `compiler-rt` archive.
 
    **Verified against a real, from-scratch rebuild of `clang.wasm`/`lld.wasm`**
    (not just the shim linked in by hand, as every previous verification
@@ -488,6 +501,31 @@ in place, for the reasoning trail.
    compile path didn't appear to exercise real threading for typical
    compiles -- worth re-confirming whether this matters for clang.wasm
    at all before spending effort wiring it in there too).
+
+## Follow-up: verify the single-threaded build is unaffected
+
+Not yet started. Per the approved plan's original verification section
+item 3, still open:
+
+- Build (or use an existing) `build-single-threaded.bat` output
+  (`wasm32-unknown-wasip1`, no `-pthread`) and confirm it still produces
+  ordinary, correct non-threaded compiled output -- i.e. that nothing in
+  this change regressed the plain build.
+- Confirm `-mwasi-threaded-io`/`-mno-wasi-threaded-io`, passed to that
+  build's clang.wasm, are silently accepted (inert) rather than erroring
+  -- consistent with how other target-inapplicable driver flags behave.
+  `WantsThreadedIoShim()`'s `Triple.isOSWASI()` guard should already make
+  this true in principle (a plain `wasm32-unknown-wasip1` triple is
+  still WASI, so the flag is accepted and parsed either way; the question
+  is just whether passing it produces any observable difference when
+  `-pthread` was never present to begin with -- it shouldn't, since
+  `WantsSharedMemory()`, and therefore the default, is false without
+  `-pthread` regardless of the flag), but this has not actually been
+  exercised against a real `build-single-threaded.bat` binary.
+
+Worth scoping as a short, focused follow-up rather than folding in
+opportunistically -- it's a distinct verification pass against a
+separate build config, not new design work.
 
 ## Why this is scoped as its own session
 
