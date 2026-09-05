@@ -261,9 +261,20 @@ provide functionality no WASI host does by default:
   see `build.bat` and `ai-notes/wip.md` for both.
   **Not yet observed**: whether any of this project's own smoke-test
   workloads (tiny "Hello World" compiles) are actually large enough to
-  trigger a real `thread-spawn` call at all -- `LLVM_ENABLE_THREADS=ON`
-  only makes threading *available*; nothing in these particular tests has
-  been confirmed to actually use it yet.
+  trigger a real `thread-spawn` call from *clang.wasm's own internal
+  work* -- `LLVM_ENABLE_THREADS=ON` only makes threading *available*;
+  nothing in these particular tests has been confirmed to actually use it
+  yet. (Separately, and easy to conflate with the above: whether a
+  program *clang.wasm compiles* can itself use real threads is a
+  completely independent question -- inherited, unmodified mainline clang
+  WebAssembly driver support, unrelated to whether clang.wasm itself runs
+  threaded. **Verified working**: `ai-notes/run_clang_threaded_output_smoketest.mjs`
+  has clang.wasm compile+link a real 4-pthread program
+  (`--target=wasm32-wasip1-threads -pthread`, plus explicit
+  `-Wl,--import-memory -Wl,--max-memory=` -- not auto-added by `-pthread`,
+  same as native wasi-sdk `clang++`) and runs the output through the same
+  thread-hosting machinery: `counter = 400000` exactly, all 4 threads
+  correctly spawn and join.)
   **Genuinely open, not addressed**: real file I/O consistency across
   threads (multiple threads of one process doing concurrent
   `fd_read`/`fd_write` against the same mounted filesystem) -- the

@@ -479,9 +479,30 @@ on `wasm-wasi` directly. Findings, most important first:
   makes parallelizing worthwhile. Not yet tried: a large enough
   compile/link (many sections/chunks, see `lld/wasm/Writer.cpp`'s
   `parallelFor` call sites) to actually observe a real `thread-spawn`
-  call -- worth doing before assuming this milestone delivers any real
-  speedup yet, versus just "compiles and links correctly with threading
-  enabled, unexercised."
+  call from *clang.wasm's own internal work* -- worth doing before
+  assuming this milestone delivers any real speedup yet, versus just
+  "compiles and links correctly with threading enabled, unexercised."
+  (`thread-spawn` *has* now been observed firing for real, just not from
+  clang.wasm's own internals -- see the next bullet.)
+- **A separate, easy-to-conflate question, now also answered**: does a
+  program *clang.wasm compiles* (for a user, targeting
+  `--target=wasm32-wasip1-threads -pthread`) actually work with real
+  threads? This is completely independent of whether clang.wasm itself
+  runs threaded -- it's inherited, unmodified mainline clang WebAssembly
+  driver support that predates and doesn't depend on anything this session
+  changed. Untested until the user asked the question directly; now
+  verified: `ai-notes/run_clang_threaded_output_smoketest.mjs` has
+  clang.wasm compile+link a real 4-pthread mutex-counter program, then
+  runs the *output* through the same thread-hosting machinery.
+  **PASSED** (`counter = 400000`, all 4 threads spawn/join correctly, and
+  their `wasi.thread-spawn` calls are the first ones actually observed
+  firing in this whole session). One gotcha, not clang.wasm-specific:
+  `-pthread` alone gets `-Wl,--shared-memory` added automatically by
+  clang's driver, but not `--import-memory`/`--max-memory` -- confirmed
+  this matches native wasi-sdk `clang++`'s behavior too (same as the
+  original standalone prototype needed), so any user targeting a
+  multi-Worker JS host needs to pass those two flags explicitly, same as
+  we do here.
 
 ## Next milestone: a real browser-based JS host
 
