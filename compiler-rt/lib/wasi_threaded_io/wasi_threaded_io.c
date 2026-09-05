@@ -341,7 +341,15 @@ static int32_t do_rpc(struct io_request *r) {
 static int is_std_fd(int32_t fd) { return fd == 0 || fd == 1 || fd == 2; }
 
 int32_t __imported_wasi_snapshot_preview1_fd_close(int32_t fd) {
-  if (on_io_thread())
+  // is_std_fd() must gate every op the same way, this one included: an fd
+  // is either server-owned or caller-owned, never split per-operation. A
+  // fd_close(1) that went through the RPC while fd_write(1, ...) stays
+  // exempted above would close fd 1 in the SERVER's table while every
+  // thread's writes keep landing on the CALLER's still-open fd 1 --
+  // exactly the kind of table split this whole file exists to prevent,
+  // and a live path: fclose(stdout)/__stdio_exit at process teardown
+  // calls this on fd 1 for any program that touched stdio at all.
+  if (on_io_thread() || is_std_fd(fd))
     return wasi_io_real_fd_close(fd);
   struct io_request r = {.op = IO_FD_CLOSE, .fd = fd};
   return do_rpc(&r);
@@ -368,7 +376,7 @@ __imported_wasi_snapshot_preview1_fd_fdstat_set_flags(int32_t fd,
 int32_t __imported_wasi_snapshot_preview1_fd_seek(int32_t fd, int64_t offset,
                                                    int32_t whence,
                                                    int32_t retptr0) {
-  if (on_io_thread())
+  if (on_io_thread() || is_std_fd(fd))
     return wasi_io_real_fd_seek(fd, offset, whence, retptr0);
   struct io_request r = {.op = IO_FD_SEEK,
                           .fd = fd,
