@@ -15,6 +15,7 @@ import { readFile } from 'node:fs/promises';
 import { WASI } from 'node:wasi';
 import { workerData } from 'node:worker_threads';
 import { installSpawnHook } from './wasi_spawn_shim.mjs';
+import { instantiateThreaded, makeFakeInstance } from './wasi_thread_hook.mjs';
 
 const { wasmPath, argv, env, preopens, sab } = workerData;
 const status = new Int32Array(sab);
@@ -39,10 +40,11 @@ try {
   const bytes = await readFile(wasmPath);
   const wasmModule = await WebAssembly.compile(bytes);
 
-  // No custom imports needed to instantiate -- see Unix/Program.inc: the
-  // spawn hook is an optional post-instantiation extension point, not a
-  // required wasm import.
-  const instance = await WebAssembly.instantiate(wasmModule, wasi.getImportObject());
+  // clang.wasm/lld.wasm are both built against wasm32-wasip1-threads, so
+  // both unconditionally require env.memory + wasi.thread-spawn to
+  // instantiate at all -- see wasi_thread_hook.mjs.
+  const { instance, memory } = await instantiateThreaded(
+    wasmModule, bytes, wasi.getImportObject(), { wasmPath, preopens });
 
   // Recursion support: if this child itself needs to spawn a grandchild
   // (e.g. a future assembler invocation), install the same hook, pointed at
@@ -51,7 +53,7 @@ try {
   // tests) may have had Program.cpp's WASI code -- and so this export --
   // dead-stripped by the linker, so skip installing rather than hard-fail.
   if (instance.exports.__wasi_shim_set_spawn_hook)
-    installSpawnHook(instance, { wasmPath, preopens });
+    installSpawnHook(instance, { wasmPath, preopens, memory });
 
   let exitCode = 0;
   try {
@@ -59,7 +61,7 @@ try {
     // exit; it only throws for an actual trap/abort (e.g. our own
     // report_fatal_error calls), in which case there's no well-defined exit
     // code to report beyond "something went wrong".
-    const ret = wasi.start(instance);
+    const ret = wasi.start(makeFakeInstance(instance, memory));
     if (typeof ret === 'number')
       exitCode = ret;
   } catch (e) {

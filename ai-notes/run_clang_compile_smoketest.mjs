@@ -22,6 +22,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { argv as processArgv } from 'node:process';
 import { installSpawnHook, findResourceDir } from './wasi_spawn_shim.mjs';
+import { instantiateThreaded, makeFakeInstance } from './wasi_thread_hook.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
 const wasmPath = processArgv[2] ?? path.join(repoRoot, 'build', 'bin', 'clang.wasm');
@@ -68,13 +69,14 @@ console.error(`Loaded ${bytes.length} bytes, compiling wasm module...`);
 const wasmModule = await WebAssembly.compile(bytes);
 
 console.error('Instantiating driver instance...');
-const instance = await WebAssembly.instantiate(wasmModule, wasi.getImportObject());
-installSpawnHook(instance, { wasmPath, preopens });
+const { instance, memory } = await instantiateThreaded(
+  wasmModule, bytes, wasi.getImportObject(), { wasmPath, preopens });
+installSpawnHook(instance, { wasmPath, preopens, memory });
 
 console.error(`Running: ${clangArgs.join(' ')}`);
 let driverExit = 0;
 try {
-  const ret = wasi.start(instance);
+  const ret = wasi.start(makeFakeInstance(instance, memory));
   if (typeof ret === 'number')
     driverExit = ret;
 } catch (e) {

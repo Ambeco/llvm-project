@@ -113,16 +113,22 @@ function resolveGuestPath(preopens, guestPath) {
 /// Requires Node's --experimental-wasm-type-reflection flag (for
 /// WebAssembly.Function -- unflagged in modern browsers already, this is
 /// purely a Node-reference-host requirement).
-export function installSpawnHook(instance, { wasmPath: defaultWasmPath, preopens }) {
+///
+/// `memory` is optional: pass it explicitly for a wasi-threads build
+/// (whose memory is *imported*, so `instance.exports.memory` doesn't
+/// exist -- see wasi_thread_hook.mjs); omitted, this falls back to
+/// `instance.exports.memory`, correct for a non-threaded build.
+export function installSpawnHook(instance, { wasmPath: defaultWasmPath, preopens, memory }) {
   const table = instance.exports.__indirect_function_table;
   if (!table) {
     throw new Error(
       'wasi_spawn_shim: instance has no exported __indirect_function_table -- ' +
       'was clang.wasm linked with -Wl,--export-table? (see build.bat)');
   }
+  const mem = memory ?? instance.exports.memory;
 
   function spawnSync(ptr, len) {
-    const bytes = new Uint8Array(instance.exports.memory.buffer, ptr, len);
+    const bytes = new Uint8Array(mem.buffer, ptr, len);
     // Copy out of wasm memory before handing off to the worker (structured
     // clone of a view into a growable ArrayBuffer would be unsafe otherwise).
     const blobCopy = bytes.slice();

@@ -13,6 +13,7 @@ import { readFile } from 'node:fs/promises';
 import { WASI } from 'node:wasi';
 import { workerData, parentPort } from 'node:worker_threads';
 import { installSpawnHook } from './wasi_spawn_shim.mjs';
+import { instantiateThreaded, makeFakeInstance } from './wasi_thread_hook.mjs';
 
 const { wasmPath, clangArgs, preopens } = workerData;
 
@@ -21,11 +22,17 @@ try {
   const wasi = new WASI({ version: 'preview1', args: clangArgs, env: {}, preopens });
   const bytes = await readFile(wasmPath);
   const wasmModule = await WebAssembly.compile(bytes);
-  const instance = await WebAssembly.instantiate(wasmModule, wasi.getImportObject());
-  installSpawnHook(instance, { wasmPath, preopens });
+  // clang.wasm is built against wasm32-wasip1-threads -- each of these
+  // independent driver instances still gets its own private shared memory
+  // (instantiateThreaded creates a fresh one per call), matching the
+  // process-like isolation this script is demonstrating; only *within* one
+  // such instance's own spawned threads is memory actually shared.
+  const { instance, memory } = await instantiateThreaded(
+    wasmModule, bytes, wasi.getImportObject(), { wasmPath, preopens });
+  installSpawnHook(instance, { wasmPath, preopens, memory });
 
   try {
-    const ret = wasi.start(instance);
+    const ret = wasi.start(makeFakeInstance(instance, memory));
     if (typeof ret === 'number')
       exitCode = ret;
   } catch (e) {
