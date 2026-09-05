@@ -158,7 +158,15 @@ export function installSpawnHook(instance, { wasmPath: defaultWasmPath, preopens
 
     console.error(`wasi_spawn_shim: spawning ${argv.join(' ')}`);
     Atomics.wait(status, 0, 0); // Blocks this thread -- see Program.inc.
-    worker.terminate();
+    // Deliberately NOT calling worker.terminate() here: this function is
+    // called synchronously from wasm (via call_indirect), so it can't
+    // await the worker's own 'exit' event -- and forcefully terminating
+    // immediately after Atomics.wait unblocks races with the worker's own
+    // pending console output (reportExit() is the worker's last action,
+    // so its own console.error()/console.log() calls just before it may
+    // not have flushed yet), silently truncating error messages. The
+    // worker has already done its real work by this point (that's what
+    // unblocked us); let it exit on its own in the background instead.
 
     const exitCode = Atomics.load(status, 1);
     console.error(`wasi_spawn_shim: child exited with code ${exitCode}`);

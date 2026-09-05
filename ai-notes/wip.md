@@ -603,3 +603,46 @@ of `worker_threads`, catching a *terminated* Worker and rendering its own
 call stack, hosting-JS-responsible-for-cleanup-on-terminate). That's a
 separate, substantial piece of work, likely in its own repo, not attempted
 here yet.
+
+## Confirmed: shared-fd-across-threads gap, and the fix's shape
+
+`run_clang_threaded_io_smoketest.mjs` confirmed a real, expected gap: our
+hosting model gives each spawned wasi-thread its own independent
+`node:wasi` instance with its own private fd table (see
+`wasi_thread_worker.mjs`). A real pthread program's completely normal
+pattern -- main thread opens one fd, shares the plain `int` with worker
+threads, each thread `pwrite()`s using that same fd number -- fails with
+`EBADF`, since the fd number means nothing in a worker's own table. The
+control case (each thread independently `open()`s its own fd to the same
+path) works fine. This isn't an LLVM/clang/lld bug; it's inherent to
+per-host-thread fd tables, and was anticipated going in.
+
+**Planned fix**: a dedicated file-I/O thread, with all other threads
+RPCing to it for file I/O, instead of calling `open`/`read`/`write`/etc.
+directly. Confirmed this is implementable *entirely within the compiled
+wasm*, with no new host support beyond what already exists:
+- `-pthread` already provides `--shared-memory`/`--import-memory` and the
+  `+atomics` target feature (`memory.atomic.wait32`/`notify32`, wasm's
+  futex equivalent). A request queue/mailbox in shared linear memory,
+  guarded by atomics, lets any thread hand a request ("open this path",
+  "pwrite this fd/buf/offset") to the dedicated I/O thread and block for
+  the response -- entirely in-wasm, no host syscalls in the handoff itself.
+- The host's job stays exactly what it already does: answer
+  `wasi.thread-spawn` by spawning a Worker with the shared memory. It
+  doesn't need to know one thread is "special" -- that's a pure userspace
+  convention.
+- Real `open`/`read`/`write`/`pwrite`/`close` calls still happen inside the
+  dedicated I/O thread's own WASI imports/instance, since only that
+  thread's fd table matters -- every other thread marshals args/results
+  across the shared-memory queue instead of calling libc I/O itself.
+- Same shape as Emscripten's `PROXY_TO_PTHREAD`/filesystem-proxying
+  design, for an analogous reason (there: browser main-thread owns the
+  real filesystem handle; here: whichever host-thread's instance owns the
+  preopens owns the fd table).
+
+**Scope**: this shim (probably a small wasi-libc-level intercept layer for
+`open`/`read`/`write`/`pwrite`/`close`/etc., or a thin wrapper linked in)
+needs to be linked into *both* clang.wasm itself *and* any `-pthread`
+output binary clang.wasm produces -- both have the identical
+fd-table-per-host-thread problem. Not yet started; this is the next
+concrete piece of work in this line.
