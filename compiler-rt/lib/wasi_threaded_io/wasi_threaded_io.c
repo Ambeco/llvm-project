@@ -396,11 +396,27 @@ int __wrap_close(int fd) {
 // isn't actually a limitation for wasm, just calling out that the
 // request struct's field is untyped on purpose.
 int __wrap_fcntl(int fd, int cmd, ...) {
+  // Only pull the variadic argument for commands that actually pass one
+  // (F_GETFD/F_GETFL do not) -- reading a va_arg that was never supplied
+  // is undefined behavior, not just a wrong value, and F_GETFL is exactly
+  // what fdopen() calls on every fopen().
   long arg = 0;
-  va_list ap;
-  va_start(ap, cmd);
-  arg = va_arg(ap, long);
-  va_end(ap);
+  switch (cmd) {
+  case F_DUPFD:
+  case F_SETFD:
+  case F_SETFL:
+  case F_GETLK:
+  case F_SETLK:
+  case F_SETLKW: {
+    va_list ap;
+    va_start(ap, cmd);
+    arg = va_arg(ap, long);
+    va_end(ap);
+    break;
+  }
+  default:
+    break; // e.g. F_GETFD, F_GETFL: no 3rd argument.
+  }
   if (on_io_thread())
     return __real_fcntl(fd, cmd, arg);
   struct io_request r = {
