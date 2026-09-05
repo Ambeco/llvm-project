@@ -1,13 +1,13 @@
 # Plan: dedicated file-I/O thread + in-wasm RPC
 
-Status: **implemented and verified for the "output program" case** (steps
-1-5 of the build order below), on its **second design** -- see "What's
-built" immediately below, and "Superseded design" further down for the
-first version's history (kept because the reasoning for abandoning it,
-and a real bug it caught, are both still useful). Not yet wired into
-build.bat/CMake or the clang driver (step 6, and linking this into
-clang.wasm itself, remain future work) beyond build.bat compiling the
-shim into its own archive (see "Build system" below).
+Status: **implemented, wired into the driver, and verified end-to-end
+against a real rebuild of clang.wasm/lld.wasm** (all 6 build-order steps
+below done), on its **second design** -- see "What's built" immediately
+below, and "Superseded design" further down for the first version's
+history (kept because the reasoning for abandoning it, and a real bug it
+caught, are both still useful). `-pthread` WASI-threads output programs
+get this automatically now; `-mno-wasi-threaded-io` opts out. Still open:
+whether/how to link the same shim into clang.wasm itself (see step 6).
 
 ## Two build configurations: what actually needs custom JavaScript
 
@@ -444,16 +444,50 @@ in place, for the reasoning trail.
    adding a new one) and wiring it into whatever this repo uses for
    regression checks is worth doing once step 6 lands, so this stops
    being a manually-reproduced result.
-6. **Not yet started**: wire the wrap/force-include link flags into
-   build.bat/CMake so clang.wasm-compiled `-pthread` output programs get
-   this automatically, and separately decide whether/how to link the
-   same shim into clang.wasm itself (per earlier investigation in
-   `ai-notes/wip.md`, clang's own compile path didn't appear to exercise
-   real threading for typical compiles -- worth re-confirming whether
-   this matters for clang.wasm at all before spending effort wiring it
-   in there too). This step is C++ driver/build-system work and can't
-   itself be `#ifdef __wasi__`-guarded the way the shim's own source is;
-   keep it as a distinct, separately-reviewable change from the shim.
+6. **Done.** `compiler-rt/lib/wasi_threaded_io/CMakeLists.txt` builds the
+   shim as a normal compiler-rt component (`clang_rt.wasi_threaded_io-wasm32`,
+   registered in `compiler-rt/lib/CMakeLists.txt`); `build.bat`'s old
+   hand-rolled compile+`ar` step is gone, replaced by adding that target
+   name to the existing `cmake --build` invocation. `clang/lib/Driver/ToolChains/WebAssembly.cpp`
+   links the resulting archive into every `-pthread` WASI-threads output
+   binary automatically (`WantsThreadedIoShim()`, linked after `-lc` with
+   an explicit `-u` safety net -- see that function and the file's own
+   comments for why both the placement and the `-u` matter, a second
+   instance of the same link-order class of bug as the "Linker gotcha"
+   above), gated by a new `-mwasi-threaded-io`/`-mno-wasi-threaded-io`
+   driver flag pair (`clang/include/clang/Options/Options.td`), on by
+   default. The same change fixed an adjacent, independently-real gap:
+   `WantsSharedMemory()` already auto-added `--shared-memory` for
+   `-pthread` WASI targets but never `--import-memory`, so a `-pthread`
+   output program didn't even get a host-shareable memory without it --
+   now added unconditionally alongside `--shared-memory`, not gated by
+   the opt-out flag (a plain correctness fix, independent of file I/O).
+
+   **Verified against a real, from-scratch rebuild of `clang.wasm`/`lld.wasm`**
+   (not just the shim linked in by hand, as every previous verification
+   in this doc was): ran the actual `ai-notes/run_clang_threaded_io_smoketest.mjs`
+   (updated to no longer pass `-Wl,--import-memory` by hand, proving the
+   driver now supplies it) driving clang.wasm itself to compile
+   `hello_threads_io.c` with a plain `--target=wasm32-wasip1-threads
+   -pthread` invocation. The actual `wasm-ld` command line clang.wasm
+   generated confirms both fixes landed: `--shared-memory --import-memory`
+   present, and `-u __imported_wasi_snapshot_preview1_fd_write
+   .../libclang_rt.wasi_threaded_io.a` appended after `-lc`, exactly as
+   designed. Running the result: Case A (shared fd across threads)
+   succeeds with correct 58-byte output, matching every prior
+   manually-linked verification. Re-ran with `-mno-wasi-threaded-io`
+   added to the same invocation and confirmed the *opposite*: the
+   generated `wasm-ld` command line has no `-u`/no shim archive, and the
+   resulting binary reproduces the original, pre-shim EBADF failure on
+   Case A exactly (Case B, which doesn't share a fd across threads,
+   still succeeds either way) -- proving the flag is a real, working
+   toggle, not just that the default path happens to work.
+
+   Whether/how to link the same shim into clang.wasm itself remains
+   open (per earlier investigation in `ai-notes/wip.md`, clang's own
+   compile path didn't appear to exercise real threading for typical
+   compiles -- worth re-confirming whether this matters for clang.wasm
+   at all before spending effort wiring it in there too).
 
 ## Why this is scoped as its own session
 

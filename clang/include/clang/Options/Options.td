@@ -5982,6 +5982,23 @@ def mharden_sls_EQ : Joined<["-"], "mharden-sls=">, Group<m_Group>,
            " blr(ARM/AArch64), comdat(ARM/AArch64), nocomdat(ARM/AArch64),"
            " return(X86), indirect-jmp(X86)">;
 
+// wasm-wasi fork addition. Deliberately NOT in m_wasm_Features_Group:
+// that group is auto-forwarded to real `-target-feature` strings by
+// getWebAssemblyTargetFeatures() (see CommonArgs.cpp), and this isn't a
+// real wasm target feature -- it's a driver-only toggle for whether to
+// link compiler-rt/lib/wasi_threaded_io's fd-table-per-thread fix into
+// -pthread WASI-threads output binaries. See
+// documents/threaded-file-io-rpc-plan.md for what it fixes and why it's
+// on by default.
+def mwasi_threaded_io : Flag<["-"], "mwasi-threaded-io">, Group<m_Group>,
+  HelpText<"Link the wasi-threads dedicated-I/O-thread runtime that fixes "
+           "shared-file-descriptor-across-threads breakage (default: on "
+           "for -pthread WASI-threads targets)">;
+def mno_wasi_threaded_io : Flag<["-"], "mno-wasi-threaded-io">, Group<m_Group>,
+  HelpText<"Don't link the wasi-threads dedicated-I/O-thread runtime "
+           "(avoids its small per-syscall overhead, but a file descriptor "
+           "opened on one thread and used from another will misbehave)">;
+
 def matomics : Flag<["-"], "matomics">, Group<m_wasm_Features_Group>;
 def mno_atomics : Flag<["-"], "mno-atomics">, Group<m_wasm_Features_Group>;
 def mbulk_memory : Flag<["-"], "mbulk-memory">, Group<m_wasm_Features_Group>;

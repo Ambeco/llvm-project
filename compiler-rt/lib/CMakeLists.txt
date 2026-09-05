@@ -17,6 +17,11 @@ if(COMPILER_RT_BUILD_BUILTINS)
   add_subdirectory(builtins)
 endif()
 
+# wasm-wasi fork addition: see compiler-rt/lib/wasi_threaded_io/CMakeLists.txt
+# and documents/threaded-file-io-rpc-plan.md. Compiles to an empty archive
+# on every non-wasi-threads target, so no gating condition is needed here.
+add_subdirectory(wasi_threaded_io)
+
 function(compiler_rt_build_runtime runtime)
   string(TOUPPER ${runtime} runtime_uppercase)
   if(COMPILER_RT_HAS_${runtime_uppercase})

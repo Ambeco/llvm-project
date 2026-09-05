@@ -62,11 +62,21 @@
 // definitions below) makes the linker use that definition instead of
 // importing it -- turning it from a wasm import into an ordinary defined
 // function, transparently redirecting *every* caller (raw POSIX code and
-// FILE*/stdio internals alike) with no `-Wl,--wrap=` or `-u` linker
-// flags needed at all. Confirmed empirically (see the session that added
-// this file) against the real wasi-sdk `libc.a`: no duplicate-symbol
-// error, and a test program's `printf`/stdio path and its raw `write()`
-// call both observably passed through the override.
+// FILE*/stdio internals alike), with no `-Wl,--wrap=` needed at all
+// (unlike the superseded POSIX-layer design). Confirmed empirically
+// against the real wasi-sdk `libc.a` when this file is linked directly
+// as a compile input: no duplicate-symbol error, and a test program's
+// `printf`/stdio path and its raw `write()` call both observably passed
+// through the override. Note this is *not* quite flag-free once this
+// file is linked as a conventional static archive instead (as the
+// clang driver does automatically -- see "Usage" below): an archive
+// member is only pulled into the link if something has an unresolved
+// reference to one of its symbols at that point on the command line,
+// and nothing in a user's own code references
+// `__imported_wasi_snapshot_preview1_fd_write` by that literal name --
+// only wasi-libc's own internal callers do. The driver handles this by
+// linking the archive after `-lc` and passing an explicit `-u` on one
+// of its symbols as a link-order-independent safety net.
 //
 // The dedicated I/O thread still needs its own way to reach the *real*
 // host import, since the module-wide symbol now points at our
@@ -85,16 +95,17 @@
 // needed there either), before any thread this file's RPC needs to
 // reach exists.
 //
-// Usage: compile this file for a wasm32-wasi*-threads target (it compiles
-// to nothing -- an empty translation unit -- everywhere else, so it's
-// always safe to add to a build). No special link flags are required
-// (unlike the earlier `--wrap`-based version) -- just link the object in.
-//
-// Not yet wired into build.bat/CMake or the clang driver -- see
-// documents/threaded-file-io-rpc-plan.md's build order. For now, link
-// this .c file (or its .o) directly into whatever wasm32-wasi*-threads
-// binary needs shared-fd-across-threads support (both clang.wasm itself,
-// if it ever needs this, and any -pthread program clang.wasm compiles).
+// Usage: builds automatically as compiler-rt component
+// `clang_rt.wasi_threaded_io` (see this directory's CMakeLists.txt) --
+// compiles to an empty translation unit on every non-wasi-threads
+// target/configuration, so it's harmless to build unconditionally.
+// `clang/lib/Driver/ToolChains/WebAssembly.cpp` links it into every
+// `-pthread` WASI-threads output binary automatically (after `-lc`, plus
+// an explicit `-u`; see that file's `WantsThreadedIoShim()` and the
+// linking code in `wasm::Linker::ConstructJob` for why); pass
+// `-mno-wasi-threaded-io` to opt out. Not (yet) linked into clang.wasm
+// itself -- separate question of whether clang.wasm's own threading ever
+// needs this, tracked in documents/threaded-file-io-rpc-plan.md.
 //
 //===--------------------------------------------------------------------===//
 

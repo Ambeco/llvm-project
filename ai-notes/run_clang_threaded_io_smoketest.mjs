@@ -33,6 +33,10 @@ const binDir = path.dirname(wasmPath);
 const sysrootPath = processArgv[3] ??
   'C:/Users/mooin/AppData/Local/wasi-sdk/wasi-sdk-34.0-x86_64-windows/share/wasi-sysroot';
 const resourceDirPath = await findResourceDir(path.join(repoRoot, 'build', 'lib', 'clang'));
+// Pass --no-shim as a 5th arg to prove -mno-wasi-threaded-io actually
+// disables compiler-rt/lib/wasi_threaded_io -- Case A should go back to
+// failing with EBADF, the same as before that runtime existed.
+const noShim = processArgv[4] === '--no-shim';
 
 const workDir = await mkdtemp(path.join(tmpdir(), 'clang-wasm-threaded-io-'));
 const tmpDir = await mkdtemp(path.join(tmpdir(), 'clang-wasm-threaded-io-tmp-'));
@@ -54,7 +58,13 @@ const clangArgs = [
   '-pthread',
   '--sysroot=/sysroot',
   '-resource-dir=/resource-dir',
-  '-Wl,--import-memory', '-Wl,--max-memory=2147483648',
+  // -Wl,--import-memory deliberately NOT passed here anymore: the driver
+  // (WebAssembly.cpp's WantsSharedMemory handling) now adds it
+  // automatically for -pthread WASI-threads targets -- this smoketest is
+  // exactly what proves that. -Wl,--max-memory is unrelated (wasm-ld
+  // defaults a memory's max to its min unless this is set explicitly;
+  // still needs to be passed by hand) so it stays.
+  '-Wl,--max-memory=2147483648',
   '-fno-crash-diagnostics', // the crash-reproducer path itself needs I/O
                             // redirection, unsupported by our Program.inc
                             // -- suppress it so a real cc1 crash surfaces
@@ -63,6 +73,8 @@ const clangArgs = [
   '/work/hello_threads_io.c',
   '-o', '/work/hello_threads_io.wasm',
 ];
+if (noShim)
+  clangArgs.splice(clangArgs.length - 2, 0, '-mno-wasi-threaded-io');
 
 const wasi = new WASI({
   version: 'preview1',
@@ -132,3 +144,11 @@ for (const name of ['case_a.txt', 'case_b.txt']) {
 await rm(workDir, { recursive: true, force: true });
 await rm(tmpDir, { recursive: true, force: true });
 console.error(programExit === 0 ? 'RESULT: program reported success' : 'RESULT: program reported failure or trapped');
+// The shim's dedicated I/O-owner thread (and its worker pthreads) are
+// real Worker threads that outlive the WASI instance's own exit -- same
+// operational requirement documented in
+// documents/threaded-file-io-rpc-plan.md for any host running a
+// wasi-threads binary. Without an explicit exit, this process now hangs
+// by default (it didn't before wasi_threaded_io was linked in
+// automatically).
+process.exit(programExit === 0 ? 0 : 1);

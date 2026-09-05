@@ -101,6 +101,28 @@ static bool WantsSharedMemory(const llvm::Triple &Triple, const ArgList &Args) {
          !WantsCooperativeMultithreading(Triple, Args);
 }
 
+// wasm-wasi fork addition. Real (non-cooperative) pthread support is
+// exactly the condition under which the shared-fd-across-threads bug
+// compiler-rt/lib/wasi_threaded_io fixes can occur at all -- each spawned
+// thread gets its own independent WASI fd table unless this runtime is
+// linked in, so a fd shared between threads (opened on one, used from
+// another) silently misbehaves. On by default for that reason; see
+// documents/threaded-file-io-rpc-plan.md. `-mno-wasi-threaded-io` opts
+// out, trading correctness for the runtime's small per-syscall RPC cost.
+static bool WantsThreadedIoShim(const llvm::Triple &Triple,
+                                const ArgList &Args) {
+  // Guard on isOSWASI() too: the compiler-rt archive this pulls in
+  // (clang_rt.wasi_threaded_io) is only ever built for WASI targets, so
+  // without this an explicit -mwasi-threaded-io on e.g. wasm32-emscripten
+  // would ask getCompilerRTArgString() for an archive that doesn't exist
+  // for that target instead of being silently inert.
+  if (!Triple.isOSWASI())
+    return false;
+  bool Default = WantsSharedMemory(Triple, Args);
+  return Args.hasFlag(options::OPT_mwasi_threaded_io,
+                      options::OPT_mno_wasi_threaded_io, Default);
+}
+
 void wasm::Linker::ConstructJob(Compilation &C, const JobAction &JA,
                                 const InputInfo &Output,
                                 const InputInfoList &Inputs,
@@ -188,8 +210,22 @@ void wasm::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   if (WantsCooperativeMultithreading(ToolChain.getTriple(), Args))
     CmdArgs.push_back("--cooperative-threading");
 
-  if (WantsSharedMemory(ToolChain.getTriple(), Args))
+  if (WantsSharedMemory(ToolChain.getTriple(), Args)) {
     CmdArgs.push_back("--shared-memory");
+    // wasm-wasi fork fix: a *shared* memory still defaults to being
+    // *exported* unless --import-memory is also passed (see lld/wasm's
+    // own default-export-if-neither-specified logic) -- which means a
+    // -pthread program built without this explicit flag doesn't actually
+    // get a memory the wasi-threads per-thread-Worker hosting model can
+    // share across instances at all, independent of anything below.
+    // Scoped to the "-threads" environment specifically (not every
+    // WantsSharedMemory-true target, e.g. plain -pthread wasm32-wasip1 or
+    // a wasip2/wasip3 -pthread link through wasm-component-ld) since
+    // that's the only environment this fork's per-thread-Worker hosting
+    // model (and the verification done for this change) actually covers.
+    if (ToolChain.getTriple().getEnvironmentName() == "threads")
+      CmdArgs.push_back("--import-memory");
+  }
 
   if (!Args.hasArg(options::OPT_nostdlib, options::OPT_nodefaultlibs)) {
     if (ToolChain.ShouldLinkCXXStdlib(Args))
@@ -200,6 +236,24 @@ void wasm::Linker::ConstructJob(Compilation &C, const JobAction &JA,
 
     CmdArgs.push_back("-lc");
     AddRunTimeLibs(ToolChain, ToolChain.getDriver(), CmdArgs, Args);
+
+    // wasm-wasi fork addition: link compiler-rt/lib/wasi_threaded_io's
+    // fd-table-per-thread fix in after -lc/AddRunTimeLibs, not before --
+    // wasi-libc's own internal callers of the WASI imports this runtime
+    // overrides (e.g. inside `write`/`fopen`) only become part of the
+    // link once -lc above is processed, and a static archive's member is
+    // only pulled in if something has an unresolved reference to one of
+    // its symbols at the point the linker reaches it on the command
+    // line. The explicit -u is a second, order-independent safety net
+    // for the same reason (see documents/threaded-file-io-rpc-plan.md's
+    // "Linker gotcha" -- this is the same class of bug, found once
+    // already this session for the shim's own now-superseded design).
+    if (WantsThreadedIoShim(ToolChain.getTriple(), Args)) {
+      CmdArgs.push_back("-u");
+      CmdArgs.push_back("__imported_wasi_snapshot_preview1_fd_write");
+      CmdArgs.push_back(
+          ToolChain.getCompilerRTArgString(Args, "wasi_threaded_io"));
+    }
   }
 
   ToolChain.addProfileRTLibs(Args, CmdArgs);
