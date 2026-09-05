@@ -55,24 +55,28 @@ the same way -- goes through `Command::Execute()`/`Wait()` in
 *exported, growable* indirect call table (`-Wl,--export-table
 -Wl,--growable-table`, present in **both** build configs' linker flags
 for exactly this reason -- it has nothing to do with threading). The
-**default hook fails loudly** (`report_fatal_error`), not silently --
-confirmed in `ai-notes/wip.md`'s "Known, deliberately-deferred work"
-section. So: **a JS host must, after instantiating the module**:
-
-- (d) grow the module's exported indirect-call table by one slot
-  (`WebAssembly.Table.prototype.grow`),
-- (e) write a `WebAssembly.Function`-wrapped JS callback into that slot
-  that actually implements "run a subprocess": spawn a Worker running a
-  *fresh instantiation* of the same module (for a `cc1` invocation) or of
-  `lld.wasm` (for a link step), wire up its argv/env/preopens/stdio, run
-  it to completion, and report the exit code back -- synchronously, from
-  the calling instance's point of view (`Atomics.wait` on a small
-  shared control buffer is the reference implementation's mechanism;
-  see below -- this is a *much* smaller use of shared memory than real
-  threading's whole-module-shared linear memory, and needs no
-  `-pthread`/`wasi-threads` support at all),
-- (f) call the module's exported `__wasi_shim_set_spawn_hook()` to
-  install that callback,
+**default hook fails loudly** (`report_fatal_error`), confirmed directly
+against the current `Unix/Program.inc` source (not just its commit
+message): the default stub calls `report_fatal_error`, and the exported
+install point is literally named `__wasi_shim_set_spawn_hook`, matching
+what's described below. So: **a JS host must, after instantiating the
+module**, do three things -- (d) grow the module's exported indirect-call
+table by one slot, (e) write a JS callback wrapped as a typed wasm
+function into that slot which actually implements "run a subprocess" (a
+Worker running a fresh instantiation of the module, or of `lld.wasm` for
+a link step, run synchronously to completion via `Atomics.wait` on a
+small control buffer -- much smaller than real threading's whole-module-
+shared memory, and needs no `-pthread`/`wasi-threads` support at all),
+and (f) call that exported function to install it. **README.md's "JS
+Framework" section is the canonical, exact recipe for d/e/f** (precise
+API calls, parameter types, the Node flag needed) -- verified this
+session to still match current source and the current
+`ai-notes/wasi_spawn_shim.mjs`; refer to that section rather than this
+one if the two ever seem to disagree, and update both if the mechanism
+changes. The point being made here is narrower and doesn't need
+restating there: **this exact same requirement applies to both build
+configurations equally, is unrelated to threading, and its absence fails
+loudly rather than silently doing nothing.**
 
 or every real compile (and every combined compile+link invocation) on
 **either** build configuration fails loudly the moment it tries to spawn
