@@ -70,6 +70,49 @@ verified the reverse of Case A specifically (see next section): a new
 no special-casing needed anywhere in the implementation for "who opened
 it."
 
+**fd 0/1/2 (stdin/stdout/stderr) are exempted from the RPC entirely** --
+`fd_write`/`fd_read`/`fd_fdstat_get`/`fd_fdstat_set_flags` all call the
+real import directly for these three fds, on every thread, without going
+through the mailbox. These fds are host-global by convention -- every
+thread's own independent WASI host instance already maps them to the
+same real stdin/stdout/stderr, which is exactly why console output from
+every thread worked correctly all through this investigation, even
+before this file's RPC existed for anything else. Routing them through
+the RPC anyway would still be correct, but would turn the single mailbox
+slot into a global lock on *all* console output -- every thread's
+`printf` serializing through one spinlock, including the main thread's,
+which is the exact contention pattern constraint 1 (below) exists to
+avoid, just reached via a spin instead of a `wait32` trap. Verified with
+a stress test (4 threads each looping 200 `printf`s interleaved with
+`pwrite`s to a real file): completed in ~150ms with correct output both
+with and without the exemption under Node -- no livelock either way on
+this host -- but the exemption is kept regardless, since it's strictly
+better on contention grounds and there's no evidence it costs anything
+(the one case it could get wrong -- a program that itself closes fd
+0/1/2 and reuses that number for a real, cross-thread-shared file -- is
+rare and already dubious practice). *Not* verified: whether the
+un-exempted version would actually livelock on a host that can't yield
+the way Node does (a real browser main thread) -- untestable in this
+environment, which is exactly why the exemption is kept as a
+precaution rather than only as an optimization.
+
+**Operational note, found via the same stress test**: the dedicated I/O
+server thread runs forever once spawned (an intentional, persistent
+background service thread -- see "What's built" above). A test harness
+(or any real host) that waits for all spawned worker threads to exit
+naturally before considering the program "done" will hang, even though
+the program's actual main-thread computation completed correctly and
+promptly -- confirmed directly: the stress test's own output showed all
+800 expected `printf`s and a clean `exit 0` in ~150ms inside a log that
+a naively-written harness (this session's first version of the stress
+test's own runner script) nonetheless waited on indefinitely, because it
+was waiting for every worker (including the eternal I/O thread) to
+finish rather than acting on the main instance's own `wasi.start()`
+return value and then explicitly tearing the process down. Any host
+integration needs to actively terminate/kill remaining threads once the
+main computation finishes, not wait for the I/O thread to exit on its
+own -- it never will.
+
 ## Main-thread-opens, workers-read/write is not a special case
 
 Raised as an open question: what happens when the *main* thread opens a
@@ -96,17 +139,22 @@ logic involved beyond the existing `on_io_thread()` check (which only
 ever answers "am I the dedicated server," never "did I open this fd").
 
 The design's actual constraint is orthogonal to *who opens a file*: it's
-about *what "share a fd" means for non-positional `read()`/`write()`* --
-if multiple threads plain-`read()`/`write()` (not `pread`/`pwrite`) the
-*same* fd concurrently, they race on that fd's single shared file-offset
-cursor, same as they would in a real native multi-threaded process (this
-is standard, expected POSIX behavior, not something this design
-introduces or could fix -- it's exactly why `hello_threads_io.c`'s
-shared-fd case deliberately uses `pwrite`, not `write`). The single
-mailbox actually serializes concurrent requests more strictly than a
-real OS-level shared fd would (only one request in flight at a time), so
-if anything this design is less racy than native hardware concurrency
-here, not more.
+about *what "share a fd" means for non-positional `read()`/`write()`*,
+and it's not really this design's constraint at all -- it's POSIX's.
+Concurrent plain `read()`/`write()` (not `pread`/`pwrite`) on the *same*
+fd from multiple threads races on that fd's single shared file-offset
+cursor in a real native multi-threaded process too; POSIX never promised
+otherwise. A program that needs deterministic per-thread positions on a
+shared fd already had to use `pread`/`pwrite` before wasm entered the
+picture -- which is exactly why `hello_threads_io.c`'s shared-fd case
+uses `pwrite`, not `write`. So the practical answer to "when do I need
+to think about this" is: only code that was already relying on
+undefined behavior needs to change, and it needed to change regardless
+of this design. (The single mailbox happens to serialize concurrent
+requests more strictly than a real OS-level shared fd would -- only one
+request in flight at a time -- so if anything this design is *less*
+racy than native hardware concurrency for the well-defined,
+positional-I/O case, not more.)
 
 ## Superseded design: POSIX-layer `-Wl,--wrap=` interception
 

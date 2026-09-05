@@ -161,7 +161,15 @@ enum io_op {
 // dereferences them directly, including writing results (byte counts,
 // the new seek offset, a fdstat struct, ...) straight into the caller's
 // own retptr0 buffer. No result data needs to travel back through the
-// mailbox at all; only the raw WASI errno return code does.
+// mailbox at all; only the raw WASI errno return code does. This relies
+// on retptr0 (and iovs, and the buffers iovs itself points to) actually
+// living in linear memory reachable from every thread -- true today
+// because wasi-libc's pthread stacks are wasi-libc-managed heap
+// allocations inside the one shared `--import-memory`/`--shared-memory`
+// linear memory, not some separate per-thread region; a caller passing a
+// pointer into genuinely thread-private storage outside linear memory
+// would break this, but no such storage exists for a wasm32-wasi*-threads
+// binary under the current toolchain.
 struct io_request {
   enum io_op op;
   int32_t fd;
@@ -311,6 +319,26 @@ static int32_t do_rpc(struct io_request *r) {
 //
 // Each of these takes over a wasm import wasi-libc otherwise resolves
 // against the host directly -- see the file header comment.
+//
+// fd 0/1/2 (stdin/stdout/stderr) are exempted below from RPCing out at
+// all: unlike a fd a program opens itself, these are host-global by
+// convention -- every thread's own independent WASI host instance
+// already maps them to the same real stdin/stdout/stderr, which is
+// exactly why console output from every thread worked correctly all
+// through this file's development, before any of this RPC existed.
+// Routing them through the RPC anyway would be merely redundant on a
+// Node host, but turns the single mailbox slot into a global lock on
+// *all* console output -- every thread's `printf` would serialize
+// through one spinlock, including the main thread's, which is the exact
+// contention pattern constraint 1 exists to avoid (reached here via a
+// spin rather than a trap, but still real contention on a host that
+// can't cheaply yield, e.g. a browser main thread). Skipping the RPC for
+// these fds removes console I/O from the critical path entirely, with
+// no known correctness cost for typical programs -- the one case this
+// exemption gets wrong is a program that itself `close()`s fd 0/1/2 and
+// reuses that fd number for a real, cross-thread-shared file (rare, and
+// arguably already dubious practice).
+static int is_std_fd(int32_t fd) { return fd == 0 || fd == 1 || fd == 2; }
 
 int32_t __imported_wasi_snapshot_preview1_fd_close(int32_t fd) {
   if (on_io_thread())
@@ -321,7 +349,7 @@ int32_t __imported_wasi_snapshot_preview1_fd_close(int32_t fd) {
 
 int32_t __imported_wasi_snapshot_preview1_fd_fdstat_get(int32_t fd,
                                                           int32_t retptr0) {
-  if (on_io_thread())
+  if (on_io_thread() || is_std_fd(fd))
     return wasi_io_real_fd_fdstat_get(fd, retptr0);
   struct io_request r = {.op = IO_FD_FDSTAT_GET, .fd = fd, .retptr0 = retptr0};
   return do_rpc(&r);
@@ -330,7 +358,7 @@ int32_t __imported_wasi_snapshot_preview1_fd_fdstat_get(int32_t fd,
 int32_t
 __imported_wasi_snapshot_preview1_fd_fdstat_set_flags(int32_t fd,
                                                        int32_t flags) {
-  if (on_io_thread())
+  if (on_io_thread() || is_std_fd(fd))
     return wasi_io_real_fd_fdstat_set_flags(fd, flags);
   struct io_request r = {
       .op = IO_FD_FDSTAT_SET_FLAGS, .fd = fd, .fdflags = flags};
@@ -353,7 +381,7 @@ int32_t __imported_wasi_snapshot_preview1_fd_seek(int32_t fd, int64_t offset,
 int32_t __imported_wasi_snapshot_preview1_fd_write(int32_t fd, int32_t iovs,
                                                     int32_t iovs_len,
                                                     int32_t retptr0) {
-  if (on_io_thread())
+  if (on_io_thread() || is_std_fd(fd))
     return wasi_io_real_fd_write(fd, iovs, iovs_len, retptr0);
   struct io_request r = {.op = IO_FD_WRITE,
                           .fd = fd,
@@ -366,7 +394,7 @@ int32_t __imported_wasi_snapshot_preview1_fd_write(int32_t fd, int32_t iovs,
 int32_t __imported_wasi_snapshot_preview1_fd_read(int32_t fd, int32_t iovs,
                                                    int32_t iovs_len,
                                                    int32_t retptr0) {
-  if (on_io_thread())
+  if (on_io_thread() || is_std_fd(fd))
     return wasi_io_real_fd_read(fd, iovs, iovs_len, retptr0);
   struct io_request r = {.op = IO_FD_READ,
                           .fd = fd,
