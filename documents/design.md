@@ -263,9 +263,11 @@ itself can't run any code once terminated.
   clang.wasm/lld.wasm. See `documents/threaded-file-io-rpc-plan.md` for
   the full design and verification detail. The single-threaded build
   (`build-single-threaded.bat`) has since been confirmed unaffected for
-  ordinary compiles, but explicit `-mwasi-threaded-io` there is a
-  confirmed, not-yet-fixed link failure — see `documents/remaining_work.md`.
-  Still open: whether/how to link the shim into clang.wasm itself.
+  ordinary compiles; explicit `-mwasi-threaded-io` there now produces a
+  clear driver error (instead of the link failure it used to) explaining
+  that this clang's own compiler-rt lacks atomics support — see
+  `documents/remaining_work.md`. Still open: whether/how to link the
+  shim into clang.wasm itself.
 - **No subprocess I/O redirection, timeouts, polling, or detached
   processes.** `Unix/Program.inc`'s `Execute()`/`Wait()` fail loudly
   (`report_fatal_error`) rather than silently no-op'ing for these. Nothing

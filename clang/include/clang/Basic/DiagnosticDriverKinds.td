@@ -449,6 +449,18 @@ def warn_drv_fraw_string_literals_in_cxx11 : Warning<
 
 def err_drv_libclc_not_found : Error<"no libclc library '%0' found in the clang resource directory">;
 
+// wasm-wasi fork addition: see clang/lib/Driver/ToolChains/WebAssembly.cpp's
+// WantsThreadedIoShim() and documents/threaded-file-io-rpc-plan.md. Fails
+// loudly rather than letting wasm-ld's much more cryptic "no such file"
+// error surface, or (worse) silently dropping the flag the user asked for.
+def err_drv_wasi_threaded_io_unavailable : Error<
+  "the WASI threaded file-I/O runtime requested by '%0' is not available in "
+  "this clang installation -- clang_rt.wasi_threaded_io is only built into "
+  "a clang whose own compiler-rt was itself configured for a WASI target "
+  "with atomics/shared-memory support (e.g. wasm32-wasip1-threads); did you "
+  "mean to pass '-mno-wasi-threaded-io' instead, or use a clang built with "
+  "WASI threads support?">;
+
 def err_drv_invalid_malign_branch_EQ : Error<
   "invalid argument '%0' to -malign-branch=; each element must be one of: %1">;
 

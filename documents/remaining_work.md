@@ -43,20 +43,19 @@ undetected in `build.bat`'s own prior "from-scratch" verification, whose
 `build/NATIVE` cache was never actually reconfigured after
 `wasi_threaded_io` was added.
 
-### New, not yet started: fix `-mwasi-threaded-io`'s link failure on non-atomics targets
+### Done: fix `-mwasi-threaded-io`'s link failure on non-atomics targets
 
-`WantsThreadedIoShim()` (`clang/lib/Driver/ToolChains/WebAssembly.cpp`)
-gates only on `Triple.isOSWASI()`, so an explicit `-mwasi-threaded-io`
-force-enables the shim even on a target without `+atomics` (e.g. plain
-`wasm32-unknown-wasip1`, no `-pthread`) — where the shim archive doesn't
-build with real content (and, in `build-single-threaded.bat`'s case,
-isn't even in the build's target list, so it doesn't exist at all).
-Needs the same kind of narrowing `--import-memory`'s addition already
-uses (`Triple.getEnvironmentName() == "threads"`), so the flag is
-rejected or silently downgraded rather than producing a confusing
-"file not found"/undefined-symbol link error. See
+Fixed by checking whether the resolved `clang_rt.wasi_threaded_io`
+archive actually exists before appending it to the link
+(`wasm::Linker::ConstructJob` in `clang/lib/Driver/ToolChains/WebAssembly.cpp`),
+rather than gating on target/flag heuristics (confirmed those can't
+predict archive validity — see the plan doc). Emits a new, detailed
+diagnostic (`err_drv_wasi_threaded_io_unavailable`) explaining why and
+suggesting `-mno-wasi-threaded-io` when it's missing, instead of letting
+`wasm-ld`'s cryptic "no such file" error surface. Verified against the
+real single-threaded binary. See
 `documents/threaded-file-io-rpc-plan.md`'s "Correction found while
-starting this follow-up" section for the confirmed repro.
+starting this follow-up" section for full detail.
 
 ### Still open (deferred, not scheduled): linking the shim into clang.wasm itself
 

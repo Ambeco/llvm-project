@@ -249,10 +249,33 @@ void wasm::Linker::ConstructJob(Compilation &C, const JobAction &JA,
     // "Linker gotcha" -- this is the same class of bug, found once
     // already this session for the shim's own now-superseded design).
     if (WantsThreadedIoShim(ToolChain.getTriple(), Args)) {
-      CmdArgs.push_back("-u");
-      CmdArgs.push_back("__imported_wasi_snapshot_preview1_fd_write");
-      CmdArgs.push_back(
-          ToolChain.getCompilerRTArgString(Args, "wasi_threaded_io"));
+      // wasm-wasi fork addition: the archive only has real content when
+      // *this clang's own* compiler-rt was configured for a WASI target
+      // with atomics/shared-memory support (see
+      // build-single-threaded.bat vs. build.bat) -- a property of this
+      // clang binary, not of the current invocation's --target/-pthread
+      // flags, so it can't be predicted from WantsPthread()/Triple alone
+      // (confirmed: an explicit -mwasi-threaded-io correctly finds a real
+      // archive even when cross-compiling a non-pthread target, as long
+      // as *this* clang itself was built with atomics support). Check
+      // the file directly instead, and fail loudly with a clear
+      // diagnostic rather than letting wasm-ld's much more cryptic
+      // "no such file" error surface -- see
+      // documents/threaded-file-io-rpc-plan.md's "Correction found while
+      // starting this follow-up" for the confirmed repro this fixes.
+      const char *ShimArchive =
+          ToolChain.getCompilerRTArgString(Args, "wasi_threaded_io");
+      if (!ToolChain.getVFS().exists(ShimArchive)) {
+        const Arg *ThreadedIoArg = Args.getLastArg(
+            options::OPT_mwasi_threaded_io, options::OPT_mno_wasi_threaded_io);
+        ToolChain.getDriver().Diag(diag::err_drv_wasi_threaded_io_unavailable)
+            << (ThreadedIoArg ? ThreadedIoArg->getAsString(Args)
+                              : "-mwasi-threaded-io (default for this target)");
+      } else {
+        CmdArgs.push_back("-u");
+        CmdArgs.push_back("__imported_wasi_snapshot_preview1_fd_write");
+        CmdArgs.push_back(ShimArchive);
+      }
     }
   }
 

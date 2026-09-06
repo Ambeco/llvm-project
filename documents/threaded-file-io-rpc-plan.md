@@ -582,10 +582,22 @@ it currently gates only on `Triple.isOSWASI()`, but needs to also check
 for atomics/threads support before honoring an explicit
 `-mwasi-threaded-io`, the same way `--import-memory`'s addition above is
 scoped to `Triple.getEnvironmentName() == "threads"` rather than the
-broader `WantsSharedMemory()`. **Not fixed as part of this
-verification-only session** -- flagged here as a confirmed, open defect
-for a follow-up session (driver code change, not just a build-script or
-CMake tweak like the NATIVE-configure fix above).
+broader `WantsSharedMemory()`. **Fixed** (follow-up session): `WantsThreadedIoShim()`'s existing check
+site in `wasm::Linker::ConstructJob` now checks whether the resolved
+`clang_rt.wasi_threaded_io` archive actually exists (via
+`ToolChain.getVFS().exists(...)`) before appending it, instead of trusting
+`wasm-ld` to fail correctly. When it doesn't exist, emits a new, detailed
+diagnostic (`err_drv_wasi_threaded_io_unavailable` in
+`DiagnosticDriverKinds.td`) explaining *why* (this clang's own compiler-rt
+wasn't built with atomics/shared-memory support) and suggesting
+`-mno-wasi-threaded-io` as the fix -- per the user's stated preference for
+detailed, "did you mean" -style errors over silent no-ops or cryptic
+lower-level failures. Verified against the real single-threaded binary
+(incremental rebuild, no full LLVM rebuild needed): explicit
+`-mwasi-threaded-io` now produces the clear driver error instead of
+`wasm-ld`'s "no such file" failure; the no-flag default and
+`-mno-wasi-threaded-io` remain confirmed silently inert; ordinary
+compile+link+run is unaffected.
 
 ## Why this is scoped as its own session
 
