@@ -70,11 +70,11 @@ Worker running a fresh instantiation of the module, or of `lld.wasm` for
 a link step, run synchronously to completion via `Atomics.wait` on a
 small control buffer -- much smaller than real threading's whole-module-
 shared memory, and needs no `-pthread`/`wasi-threads` support at all),
-and (f) call that exported function to install it. **README.md's "JS
-Framework" section is the canonical, exact recipe for d/e/f** (precise
+and (f) call that exported function to install it. **`documents/js-host-contract.md`
+is the canonical, exact recipe for d/e/f** (precise
 API calls, parameter types, the Node flag needed) -- verified this
 session to still match current source and the current
-`ai-notes/wasi_spawn_shim.mjs`; refer to that section rather than this
+`ai-notes/wasi_spawn_shim.mjs`; refer to that doc rather than this
 one if the two ever seem to disagree, and update both if the mechanism
 changes. The point being made here is narrower and doesn't need
 restating there: **this exact same requirement applies to both build
