@@ -57,13 +57,43 @@ real single-threaded binary. See
 `documents/threaded-file-io-rpc-plan.md`'s "Correction found while
 starting this follow-up" section for full detail.
 
-### Still open (deferred, not scheduled): linking the shim into clang.wasm itself
+### Resolved (2026-09-06): linking the shim into clang.wasm/lld.wasm itself is not needed
 
-Whether/how to link `wasi_threaded_io` into clang.wasm's own binary
-(separate from the output programs it compiles) remains an open question.
-Earlier investigation suggested clang's own compile path may not exercise
-real threading enough for this to matter in practice — worth
-re-confirming before spending effort wiring it in there too.
+Closed by reading the actual code, not just re-running the trivial
+"Hello World" case: the earlier finding (`ai-notes/wip.md`) that a tiny
+one-file compile never triggers `thread-spawn` at all left open whether a
+*large* real-world compile/link would exercise real in-module threading
+in a way that hits the same shared-fd-across-threads bug the RPC shim
+fixes. It wouldn't, structurally, regardless of size:
+
+- `lld/wasm/Writer.cpp`'s two `parallelFor`/`parallelForEach` call sites
+  (`writeSections`, `computeHash`) are the only real in-module
+  multithreading `lld.wasm` does for a normal link, and both write into
+  an in-memory buffer via `memcpy` (`buffer->getBufferStart()`) — never a
+  raw file descriptor.
+- That buffer comes from `llvm::FileOutputBuffer` (`llvm/lib/Support/FileOutputBuffer.cpp`).
+  Neither of its two backing implementations does file I/O from worker
+  threads: `OnDiskBuffer` (mmap path) has workers write into a
+  `mapped_file_region` and only calls `unmap()`/`Temp.keep()` in
+  `commit()`; `InMemoryBuffer` (the WASI-relevant fallback, since mmap
+  isn't available) has workers write into an anonymous
+  `Memory::allocateMappedMemory` block and only opens the real output fd
+  and does the single `raw_fd_ostream` write in `commit()`. Both `commit()`
+  calls happen strictly after `parallelForEach`/`parallelFor` return
+  (those calls block until all workers join), i.e. only on the original
+  calling thread — never concurrently, never from a spawned worker.
+- `clang.wasm`'s own compile path (`cc1`) runs as a fully separate spawned
+  instance per the existing `CLANG_SPAWN_CC1`/spawn-hook design (its own
+  linear memory, its own fd table) — not in-module threading at all — and
+  a normal `-c` single-TU compile doesn't invoke `ThreadPoolStrategy`
+  regardless of file size (no ThinLTO/parallel-PCH path in this project's
+  use case).
+
+So no worker thread inside `clang.wasm`/`lld.wasm`'s own execution ever
+touches a file descriptor, at any input size — the exact precondition the
+RPC shim exists to fix. Not worth wiring `wasi_threaded_io` into either
+binary's own build; closing this as a non-issue rather than leaving it
+open.
 
 ## The real browser-based JS host (separate project, not started)
 

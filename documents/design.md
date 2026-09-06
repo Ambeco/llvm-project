@@ -266,8 +266,13 @@ itself can't run any code once terminated.
   ordinary compiles; explicit `-mwasi-threaded-io` there now produces a
   clear driver error (instead of the link failure it used to) explaining
   that this clang's own compiler-rt lacks atomics support — see
-  `documents/remaining_work.md`. Still open: whether/how to link the
-  shim into clang.wasm itself.
+  `documents/remaining_work.md`. Resolved: linking the shim into
+  clang.wasm/lld.wasm's own build is unnecessary — neither binary's
+  in-module worker threads ever touch a file descriptor directly (they
+  only write into an in-memory/mmap'd buffer; the real fd write happens
+  single-threaded after workers join), so the bug this shim fixes cannot
+  occur there. See `documents/remaining_work.md` for the code-level
+  evidence.
 - **No subprocess I/O redirection, timeouts, polling, or detached
   processes.** `Unix/Program.inc`'s `Execute()`/`Wait()` fail loudly
   (`report_fatal_error`) rather than silently no-op'ing for these. Nothing

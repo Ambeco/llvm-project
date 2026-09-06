@@ -6,8 +6,9 @@ below done), on its **second design** -- see "What's built" immediately
 below, and "Superseded design" further down for the first version's
 history (kept because the reasoning for abandoning it, and a real bug it
 caught, are both still useful). `-pthread` WASI-threads output programs
-get this automatically now; `-mno-wasi-threaded-io` opts out. Still open:
-whether/how to link the same shim into clang.wasm itself (see step 6).
+get this automatically now; `-mno-wasi-threaded-io` opts out. Linking the
+same shim into clang.wasm/lld.wasm itself was investigated and resolved
+as unnecessary (see step 6).
 **The single-threaded-build follow-up below is now done** — found and
 fixed a real CMake bug along the way, confirmed correct non-threaded
 compile+link+run, and confirmed a real (separate, not-yet-fixed) defect:
@@ -498,11 +499,21 @@ in place, for the reasoning trail.
    still succeeds either way) -- proving the flag is a real, working
    toggle, not just that the default path happens to work.
 
-   Whether/how to link the same shim into clang.wasm itself remains
-   open (per earlier investigation in `ai-notes/wip.md`, clang's own
-   compile path didn't appear to exercise real threading for typical
-   compiles -- worth re-confirming whether this matters for clang.wasm
-   at all before spending effort wiring it in there too).
+   **Resolved (2026-09-06):** linking the same shim into clang.wasm/lld.wasm
+   itself is not needed, regardless of input size. Confirmed by reading
+   the code, not just re-running the trivial case: `lld/wasm/Writer.cpp`'s
+   only two `parallelFor`/`parallelForEach` sites (`writeSections`,
+   `computeHash`) write into an in-memory buffer via `memcpy`, never a raw
+   fd; `llvm::FileOutputBuffer`'s two backing implementations
+   (`OnDiskBuffer`'s mmap region, `InMemoryBuffer`'s anonymous memory
+   block -- the WASI-relevant one, since mmap isn't available) both defer
+   the actual file descriptor I/O to `commit()`, which only runs after
+   `parallelFor`/`parallelForEach` have already joined all workers -- i.e.
+   only on the original calling thread, never concurrently. clang.wasm's
+   own compile path (`cc1`) runs as a fully separate spawned instance (own
+   linear memory, own fd table) rather than in-module threading at all,
+   and a normal `-c` compile never invokes `ThreadPoolStrategy`. See
+   `documents/remaining_work.md` for the full evidence trail.
 
 ## Follow-up: verify the single-threaded build is unaffected
 
