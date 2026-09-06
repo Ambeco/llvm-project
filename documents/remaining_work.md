@@ -104,13 +104,23 @@ a branch here), needs:
 
 ## Housekeeping / known fragile spots
 
-- `build.bat` hardcodes `lib/clang/24/...` (the current LLVM major
-  version) for the second, non-threaded compiler-rt build's output path.
-  Will break silently on the next version bump; should be made
-  version-agnostic like the JS smoke tests' `findResourceDir()`.
-- Re-verify the full 18-commit cherry-pick sequence still applies cleanly
-  on the *next* rebase onto a fresh `main` snapshot; it applied with zero
-  manual conflicts last time, but that's not guaranteed to hold forever.
+- Done: `build.bat` no longer hardcodes `lib/clang/24/...` for the
+  second, non-threaded compiler-rt build's output path — it now resolves
+  the version number from the actual build output (same approach as the
+  JS smoke tests' `findResourceDir()`), so it won't silently break on the
+  next LLVM major-version bump.
+- Done (2026-09-06): re-verified the `upstream-fixes` cherry-pick
+  sequence against a fresh shallow-fetch of upstream `main`
+  (`5735d1730`, well past the `822f549e9` base used at the last rebase).
+  All 8 `upstream-fixes` commits cherry-picked cleanly onto it in a
+  scratch branch (no conflicts, no empty/already-upstreamed patches);
+  scratch branch discarded afterward, no real branch touched. Only
+  `upstream-fixes`'s commits were re-tested here (the ones patching real
+  LLVM/clang source, so the only ones actually at conflict risk) — the
+  much larger `wasm-wasi`-only commit set has grown well past the
+  original 18-commit rebase and is mostly docs/build-script/new-file
+  commits that cherry-pick trivially on top; re-verify it too at the
+  point an actual rebase is being done, not preemptively.
 
 ## Explicitly deferred, not forgotten
 
