@@ -152,8 +152,47 @@ a branch here), needs:
   commits that cherry-pick trivially on top; re-verify it too at the
   point an actual rebase is being done, not preemptively.
 
+## Worth investigating (not yet a confirmed bug)
+
+- **Module cache / PCH file locking under concurrent instances.**
+  `LockFileManager` was patched (`upstream-fixes`) to conservatively
+  assume a lock is always held on WASI — i.e. no real cross-instance
+  locking. Fine for a single driver instance, but
+  `ai-notes/run_clang_parallel_smoketest.mjs` already proves multiple
+  independent clang.wasm instances compiling concurrently is a real,
+  exercised feature of this project (not hypothetical). If two of those
+  instances ever shared a `-fmodules` module cache directory or a PCH
+  output path, the fake-lock behavior could let them race/corrupt each
+  other. Untested — likely the first genuine problem to hit if `-fmodules`
+  or PCH support gets exercised under the existing multi-instance
+  parallelism model.
+
 ## Explicitly deferred, not forgotten
 
+- **LTO / ThinLTO backends** (`-flto`, `-flto=thin`): different threading
+  shape than lld's normal parallel section-writing (see the resolved
+  self-linking item above) — ThinLTO backend jobs each produce their own
+  separate output file rather than writing into one shared buffer, so
+  presumably each thread owns its own fd and this is fine, but that's an
+  assumption, not verified.
+- **Sanitizers** (`-fsanitize=address/undefined/thread`, etc.): compiler-rt
+  sanitizer runtimes aren't part of this build's target list at all (only
+  `builtins` and `wasi_threaded_io`); a `-fsanitize=...` output-program
+  compile would presumably fail at link with a missing-archive error, but
+  the failure mode itself (clean diagnostic vs. confusing linker error)
+  hasn't been checked. Out of scope for the "compile/link/run ordinary
+  C/C++" goal unless a real need appears.
+- **PGO** (`-fprofile-instr-generate`/`-fprofile-use`): profile counter
+  writing at exit, and whether counter merging across `-pthread`
+  output-program threads hits anything like the shared-fd issue
+  `wasi_threaded_io` fixes. Not built or tested at all.
+- **wasm dynamic linking of output programs** (`-shared`, the wasm
+  "dylink" ABI, or `-fPIC` for wasm): this project builds everything
+  static (`BUILD_SHARED_LIBS=OFF`); whether `wasm-ld` here can produce a
+  dynamically-linked wasm output at all for *user* code is untested and
+  orthogonal to `-ldl` (which only satisfies clang.wasm's own build-time
+  symbol references — plugin loading is already off via
+  `LLVM_ENABLE_PLUGINS=OFF`).
 - `clangd` support: raised as a likely-harder future problem (persistent
   background indexing threads, not a one-shot spawn-and-wait like `cc1`).
   `clang-tools-extra` isn't even enabled in `LLVM_ENABLE_PROJECTS` yet.
