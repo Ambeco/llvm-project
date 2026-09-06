@@ -22,7 +22,7 @@ See `documents/design.md` for the full design: the `upstream-fixes`/`wasm-wasi` 
 ## 4. Remaining work
 
 See `documents/remaining_work.md` for the full list. Briefly:
-- Verify `build-single-threaded.bat`'s clang.wasm is unaffected by the new file-I/O threading shim, and that its opt-in/opt-out flags are inert there.
+- Fix `-mwasi-threaded-io`'s link failure on non-atomics targets (e.g. `build-single-threaded.bat`'s clang.wasm without `-pthread`) — confirmed defect, not yet fixed.
 - Decide whether/how to link the file-I/O threading shim into clang.wasm itself, not just its output programs.
 - The real browser-based JS host (the actual VS Code for Web extension) hasn't been started — everything today is a Node.js reference implementation.
 - No PR has been opened upstream from `upstream-fixes` yet.

@@ -261,10 +261,11 @@ itself can't run any code once terminated.
   WASI-threads output binary by the driver (opt out with
   `-mno-wasi-threaded-io`); verified against a real rebuild of
   clang.wasm/lld.wasm. See `documents/threaded-file-io-rpc-plan.md` for
-  the full design and verification detail. Still open: whether/how to
-  link the same shim into clang.wasm itself, and confirming the
-  single-threaded build (`build-single-threaded.bat`) is unaffected — see
-  `documents/remaining_work.md`.
+  the full design and verification detail. The single-threaded build
+  (`build-single-threaded.bat`) has since been confirmed unaffected for
+  ordinary compiles, but explicit `-mwasi-threaded-io` there is a
+  confirmed, not-yet-fixed link failure — see `documents/remaining_work.md`.
+  Still open: whether/how to link the shim into clang.wasm itself.
 - **No subprocess I/O redirection, timeouts, polling, or detached
   processes.** `Unix/Program.inc`'s `Execute()`/`Wait()` fail loudly
   (`report_fatal_error`) rather than silently no-op'ing for these. Nothing

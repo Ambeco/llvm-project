@@ -22,16 +22,41 @@ line in both the shim-enabled and shim-disabled directions. The same
 change fixed an adjacent gap where `--shared-memory` was auto-added for
 `-pthread` WASI-threads targets but `--import-memory` never was.
 
-### Follow-up, not yet started: verify the single-threaded build is unaffected
+### Done: verify the single-threaded build is unaffected
 
-Confirm a `build-single-threaded.bat`-built clang.wasm (no `-pthread`,
-plain `wasm32-unknown-wasip1`) still produces ordinary, correct
-non-threaded output, and that `-mwasi-threaded-io`/`-mno-wasi-threaded-io`
-passed to it are silently inert rather than erroring. See
+Built `build-single-threaded.bat`'s clang.wasm/lld.wasm from scratch and
+confirmed a real compile+link+run ("Hello, world!") produces correct
+non-threaded output — item 1 of the checklist, fully passed. Item 2 is
+mixed: the no-flag default and `-mno-wasi-threaded-io` are both silently
+inert as expected (byte-identical `wasm-ld` invocations, shim absent),
+but explicit `-mwasi-threaded-io` **fails to link**
+(`libclang_rt.wasi_threaded_io.a: No such file or directory`) rather than
+being inert — a real, confirmed defect, not just the predicted risk. See
 `documents/threaded-file-io-rpc-plan.md`'s "Follow-up: verify the
-single-threaded build is unaffected" section for the exact checklist.
-Small, focused verification pass — a good candidate for its own short
-session rather than folding into whatever's next.
+single-threaded build is unaffected" section for full detail, including
+a second bug found and fixed along the way: `compiler-rt/lib/wasi_threaded_io/CMakeLists.txt`
+was unconditionally requesting `ARCHS wasm32`, which hard-failed LLVM's
+NATIVE cross-compile-host sub-build (used for host-native tblgen tools)
+the moment it was freshly configured — fixed by skipping the component
+when `LLVM_TARGET_IS_CROSSCOMPILE_HOST`. That bug had also gone
+undetected in `build.bat`'s own prior "from-scratch" verification, whose
+`build/NATIVE` cache was never actually reconfigured after
+`wasi_threaded_io` was added.
+
+### New, not yet started: fix `-mwasi-threaded-io`'s link failure on non-atomics targets
+
+`WantsThreadedIoShim()` (`clang/lib/Driver/ToolChains/WebAssembly.cpp`)
+gates only on `Triple.isOSWASI()`, so an explicit `-mwasi-threaded-io`
+force-enables the shim even on a target without `+atomics` (e.g. plain
+`wasm32-unknown-wasip1`, no `-pthread`) — where the shim archive doesn't
+build with real content (and, in `build-single-threaded.bat`'s case,
+isn't even in the build's target list, so it doesn't exist at all).
+Needs the same kind of narrowing `--import-memory`'s addition already
+uses (`Triple.getEnvironmentName() == "threads"`), so the flag is
+rejected or silently downgraded rather than producing a confusing
+"file not found"/undefined-symbol link error. See
+`documents/threaded-file-io-rpc-plan.md`'s "Correction found while
+starting this follow-up" section for the confirmed repro.
 
 ### Still open (deferred, not scheduled): linking the shim into clang.wasm itself
 

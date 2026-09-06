@@ -7,10 +7,12 @@ below, and "Superseded design" further down for the first version's
 history (kept because the reasoning for abandoning it, and a real bug it
 caught, are both still useful). `-pthread` WASI-threads output programs
 get this automatically now; `-mno-wasi-threaded-io` opts out. Still open:
-whether/how to link the same shim into clang.wasm itself (see step 6), and
-confirming `build-single-threaded.bat`'s clang.wasm is unaffected by any
-of this (see "Follow-up: verify the single-threaded build is unaffected"
-below).
+whether/how to link the same shim into clang.wasm itself (see step 6).
+**The single-threaded-build follow-up below is now done** — found and
+fixed a real CMake bug along the way, confirmed correct non-threaded
+compile+link+run, and confirmed a real (separate, not-yet-fixed) defect:
+explicit `-mwasi-threaded-io` fails to link on that build instead of
+being inert.
 
 ## Two build configurations: what actually needs custom JavaScript
 
@@ -526,6 +528,64 @@ item 3, still open:
 Worth scoping as a short, focused follow-up rather than folding in
 opportunistically -- it's a distinct verification pass against a
 separate build config, not new design work.
+
+**Correction found while starting this follow-up (before the
+single-threaded binary even existed)**: the plan's own expectation above
+-- "it shouldn't [make a difference], since `WantsSharedMemory()`...is
+false without `-pthread` regardless of the flag" -- is wrong for the
+explicit-opt-in direction. Checked directly against the existing,
+already-verified threaded `build/bin/clang.wasm` (same driver code both
+builds share): `WantsThreadedIoShim()` is `Args.hasFlag(mwasi_threaded_io,
+mno_wasi_threaded_io, Default)` (`clang/lib/Driver/ToolChains/WebAssembly.cpp`),
+so an **explicit** `-mwasi-threaded-io` always overrides `Default`
+regardless of `-pthread` -- confirmed via a `-###` dry-run comparison
+(`--target=wasm32-wasip1`, no `-pthread`): the no-flag and
+`-mno-wasi-threaded-io` runs produce byte-identical `wasm-ld` command
+lines (shim absent), but explicit `-mwasi-threaded-io` alone *does* add
+`-u __imported_wasi_snapshot_preview1_fd_write` plus the
+`libclang_rt.wasi_threaded_io.a` archive path -- a real, intended
+difference (explicit flags always beat a computed default; this is
+ordinary `hasFlag` semantics, not a bug in `WebAssembly.cpp`). This is
+harmless on the *threaded* build, where `wasi_threaded_io.c`'s
+`__wasm_atomics__` guard is satisfied and the archive is real.
+
+**Why this matters for the single-threaded build specifically**: its
+compiler-rt pass targets plain `wasm32-unknown-wasip1` (no `+atomics`),
+so `wasi_threaded_io.c` compiles to an *empty* archive (by design --
+see "What's built" above). An explicit `-mwasi-threaded-io` there would
+still add `-u __imported_wasi_snapshot_preview1_fd_write` pointing at
+that empty archive -- and `-u` forces the linker to require the symbol
+exist, which it won't.
+
+**Confirmed against the real single-threaded binary** (compile+link via
+`build-single-threaded/bin/clang.wasm`, no `-pthread`): explicit
+`-mwasi-threaded-io` alone does fail -- `wasm-ld: error: cannot open
+.../libclang_rt.wasi_threaded_io.a: No such file or directory`, exit
+code 1, no `.wasm` produced. `-mno-wasi-threaded-io` and the no-flag
+default both succeed with byte-identical `wasm-ld` invocations (shim
+absent) and produce a correct, runnable binary either way -- so the
+plan's original "silently inert" expectation holds for those two, but
+**not** for explicit `-mwasi-threaded-io`, which is a real, confirmed
+gap in this checklist item, not just a predicted risk.
+
+The immediate cause is even more basic than the predicted "-u against an
+empty archive": `build-single-threaded.bat`'s `cmake --build` line never
+lists `clang_rt.wasi_threaded_io-wasm32` as a target at all (unlike
+`build.bat`'s line 39, which does) -- see build-order step 6 above -- so
+the archive doesn't exist in this build's output *at all*, empty or
+otherwise. Adding that target to `build-single-threaded.bat` would only
+trade one error for the originally-predicted one (`-u` against a
+genuinely-empty archive, since this target lacks `+atomics`) -- it would
+not make the flag actually work. **The real fix belongs in
+`WantsThreadedIoShim()`** (`clang/lib/Driver/ToolChains/WebAssembly.cpp`):
+it currently gates only on `Triple.isOSWASI()`, but needs to also check
+for atomics/threads support before honoring an explicit
+`-mwasi-threaded-io`, the same way `--import-memory`'s addition above is
+scoped to `Triple.getEnvironmentName() == "threads"` rather than the
+broader `WantsSharedMemory()`. **Not fixed as part of this
+verification-only session** -- flagged here as a confirmed, open defect
+for a follow-up session (driver code change, not just a build-script or
+CMake tweak like the NATIVE-configure fix above).
 
 ## Why this is scoped as its own session
 
