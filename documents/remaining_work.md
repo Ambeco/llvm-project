@@ -331,6 +331,85 @@ debugging as a **compile-time instrumentation** problem instead of a
   project is ready to pick this up — not a natural continuation of the
   Stage A build-porting work already done.
 
+### Researched (2026-09-07): running the inferior in a separate browser tab — real sandboxing win, and a genuine debugging shortcut, but doesn't change the CDP-reachability "no" above
+
+Prompted by asking "what if the wasm ran outside the extension's own tab
+entirely, in some separate, debuggable Chromium process?" Two questions
+tangled together here — sandboxing and debuggability — and they turn out to
+have different, both good, answers:
+
+- **Sandboxing: yes, and it's an existing, supported mechanism, not new
+  engineering.** A VS Code (for Web) extension can open a real, separate
+  top-level browsing context via `vscode.env.openExternal(uri)` — in
+  vscode.dev this always opens the URL in a genuinely new browser tab (the
+  extension host itself runs in a Web Worker and has no `window.open()` of
+  its own; `openExternal` is the supported bridge for this). A tab served
+  from a different origin than vscode.dev lands in its own OS-level
+  renderer process under Chrome's standard site-isolation architecture —
+  a real security boundary for running arbitrary compiled/user code,
+  achieved "for free" via an existing VS Code API rather than anything
+  this project would have to build. (VS Code's own Webview iframes use the
+  same separate-origin trick for the same reason, just as an iframe rather
+  than a top-level tab — see `documents/vscode-wasi-host.md`.)
+- **Debuggability: still no *programmatic* CDP access for the extension
+  itself** — process/origin separation doesn't unlock `chrome.debugger` or
+  any other CDP path; the "no" in the section above is unaffected by which
+  tab or process the wasm actually executes in, since it was never about
+  physical process placement, only about which browser privilege tier the
+  code asking for access runs in — but there's a real, concrete practical
+  win anyway: **Chrome DevTools has shipped built-in, no-extension-needed
+  WebAssembly/DWARF C/C++ source debugging since Chrome 114 (May 2023)** —
+  breakpoints, stepping, and locals with real source mapping, using the
+  same `-g` DWARF output `clang.wasm` already produces for free today. If
+  the compiled program runs in its own real tab (rather than inline in the
+  extension host or a hard-to-target nested iframe), a user can just open
+  Chrome's own DevTools on that tab (`F12`, same as any other page) and get
+  genuine interactive C/C++ debugging immediately — zero GDB-remote
+  transport, zero `lldb.wasm`-to-browser bridge, none of the engineering
+  scoped above. The tradeoff: that's Chrome's own DevTools UI, not
+  integrated into VS Code's editor gutter/Debug sidebar — getting *that*
+  experience would still need the compile-time-instrumentation design
+  above (or an entirely separate DAP-over-something bridge), regardless of
+  which tab/process the code runs in.
+- **Two real open questions before this is buildable, not just
+  researched-in-principle:**
+  1. **Cross-context communication.** `openExternal` returns only a
+     success/failure boolean, not a `Window` handle — the extension can't
+     `postMessage` into the new tab directly the way `window.open()`'s
+     return value would allow. Options not yet investigated: have the
+     runner tab be fully self-sufficient (it re-runs the compile itself
+     rather than receiving already-compiled bytes from the extension,
+     sidestepping the handoff problem for that step at least); some
+     shared-storage relay (`BroadcastChannel`/`SharedWorker` only work
+     same-origin, not cross-origin); or accepting one-shot, URL-encoded
+     hand-off (query string/fragment) for anything small enough, with no
+     live channel back for things like stdin or workspace file access.
+  2. **`SharedArrayBuffer`/cross-origin isolation for the runner tab.**
+     This project's threaded build needs `SharedArrayBuffer`, which needs
+     the *page itself* served with `Cross-Origin-Opener-Policy: same-origin`
+     + `Cross-Origin-Embedder-Policy: require-corp` (or the newer
+     `Origin-Isolation`/`Document-Isolation-Policy` alternative) — real HTTP
+     response headers, not something a page can grant itself purely in JS.
+     Achievable on most static hosts (a `coi-serviceworker`-style
+     first-load shim is a documented workaround where the host can't set
+     headers directly, e.g. GitHub Pages), but wherever the runner page
+     ends up hosted, this needs to be arranged deliberately — not
+     automatic. Note also that `COOP: same-origin` itself severs
+     `window.opener` from any cross-origin page that opened it, which
+     forecloses the most obvious accidental postMessage channel back to
+     vscode.dev even if one were tempted to rely on it.
+- **Net assessment:** worth doing regardless of the debugging question,
+  for the sandboxing win alone (running arbitrary compiled user code
+  outside the extension's own tab is good hygiene on its own merits) — and
+  it turns "real interactive C/C++ debugging in the browser" into a
+  near-term, low-effort deliverable (point Chrome DevTools at the tab) far
+  sooner than the from-scratch instrumentation design above. Both remain
+  real, unscoped follow-up work: the tab-launch/isolation piece is a
+  `documents/js-host-contract.md`/host-design question (where does the
+  runner page live, how is it served, how does it get COOP/COEP), not an
+  LLVM source question at all — good candidate for its own session, and
+  doesn't depend on any further `lldb.wasm` work to be worth starting.
+
 ## Upstream contribution (`upstream-fixes` branch)
 
 - No PR has been opened yet — hold off until asked.
