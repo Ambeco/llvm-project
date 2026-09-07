@@ -413,6 +413,47 @@ free, not speculative — worth its own dedicated session when the project is
 ready to pick this up, not a natural continuation of the Stage A
 build-porting work already done.
 
+### What this means for `lldb.wasm` itself: still needed, but as a symbol/value *library*, not a live debugger
+
+This design replaces LLDB's `Process`/GDB-remote layer entirely — the part
+that assumes a live, controllable inferior reachable over some wire protocol
+— which is exactly Stage B (never built, and now moot regardless: nothing
+reachable from a browser can speak to a live debug target that way, per the
+V8/CDP research above). So `Process/gdb-remote`, `Process/wasm`'s GDB-remote
+client: not needed for this design, at all.
+
+What's still genuinely hard and worth keeping LLDB for is DWARF *decoding*,
+not process *control* — two jobs that are still substantial to reimplement
+from scratch:
+- **Symbol resolution**: "hook fired at wasm PC X" → "`foo.c` line 42" and
+  "local `x` lives at address A, as DWARF type T." This is `ObjectFile/wasm`
+  + the DWARF `SymbolFile` — Stage A, already built and running today.
+- **Value formatting / expression evaluation**: turning a raw address + a
+  DWARF type into a real pretty-printed value (`std::vector<int>` with 3
+  elements: `{1, 2, 3}`, not just a hex dump), and evaluating a typed
+  expression in a Debug Console (`x->y.z`). That's `TypeSystemClang`/
+  `ValueObject`, and LLDB's full Clang-based JIT expression parser if
+  expression evaluation is wanted. This is genuinely LLDB's core value
+  proposition, separate from controlling a live process — not something
+  worth reimplementing from scratch.
+
+So the shape is: a custom JS debug adapter drives pause/resume/memory-reads
+itself against the instrumentation scheme, and calls into some *slice* of
+`lldb.wasm` purely as a symbol/type/value-decoding library — not through
+`Process`/`Target`'s live-process orchestration, and not through the
+`lldb`/`lldb-dap` CLI tools as built (their whole command-interpreter/REPL
+layer is dead weight for a library consumer that's never taking human
+command-line input).
+
+**Concrete, unmeasured follow-up this surfaces:** if `Process`, `Target`'s
+live-process machinery, and most of the command-interpreter/REPL layer
+really aren't needed, the ~96 MiB Stage-A `lldb.wasm` build might be
+shippable as something much smaller — linking only `lldbSymbol`/`lldbCore`/
+the DWARF `SymbolFile`/`ObjectFile/wasm` (plus `ExpressionParser` if
+expression evaluation is wanted) instead of the full driver. Not attempted
+or measured; a real, concrete question for whoever picks up the debugging
+design, alongside the hook-granularity question above.
+
 ### Researched (2026-09-07): running the inferior in a separate browser tab — real sandboxing win, and a genuine debugging shortcut, but doesn't change the CDP-reachability "no" above
 
 Prompted by asking "what if the wasm ran outside the extension's own tab
