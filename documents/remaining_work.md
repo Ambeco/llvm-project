@@ -196,17 +196,33 @@ Three genuinely separate pieces of work, very different risk profiles:
    GetProgramFileSpec()` (no `/proc/self/exe` equivalent, returns empty)
    and `Host::FindProcessesImpl`/`GetProcessInfo`/`ShellExpandArguments`
    (no process enumeration or shell on this target).
-   **Known issue, not yet root-caused:** `lldb.wasm --version` prints
-   correctly then crashes (`std::terminate` from a joinable
-   `std::thread` destructor) as the process exits — `Driver.cpp` always
-   spawns a background `signal_thread` (running an empty `MainLoop`,
-   since actual signal-handler registration is skipped on WASI) and
-   joins it before exit; `clang.wasm`/`lld.wasm` never spawn a
-   comparable background thread on this code path, so this wasn't hit
-   before. Possibly a real join-ordering bug, or possibly an artifact of
-   `ai-notes/wasi_thread_hook.mjs`'s fake-threading emulation not
-   modeling `pthread_join` correctly for a still-`ppoll`-blocked worker
-   — not distinguished yet. Binary size is also a real concern:
+   **Resolved (2026-09-06): the exit-time `std::terminate` crash.** Root
+   cause found by instrumenting `Driver.cpp`/`MainLoopPosix::Interrupt`
+   with temporary debug prints (removed again after) and confirmed with
+   a standalone `pipe()`/`fcntl()`/`write()` repro compiled and run
+   through `ai-notes/run_clang_link_smoketest.mjs`'s pipeline: **`pipe()`
+   itself fails outright** (`errno=Not supported`) in this Node/
+   wasi-threads environment, and a `write()` to the resulting invalid fd
+   fails too. `MainLoopPosix`'s interrupt-pipe mechanism (used to wake a
+   `MainLoop` blocked in `ppoll` on another thread so it can shut down)
+   depends on a working `pipe()`; its own constructor only `assert()`s
+   success, which compiles out in this `MinSizeRel` build, so the
+   failure was silent until `Driver.cpp`'s shutdown path tried to use it.
+   `Driver.cpp` always spawned a background `signal_thread` hosting a
+   `MainLoop` whose only purpose was three signal handlers that already
+   always fail to register on WASI (`MainLoopPosix::RegisterSignal`, see
+   above) — with no working interrupt pipe, `AddPendingCallback` (used to
+   ask that thread to terminate) returned false, so `.join()` was never
+   called, so the still-joinable `std::thread` destructor called
+   `std::terminate()` at exit. Fixed by not creating `signal_loop`/
+   `signal_thread` at all on WASI, rather than trying to fix `pipe()`
+   itself (out of scope, and `signal_thread` had nothing left to do on
+   this target anyway once `RegisterSignal` always fails). Verified:
+   `--version`, `--help`, and an unknown-flag error all now exit cleanly
+   under `ai-notes/run_clang_smoketest.mjs`. `pipe()` failing at all on
+   this environment may be worth its own investigation later if anything
+   else in this project ever needs it (nothing does today).
+   Binary size is also a real concern:
    `lldb.wasm` is **~96 MiB** (vs. `clang.wasm`'s own already-large
    ~109 MiB), all statically linked; worth revisiting before assuming
    this is shippable to a browser as-is.

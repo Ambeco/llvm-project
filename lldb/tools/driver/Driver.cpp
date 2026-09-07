@@ -815,17 +815,23 @@ int main(int argc, char const *argv[]) {
   (void)skip_next_sigint;
   (void)main_thread;
 
+// WASI has no sigaction()/real signal delivery at all (MainLoopPosix::
+// RegisterSignal always fails there -- see MainLoopPosix.cpp), no
+// pthread_kill(), and -- discovered empirically -- no working pipe()
+// either (this Node/wasi-threads environment's write() on a pipe fd
+// created by wasi-libc's pipe() emulation fails outright), which is what
+// MainLoopPosix relies on internally to interrupt/shut down a MainLoop
+// running on another thread. Since this signal_loop/signal_thread exist
+// for no reason but to host the three signal handlers below -- none of
+// which can ever register on WASI -- don't create them at all there,
+// rather than spawning a thread whose only job is to sit in a MainLoop
+// this target can't reliably interrupt to shut down again (leaving it
+// joinable at exit previously crashed with std::terminate).
+#if !defined(__wasi__)
   // Handle signals in a MainLoop running on a separate thread.
   MainLoop signal_loop;
   Status signal_status;
 
-// WASI has no sigaction()/real signal delivery at all (MainLoopPosix::
-// RegisterSignal always fails there -- see MainLoopPosix.cpp), and no
-// pthread_kill() either. signal_loop is still created and run below (an
-// empty MainLoop that just waits to be told to terminate) so the shutdown
-// path further down stays the same on every platform; only the actual
-// signal-handler registration is skipped here.
-#if !defined(__wasi__)
   auto sigint_handler = signal_loop.RegisterSignal(
       SIGINT,
       [&, main_thread](MainLoopBase &) {
@@ -901,9 +907,9 @@ int main(int argc, char const *argv[]) {
       },
       signal_status);
   assert(sigtstp_handler && signal_status.Success());
-#endif // !__wasi__
 
   std::thread signal_thread([&] { signal_loop.Run(); });
+#endif // !__wasi__
 #endif
 
   int exit_code = 0;
@@ -936,7 +942,7 @@ int main(int argc, char const *argv[]) {
     future.wait();
   }
 
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__wasi__)
   // Try to interrupt the signal thread.  If that succeeds, wait for it to exit.
   if (signal_loop.AddPendingCallback(
           [](MainLoopBase &loop) { loop.RequestTermination(); }))
