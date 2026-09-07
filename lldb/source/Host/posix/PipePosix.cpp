@@ -113,8 +113,16 @@ Status PipePosix::CreateNew(llvm::StringRef name) {
     return Status::FromErrorString("Pipe is already opened");
 
   Status error;
+#if defined(__wasi__)
+  // WASI has no mkfifo()/named pipes on the filesystem at all.
+  (void)name;
+  error = Status::FromErrorString(
+      "PipePosix::CreateNew(name) is not supported on WASI: there are no "
+      "named pipes on this target");
+#else
   if (::mkfifo(name.str().c_str(), 0660) != 0)
     error = Status::FromErrno();
+#endif
   return error;
 }
 

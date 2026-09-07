@@ -38,12 +38,22 @@ Status HostProcessPosix::Signal(int signo) const {
 }
 
 Status HostProcessPosix::Signal(lldb::process_t process, int signo) {
+#if defined(__wasi__)
+  // WASI has no kill() at all -- there is no other process on this target
+  // to send a signal to (see Host::Kill's identical handling).
+  (void)process;
+  (void)signo;
+  return Status::FromErrorString(
+      "HostProcessPosix::Signal is not supported on WASI: there is no "
+      "kill() at all on this target");
+#else
   Status error;
 
   if (-1 == ::kill(process, signo))
     return Status::FromErrno();
 
   return error;
+#endif
 }
 
 Status HostProcessPosix::Terminate() { return Signal(SIGKILL); }

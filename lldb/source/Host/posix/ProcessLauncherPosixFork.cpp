@@ -18,9 +18,17 @@
 
 #include <climits>
 #include <fcntl.h>
+#include <unistd.h>
+
+// WASI has no fork()/ptrace()/waitpid() at all -- there is no such thing as
+// spawning and debugging a native child process on this target (Process/wasm
+// is a pure GDB-remote client; see documents/remaining_work.md). The whole
+// fork-and-exec machinery below is unreachable there, so it's skipped
+// entirely rather than porting sys/ptrace.h/sys/wait.h usage that could never
+// actually run.
+#if !defined(__wasi__)
 #include <sys/ptrace.h>
 #include <sys/wait.h>
-#include <unistd.h>
 
 #include <csignal>
 #include <sstream>
@@ -28,9 +36,23 @@
 #if defined(__linux__)
 #include <sys/personality.h>
 #endif
+#endif // !__wasi__
 
 using namespace lldb;
 using namespace lldb_private;
+
+#if defined(__wasi__)
+
+HostProcess
+ProcessLauncherPosixFork::LaunchProcess(const ProcessLaunchInfo &launch_info,
+                                        Status &error) {
+  error = Status::FromErrorString(
+      "ProcessLauncherPosixFork::LaunchProcess is not supported on WASI: "
+      "there is no fork()/exec() at all on this target");
+  return HostProcess();
+}
+
+#else // !__wasi__
 
 // Begin code running in the child process
 // NB: This code needs to be async-signal safe, since we're invoking fork from
@@ -298,3 +320,5 @@ ProcessLauncherPosixFork::LaunchProcess(const ProcessLaunchInfo &launch_info,
 
   return HostProcess();
 }
+
+#endif // !__wasi__

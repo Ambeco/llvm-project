@@ -21,6 +21,13 @@ using namespace lldb;
 using namespace lldb_private;
 
 llvm::Expected<DomainSocket::Pair> DomainSocketPosix::CreatePair() {
+#if defined(__wasi__)
+  // WASI has no socketpair()/sockets at all (see the top-level comment in
+  // TCPSocket.cpp).
+  return llvm::createStringError(
+      "DomainSocketPosix::CreatePair is not supported on WASI: there is no "
+      "sockets API at all on this target");
+#else
   int sockets[2];
   int type = SOCK_STREAM;
 #ifdef SOCK_CLOEXEC
@@ -51,4 +58,5 @@ llvm::Expected<DomainSocket::Pair> DomainSocketPosix::CreatePair() {
                   ProtocolUnixDomain, sockets[0], /*should_close=*/true)),
               std::unique_ptr<DomainSocket>(new DomainSocketPosix(
                   ProtocolUnixDomain, sockets[1], /*should_close=*/true)));
+#endif // !__wasi__
 }

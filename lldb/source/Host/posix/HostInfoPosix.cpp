@@ -21,10 +21,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+// WASI has no user/group database at all (no grp.h/pwd.h) -- there is no
+// such thing as another user or group on this target.
+#if !defined(__wasi__)
 #include <grp.h>
+#endif
 #include <mutex>
 #include <optional>
+#if !defined(__wasi__)
 #include <pwd.h>
+#endif
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <unistd.h>
@@ -99,6 +105,9 @@ struct PasswdEntry {
   std::string shell;
 };
 
+#if defined(__wasi__)
+static std::optional<PasswdEntry> GetPassword(id_t uid) { return std::nullopt; }
+#else
 static std::optional<PasswdEntry> GetPassword(id_t uid) {
   struct passwd user_info;
   struct passwd *user_info_ptr = &user_info;
@@ -111,6 +120,7 @@ static std::optional<PasswdEntry> GetPassword(id_t uid) {
   }
   return std::nullopt;
 }
+#endif // !__wasi__
 
 std::optional<std::string> PosixUserIDResolver::DoGetUserName(id_t uid) {
   if (std::optional<PasswdEntry> password = GetPassword(uid))
@@ -119,7 +129,7 @@ std::optional<std::string> PosixUserIDResolver::DoGetUserName(id_t uid) {
 }
 
 std::optional<std::string> PosixUserIDResolver::DoGetGroupName(id_t gid) {
-#if !defined(__ANDROID__) || __ANDROID_API__ >= 24
+#if (!defined(__ANDROID__) || __ANDROID_API__ >= 24) && !defined(__wasi__)
   char group_buffer[PATH_MAX];
   size_t group_buffer_size = sizeof(group_buffer);
   struct group group_info;

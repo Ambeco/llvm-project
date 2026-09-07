@@ -12,7 +12,11 @@
 #include <climits>
 #include <fcntl.h>
 #include <sys/ioctl.h>
+// WASI has no termios; nothing in this file actually uses it (window-size
+// queries below go through sys/ioctl.h's TIOCGWINSZ/struct winsize).
+#if !defined(__wasi__)
 #include <termios.h>
+#endif
 #include <unistd.h>
 
 #include "lldb/Utility/FileSpec.h"
@@ -85,6 +89,10 @@ void NativeFilePosix::CalculateInteractiveAndTerminal() {
   m_is_real_terminal = eLazyBoolNo;
   if (isatty(fd)) {
     m_is_interactive = eLazyBoolYes;
+#if defined(__wasi__)
+    // WASI has no TIOCGWINSZ/struct winsize -- there is no real terminal
+    // device to query a window size from.
+#else
     struct winsize window_size;
     if (::ioctl(fd, TIOCGWINSZ, &window_size) == 0) {
       if (window_size.ws_col > 0) {
@@ -93,6 +101,7 @@ void NativeFilePosix::CalculateInteractiveAndTerminal() {
           m_supports_colors = eLazyBoolYes;
       }
     }
+#endif
   }
 }
 
