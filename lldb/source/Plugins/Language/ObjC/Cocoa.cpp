@@ -1228,7 +1228,10 @@ time_t lldb_private::formatters::GetOSXEpoch() {
   static time_t epoch = 0;
   if (!epoch) {
 #if !defined(_WIN32) && !defined(_AIX)
+#if !defined(__wasi__)
+    // WASI has no tzset()/timezone database at all.
     tzset();
+#endif
     tm tm_epoch;
     tm_epoch.tm_sec = 0;
     tm_epoch.tm_hour = 0;

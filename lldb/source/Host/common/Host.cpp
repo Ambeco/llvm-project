@@ -780,6 +780,29 @@ uint32_t Host::FindProcesses(const ProcessInstanceInfoMatch &match_info,
   return FindProcessesImpl(match_info, process_infos);
 }
 
+#if defined(__wasi__)
+// Unlike most of the WASI stubs elsewhere in this file, these three don't
+// have a per-OS Host.cpp to override them at all (see e.g.
+// lldb/source/Host/freebsd/Host.cpp) -- WASI falls through HostInfo.h's
+// dispatch to the plain-POSIX case with no per-OS Host.cpp of its own (see
+// HostInfoPosix::GetProgramFileSpec's identical situation), and there's no
+// /proc or sysctl-style process enumeration to implement these with anyway.
+uint32_t Host::FindProcessesImpl(const ProcessInstanceInfoMatch &match_info,
+                                 ProcessInstanceInfoList &process_infos) {
+  return 0;
+}
+
+bool Host::GetProcessInfo(lldb::pid_t pid, ProcessInstanceInfo &process_info) {
+  return false;
+}
+
+Status Host::ShellExpandArguments(ProcessLaunchInfo &launch_info) {
+  return Status::FromErrorString(
+      "Host::ShellExpandArguments is not supported on WASI: there is no "
+      "shell to expand arguments with on this target");
+}
+#endif // __wasi__
+
 char SystemLogHandler::ID;
 
 SystemLogHandler::SystemLogHandler() {}

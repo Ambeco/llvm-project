@@ -812,11 +812,20 @@ int main(int argc, char const *argv[]) {
   // signal thread; it lives outside the lambda because MainLoopPosix copies
   // the callback on every dispatch, which would discard in-lambda state.
   bool skip_next_sigint = false;
+  (void)skip_next_sigint;
+  (void)main_thread;
 
   // Handle signals in a MainLoop running on a separate thread.
   MainLoop signal_loop;
   Status signal_status;
 
+// WASI has no sigaction()/real signal delivery at all (MainLoopPosix::
+// RegisterSignal always fails there -- see MainLoopPosix.cpp), and no
+// pthread_kill() either. signal_loop is still created and run below (an
+// empty MainLoop that just waits to be told to terminate) so the shutdown
+// path further down stays the same on every platform; only the actual
+// signal-handler registration is skipped here.
+#if !defined(__wasi__)
   auto sigint_handler = signal_loop.RegisterSignal(
       SIGINT,
       [&, main_thread](MainLoopBase &) {
@@ -892,6 +901,7 @@ int main(int argc, char const *argv[]) {
       },
       signal_status);
   assert(sigtstp_handler && signal_status.Success());
+#endif // !__wasi__
 
   std::thread signal_thread([&] { signal_loop.Run(); });
 #endif

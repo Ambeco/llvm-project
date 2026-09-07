@@ -68,6 +68,49 @@ extern int tcsetattr(int fd, int optional_actions,
                      const struct termios *termios_p);
 extern int tcgetattr(int fildes, struct termios *termios_p);
 
+#elif defined(__wasi__)
+// WASI has no termios/real terminal at all (no <termios.h>, and
+// TIOCGWINSZ/struct winsize aren't declared by <sys/ioctl.h> either -- see
+// lldb/source/Host/posix/FilePosix.cpp's identical finding). This driver
+// only runs headless/MI-mode on this target, so these just need to exist and
+// report "no terminal" rather than actually work, the same shape as the
+// _WIN32 shim above.
+#include <cinttypes>
+
+#include <libgen.h>
+#include <pthread.h>
+#include <sys/ioctl.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+struct winsize {
+  unsigned short ws_row;
+  unsigned short ws_col;
+};
+#ifndef TIOCGWINSZ
+#define TIOCGWINSZ 0x5413
+#endif
+
+typedef unsigned char cc_t;
+typedef unsigned int speed_t;
+typedef unsigned int tcflag_t;
+
+#define TCSANOW 0
+#define NCCS 32
+struct termios {
+  tcflag_t c_iflag;
+  tcflag_t c_oflag;
+  tcflag_t c_cflag;
+  tcflag_t c_lflag;
+  cc_t c_line;
+  cc_t c_cc[NCCS];
+  speed_t c_ispeed;
+  speed_t c_ospeed;
+};
+
+inline int tcsetattr(int, int, const struct termios *) { return -1; }
+inline int tcgetattr(int, struct termios *) { return -1; }
+
 #else
 #include <cinttypes>
 
