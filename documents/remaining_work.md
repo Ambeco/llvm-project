@@ -95,6 +95,35 @@ RPC shim exists to fix. Not worth wiring `wasi_threaded_io` into either
 binary's own build; closing this as a non-issue rather than leaving it
 open.
 
+### Resolved (2026-09-06): LTO / ThinLTO backend threads don't hit the shared-fd bug either
+
+Followed up on the assumption in the item above by reading
+`lld/wasm/LTO.cpp`'s `BitcodeCompiler::compile()` and the LLVM LTO
+backend it drives. Two cases, both safe:
+- **No `--thinlto-cache-dir`** (the common case): each parallel ThinLTO
+  backend task (`createInProcessThinBackend`, real worker threads via
+  `heavyweight_hardware_concurrency` on this project's threaded build)
+  writes into its own per-task in-memory buffer
+  (`buf[task].second`/`raw_svector_ostream`) — never a file descriptor at
+  all, same as the self-linking case above.
+- **With `--thinlto-cache-dir`** (real fd I/O, via `llvm::localCache` in
+  `llvm/lib/Support/Caching.cpp`): each task's cache lookup, temp-file
+  write, and commit-time rename (`llvm/lib/LTO/LTOBackend.cpp`'s
+  `codegen()` → `AddStream()` → `Stream->commit()`) all happen within
+  that one task's own call stack, i.e. on the single worker thread
+  running that task, start to finish — the fd it opens is never touched
+  by any other thread. That's exactly the "independent per-thread
+  `open()` calls to the same/different path" pattern
+  `documents/threaded-file-io-rpc-plan.md` already proved safe (its
+  "Main-thread-opens, workers-read/write is not a special case" section,
+  smoketest Case B) — the shared-fd bug only bites when one thread opens
+  an fd and a *different* thread later reuses that same fd number, which
+  never happens here.
+
+Confirms the original "presumably fine" assumption; downgrading from
+assumption to verified. No action needed — `wasi_threaded_io` doesn't
+need to cover this path either.
+
 ## The real browser-based JS host (separate project, not started)
 
 Everything under `ai-notes/*.mjs` is a Node reference implementation
@@ -118,6 +147,101 @@ a branch here), needs:
 - This is where a real debugger implementation would also need to live;
   `documents/vscode-wasi-host.md` was written with that in mind but no
   debugger work has started.
+
+### Scoping note (2026-09-06): what `lldb.wasm` debugging the compiled output would actually take
+
+Read `lldb/source/Plugins/Process/wasm/` and
+`lldb/docs/resources/lldbgdbremote.md` directly rather than assuming from
+the earlier "no debugging story" framing. Good news first: **LLDB
+upstream already has a complete wasm debugging *client*** —
+`ObjectFile/wasm` (parses `.wasm` binaries), a DWARF `SymbolFile` variant
+that understands wasm's tagged 64-bit address space (instance id +
+offset), and `Process/wasm` (a `ProcessGDBRemote` subclass speaking
+documented wasm-specific GDB-remote packets — `qWasmCallStack`,
+`qWasmLocal`, `qWasmGlobal`, `qWasmStackValue`). The protocol doc states
+it's "supported by the WAMR and V8 Wasm runtimes" — **V8 already
+implements the server/stub side**, almost certainly the same machinery
+behind Chrome's real "C/C++ DevTools Support (DWARF)" extension (which is
+known to run an Emscripten-built LLDB talking to V8 this exact way). So
+this isn't a from-scratch protocol design problem; it has a working
+precedent.
+
+Three genuinely separate pieces of work, very different risk profiles:
+1. **Build `lldb.wasm` itself for `wasm32-unknown-wasip1[-threads]`.**
+   **Done (2026-09-06), Stage A (offline lldb, no Process/GDB-remote
+   plugins):** built a real `bin/lldb.wasm` from `build-lldb.bat` (a new
+   build directory, not `build.bat`/`build-single-threaded.bat`'s —
+   deliberately separate so a broken NATIVE cross-build here can't poison
+   those). Config: `LLDB_ENABLE_PYTHON/LUA/SWIG/LIBEDIT/CURSES/LZMA/
+   LIBXML2/TREESITTER/PROTOCOL_SERVERS=OFF`, `LLVM_ENABLE_PROJECTS=
+   "clang;lld;lldb"`, everything else inherited from `build.bat`'s
+   toolchain block. Confirmed working end-to-end against the Node
+   reference host (`ai-notes/run_clang_smoketest.mjs build-lldb/bin/
+   lldb.wasm --version` actually prints `lldb version 24.0.0git ...`).
+   liblldb now builds STATIC (CMake's own SHARED-not-supported check
+   fails outright on `Generic`/wasm32, same fix shape as libclang's
+   existing `LIBCLANG_BUILD_STATIC`). WASI has essentially none of the
+   POSIX surface LLDB's Host layer assumes — no sockets API at all (not
+   even declared: socket/connect/bind/listen/setsockopt/getsockname/
+   getpeername/getaddrinfo, `sockaddr_un.sun_path`), no PTYs
+   (posix_openpt/ptsname), no real signal delivery (`sigaction`), no
+   fork/exec/ptrace/waitpid, no user/group database (grp.h/pwd.h), no
+   dladdr/kill/tzset/termios. All guarded out with loud "not supported"
+   errors (never silent no-ops) following this fork's existing
+   `raw_socket_stream.cpp` WASI precedent; see the git log on `lldb/`
+   from 2026-09-06 for the full file list. Two real per-OS gaps needed
+   new fallback implementations rather than just guards, since WASI has
+   no per-OS `Host.cpp`/`HostInfo*.cpp` of its own and falls through to
+   a plain-POSIX case that was previously dead code: `HostInfoPosix::
+   GetProgramFileSpec()` (no `/proc/self/exe` equivalent, returns empty)
+   and `Host::FindProcessesImpl`/`GetProcessInfo`/`ShellExpandArguments`
+   (no process enumeration or shell on this target).
+   **Known issue, not yet root-caused:** `lldb.wasm --version` prints
+   correctly then crashes (`std::terminate` from a joinable
+   `std::thread` destructor) as the process exits — `Driver.cpp` always
+   spawns a background `signal_thread` (running an empty `MainLoop`,
+   since actual signal-handler registration is skipped on WASI) and
+   joins it before exit; `clang.wasm`/`lld.wasm` never spawn a
+   comparable background thread on this code path, so this wasn't hit
+   before. Possibly a real join-ordering bug, or possibly an artifact of
+   `ai-notes/wasi_thread_hook.mjs`'s fake-threading emulation not
+   modeling `pthread_join` correctly for a still-`ppoll`-blocked worker
+   — not distinguished yet. Binary size is also a real concern:
+   `lldb.wasm` is **~96 MiB** (vs. `clang.wasm`'s own already-large
+   ~109 MiB), all statically linked; worth revisiting before assuming
+   this is shippable to a browser as-is.
+   **Not yet attempted:** Stage B (linking `Process/gdb-remote` +
+   `Process/wasm` back in) — deliberately deferred until item 2 below
+   has an actual transport, since those plugins pull in the WASI-hostile
+   `Host/common/Socket.cpp`/`ConnectionFileDescriptor` surface for no
+   benefit until then.
+2. **A new transport for the GDB-remote connection.** LLDB's GDB-remote
+   client normally reaches its target over a TCP socket or pipe
+   (`ConnectionFileDescriptor`) — WASI has no BSD sockets at all (already
+   a hard stub in this fork, see `llvm/lib/Support/raw_socket_stream.cpp`
+   in `documents/design.md`). `lldb.wasm` would need a new `Connection`
+   backend that marshals GDB-remote protocol bytes through something a JS
+   host provides — conceptually the same shape as the existing
+   spawn-hook (a host-installed function-pointer-table slot) or the
+   `wasi_threaded_io` RPC design, just carrying debug-protocol bytes
+   instead of subprocess argv or file I/O. Not attempted; new
+   infrastructure, not a CMake flag.
+3. **Reaching V8's stub from inside a VS Code Web extension.** The one
+   real open question, and the one that determines whether 1 and 2 are
+   even worth doing: V8's wasm-gdb-remote-stub surface is normally only
+   reachable via the Chrome DevTools Protocol from an attached devtools
+   client, not from arbitrary extension-host code running in the same
+   browser tab. Whether a VS Code Web extension can get at it at all
+   (some CDP-adjacent API, or none) is unresearched — this is a
+   `documents/vscode-wasi-host.md`/js-host-contract question, not an LLVM
+   source question, and it's the piece most likely to actually block
+   this, independent of how much LLDB porting effort goes in.
+
+Rough shape, not a time estimate: (1) and (2) are real but bounded
+engineering, similar in spirit to work already done elsewhere in this
+fork; (3) is a feasibility question that should be answered *first*,
+since a "no" there means 1 and 2 need a different design (e.g. a
+from-scratch stub instead of leaning on V8's) rather than just more time.
 
 ## Upstream contribution (`upstream-fixes` branch)
 
@@ -152,36 +276,47 @@ a branch here), needs:
   commits that cherry-pick trivially on top; re-verify it too at the
   point an actual rebase is being done, not preemptively.
 
-## Worth investigating (not yet a confirmed bug)
+### Resolved (2026-09-06): module cache / PCH file locking under concurrent instances is a mainline behavior, not our bug
 
-- **Module cache / PCH file locking under concurrent instances.**
-  `LockFileManager` was patched (`upstream-fixes`) to conservatively
-  assume a lock is always held on WASI — i.e. no real cross-instance
-  locking. Fine for a single driver instance, but
-  `ai-notes/run_clang_parallel_smoketest.mjs` already proves multiple
-  independent clang.wasm instances compiling concurrently is a real,
-  exercised feature of this project (not hypothetical). If two of those
-  instances ever shared a `-fmodules` module cache directory or a PCH
-  output path, the fake-lock behavior could let them race/corrupt each
-  other. Untested — likely the first genuine problem to hit if `-fmodules`
-  or PCH support gets exercised under the existing multi-instance
-  parallelism model.
+Investigated by reading the full `LockFileManager.cpp` flow plus its only
+caller, `compileModuleBehindLockOrRead()` in
+`clang/lib/Frontend/CompilerInstance.cpp`. The WASI patch
+(`processStillExecuting()` always returns "lock still held") only removes
+*early* dead-owner detection (`OwnerDied` is unreachable on this target);
+every contended lock instead always falls through to the existing,
+finite `ImplicitModulesLockTimeoutSeconds` timeout before giving up and
+rebuilding redundantly — a real but minor latency cost on a
+crashed/killed Worker, not a correctness one. The force-unlock-and-
+rebuild-on-timeout behavior that follows is unmodified upstream Clang
+(verified: `git log`/`git blame` show zero commits from this fork
+touching that function; it's attributed to upstream commit `822f549e9`,
+predating this fork), and its safety rests on `compileModuleImpl()`'s
+output always going through a temp-file-then-atomic-rename
+(`createOutputFileImpl(..., UseTemporary=true)`), so even two instances
+redundantly rebuilding the same module concurrently can't produce a torn
+file. Since the risk is upstream's, not this fork's, no action needed
+here beyond this record.
+
+## Worth investigating (not yet a confirmed bug)
 
 ## Explicitly deferred, not forgotten
 
-- **LTO / ThinLTO backends** (`-flto`, `-flto=thin`): different threading
-  shape than lld's normal parallel section-writing (see the resolved
-  self-linking item above) — ThinLTO backend jobs each produce their own
-  separate output file rather than writing into one shared buffer, so
-  presumably each thread owns its own fd and this is fine, but that's an
-  assumption, not verified.
-- **Sanitizers** (`-fsanitize=address/undefined/thread`, etc.): compiler-rt
-  sanitizer runtimes aren't part of this build's target list at all (only
-  `builtins` and `wasi_threaded_io`); a `-fsanitize=...` output-program
-  compile would presumably fail at link with a missing-archive error, but
-  the failure mode itself (clean diagnostic vs. confusing linker error)
-  hasn't been checked. Out of scope for the "compile/link/run ordinary
-  C/C++" goal unless a real need appears.
+- **Sanitizers** (`-fsanitize=address/undefined/thread`, etc.): not
+  prioritized (user confirmed 2026-09-06 — was investigating this under a
+  mistaken impression it was wanted; static analysis, not sanitizers, is
+  the actual interest — see the `clangd`/static-analysis item below).
+  Scoping findings kept in case this changes: `wasm32`/`WASI` are missing
+  from compiler-rt's own arch/OS support lists
+  (`compiler-rt/cmake/Modules/AllSupportedArchDefs.cmake`,
+  `compiler-rt/cmake/config-ix.cmake`) for everything except `profile`
+  (PGO), which upstream already supports on this target. Trap-only UBSan
+  (`-fsanitize-trap=undefined`) needs no runtime and should already work.
+  Full UBSan runtime looks like a plausible, bounded port (its source
+  doesn't touch shadow memory, just ordinary OS glue). ASan/MSan/HWASan/
+  TSan are a much bigger, likely-architecturally-blocked lift (shadow
+  memory needs fixed-offset `mmap` reservations wasm32's flat linear
+  memory has no equivalent for) — not worth pursuing without a specific
+  need.
 - **PGO** (`-fprofile-instr-generate`/`-fprofile-use`): profile counter
   writing at exit, and whether counter merging across `-pthread`
   output-program threads hits anything like the shared-fd issue
@@ -193,10 +328,59 @@ a branch here), needs:
   orthogonal to `-ldl` (which only satisfies clang.wasm's own build-time
   symbol references — plugin loading is already off via
   `LLVM_ENABLE_PLUGINS=OFF`).
-- `clangd` support: raised as a likely-harder future problem (persistent
-  background indexing threads, not a one-shot spawn-and-wait like `cc1`).
-  `clang-tools-extra` isn't even enabled in `LLVM_ENABLE_PROJECTS` yet.
-  Not attempted; worth its own investigation pass whenever it's prioritized.
+- **`clangd` / static analysis support** (the user's actual interest, not
+  sanitizers — see above): scoped 2026-09-06 by reading
+  `clang-tools-extra/clangd`'s actual source, not just guessing from its
+  reputation as "harder." The earlier "persistent background indexing
+  threads are a different shape of problem" framing turns out to be less
+  scary than it sounds:
+  - `TUScheduler`/`BackgroundIndex` use plain `std::thread` worker pools
+    (`ThreadPool.runAsync(...)`, `index/Background.cpp`) — no different
+    in kind from the real wasi-threads support this project already has
+    working.
+  - Background indexing's on-disk cache
+    (`index/BackgroundIndexStorage.cpp`'s `storeShard`/`loadShard`) opens,
+    writes, and closes each shard file within one function call on the
+    worker thread that owns that task — the same "independent per-thread
+    open()" pattern already proven safe elsewhere in this project (see
+    the resolved ThinLTO item above), not the shared-fd pattern that
+    needed `wasi_threaded_io`.
+  - clangd doesn't spawn `cc1` as a subprocess to parse a TU the way the
+    driver does — it calls into Clang's own libraries in-process
+    (`ParsedAST`/`Sema` directly), so the existing `CLANG_SPAWN_CC1`
+    multi-instance spawn-hook machinery mostly isn't even in the
+    critical path here.
+  - No native OS-level directory-watching dependency
+    (`inotify`/`ReadDirectoryChangesW`/etc.) exists in clangd itself —
+    workspace file-change notification is the LSP *client*'s job
+    (`didChangeWatchedFiles`), which a browser host already does its own
+    way. One less WASI gap to worry about.
+  - `llvm::sys::SetInterruptFunction` (Ctrl-C handling,
+    `tool/ClangdMain.cpp`) degrades the same way this fork already made
+    all Unix signal registration degrade: a silent no-op, consistent with
+    `documents/design.md`'s existing `Unix/Signals.inc` handling, not a
+    new gap.
+  - The one real optional-feature gap: `--query-driver` (asking a *real*
+    system compiler for its default include paths, `CompileCommands.cpp`)
+    spawns a subprocess via `llvm::sys::ExecuteAndWait` — works only if a
+    JS host installs the spawn hook, same as any other subprocess spawn
+    in this project; harmless to leave unsupported since this project
+    only ever has one compiler (itself).
+  - **Actual remaining work, roughly in order:** (1) enable
+    `clang-tools-extra` in `LLVM_ENABLE_PROJECTS` and see what fails to
+    configure/compile for `wasm32-unknown-wasip1[-threads]` — untried,
+    likely surfaces its own set of small WASI gaps the way clang/lld did;
+    (2) binary size is a real open question — clangd statically linking
+    every clang-tidy check (`CLANGD_TIDY_CHECKS=ON` by default) onto an
+    already-large `clang.wasm` could be a lot to ship to a browser;
+    start with `-DCLANGD_TIDY_CHECKS=OFF` and grow from there if size
+    allows; (3) design how the JS host talks to it — clangd's LSP
+    transport is JSON-RPC over stdin/stdout, which needs the same kind of
+    host-side plumbing `documents/js-host-contract.md` already specifies
+    for a normal compile, but as a long-lived bidirectional stream rather
+    than a one-shot invocation — worth its own addition to that doc once
+    started. Not yet attempted; a real next investigation/build pass, not
+    just documentation.
 - Subprocess I/O redirection, timeouts, polling, and detached-process
   support in `Unix/Program.inc` — currently fail loudly rather than
   silently no-op'ing. Nothing in a normal compile/link needs these yet;
