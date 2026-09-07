@@ -307,29 +307,111 @@ consistent with this project's whole approach (no native tooling, no
 privileged browser APIs, everything runs as ordinary page/worker JS): treat
 debugging as a **compile-time instrumentation** problem instead of a
 **runtime-introspection** problem.
-- Recompile the target program (or `lld.wasm`'s output) with breakpoint/step
-  hooks injected at potential stop points — e.g. an imported host function
-  the instrumented wasm calls at each source line or function entry/exit,
-  which the *hosting JS* (which this project's own host code controls, since
-  it supplies every import) can intercept, inspect locals via wasm
-  local/global accessors, and block on (e.g. via `Atomics.wait` if the
-  inferior runs on a worker thread) until told to resume.
-- `clang.wasm` already emits real DWARF (`-g` is a free, ordinary compiler
-  flag) for line/variable mapping; `lldb.wasm`'s existing `ObjectFile/wasm`
-  + DWARF `SymbolFile` (Stage A, already built and working — see above)
-  could still do all the *symbolic* work (resolving a PC/local index to a
-  source line or variable name) — what's missing is only the *live control*
-  half (stopping/stepping/reading memory), which would need a from-scratch
-  `Process`/`Connection` pair speaking to this instrumentation scheme
-  instead of a real GDB-remote stub.
-- This is a real, unscoped design task, not a small follow-up — it would
-  need its own investigation into where hooks can be injected cheaply (wasm
-  has no simple "single-step" trap), how much overhead instrumentation adds,
-  and how far short of real LLDB-quality debugging (watchpoints, multi-thread
-  awareness, expression evaluation touching live memory) a JS-callback-based
-  scheme can practically get. Worth its own dedicated session when the
-  project is ready to pick this up — not a natural continuation of the
-  Stage A build-porting work already done.
+
+### Why this is the *only* approach that fits, not just *a* workaround (2026-09-07)
+
+Worth stating precisely, because it isn't obvious in advance whether "no
+CDP access" rules out real VS Code-integrated debugging (breakpoints in the
+editor gutter, the Debug sidebar) or only rules out *one way* of getting it.
+It only rules out one way. The **Debug Adapter Protocol (DAP)** — the thing
+VS Code's own debugging UI actually talks to — is deliberately
+backend-agnostic: it standardizes only the conversation between VS Code and
+"the debug adapter," never how the adapter actually controls whatever it's
+debugging. A debug adapter can run as a `DebugAdapterInlineImplementation` —
+a plain JS/TypeScript object living inside the extension host itself, no
+separate process at all, which is the only shape a web extension can use
+anyway (no `child_process`). This is exactly how every other non-JavaScript
+debugger already working in VS Code for Web operates: they're not reaching
+into the browser's own execution engine at all, they're driving an
+interpreter *their own extension code already hosts* (e.g. Pyodide's CPython
+loop via its own trace hooks) and translating that interpreter's native
+stop/step/inspect hooks into DAP messages. Zero CDP, zero browser privilege,
+because control of execution never has to leave JS in the first place.
+
+`clang.wasm`/`lld.wasm` compiling to *native* wasm and handing it to the
+browser's own execution engine (V8's real JIT) to run directly forecloses
+that pattern — once V8 owns execution, this project's own JS host code no
+longer controls it step-by-step, which is exactly the gap the sections above
+found no browser API to bridge. The fix isn't a special trick for wasm; it's
+applying the *same* pattern every other VS Code Web debugger already relies
+on: keep control in JS by making the compiled program call back into it
+constantly, rather than letting the browser's engine run it uninterrupted.
+
+**A full wasm interpreter is the wrong way to do that, though** — not
+because a real spec-compliant interpreter is infeasible (wasm3 does one in a
+few thousand lines; roughly 450-500 core opcodes isn't actually the hard
+part), but because of everything *around* correctly interpreting it —
+precise overflow/NaN semantics, bounds-checked memory, tables/reference
+types, the exception-handling proposal, atomics (which this project's own
+threaded build needs) — plus a real, measurable speed loss against V8's own
+JIT, which matters here specifically since `clang.wasm`/`lld.wasm`'s own
+execution speed is part of this project's usability. Silly and infeasible
+for what it'd buy.
+
+### Confirmed (2026-09-07): the actual mechanism is two existing, free Clang codegen flags — verified against `wasm32-unknown-wasi`, not just assumed
+
+The lighter-weight alternative — compile the target program with hooks
+built directly into the generated code, so it keeps running at native wasm
+speed but calls back into host JS at controlled points — turns out not to
+need any new compiler engineering at all. Tested directly (native host
+clang, `-target wasm32-unknown-wasi -S -emit-llvm`, no changes to this
+fork), both already-existing flags emit exactly the expected calls, with
+correctly-sized wasm32 pointer arguments, no compiler-rt runtime link
+required for either (the callback bodies are meant to be user-supplied):
+
+```
+call void @__sanitizer_cov_trace_pc_guard(ptr inttoptr (... @__sancov_gen_ ...))
+call void @__cyg_profile_func_enter(ptr @add, ptr %6)
+call void @__cyg_profile_func_exit(ptr @add, ptr %11)
+```
+
+- **`-finstrument-functions`** — a call to `__cyg_profile_func_enter(fn,
+  call_site)` / `__cyg_profile_func_exit(...)` at every function's entry and
+  exit. Free call-stack tracking, no design work needed.
+- **`-fsanitize-coverage=trace-pc-guard`** — a call to
+  `__sanitizer_cov_trace_pc_guard(&guard)` on every control-flow
+  edge/basic block. In an unoptimized (`-O0`) build — the natural choice for
+  a "Debug" build anyway — that lands a hook at roughly every statement,
+  which is the granularity real line-by-line stepping needs. Both are pure
+  LLVM IR-level passes, target-independent, with no shadow-memory or OS
+  dependency blocking wasm32 the way full ASan is blocked (see the deferred
+  sanitizers note elsewhere in this file) — confirmed empirically rather
+  than inferred from that distinction.
+
+This changes the shape of the remaining work from "design an instrumentation
+scheme from scratch" to "wire together pieces that already exist":
+1. **Hooks** — the two flags above, or a small custom LLVM pass emitting one
+   hook per DWARF line-table row instead of per-edge if `trace-pc-guard`'s
+   granularity turns out too coarse or too fine for clean line-stepping.
+   Genuinely the one open design choice left.
+2. **Pause/resume** — a hook calls a host-imported function; JS blocks that
+   worker via `Atomics.wait` on a shared flag until told to step/continue —
+   this project's existing thread-coordination pattern already, nothing new.
+3. **Reading state** — locals/globals live in the shared `WebAssembly.Memory`,
+   directly readable from JS as a plain typed array, no serialization
+   boundary at all. `lldb.wasm`'s DWARF `ObjectFile`/`SymbolFile` (Stage A,
+   already built and running — see above) does the "which address holds
+   variable `x` at this line" resolution.
+4. **DAP wiring** — a plain `DebugAdapterInlineImplementation`, per the
+   backend-agnostic point above.
+
+Scoping note: this should be opt-in (a distinct "Debug" build, separate from
+a plain "Run" build) the same way native toolchains already separate
+`-O0 -g` debug builds from optimized release ones — `trace-pc-guard` adds
+real per-edge overhead not worth paying on an ordinary run. And this should
+almost certainly be scoped to *the user's compiled program only*, not
+`clang.wasm`/`lld.wasm` themselves — instrumenting our own already-large
+compiler binaries would add real size/perf cost for no product benefit.
+
+Still a real, unscoped design task, not a small follow-up — open questions:
+exact hook granularity (above), how much overhead instrumentation adds in
+practice, and how far short of real LLDB-quality debugging (watchpoints,
+multi-thread awareness, expression evaluation touching live memory) a
+JS-callback-based scheme can practically get. But it is now a *de-risked*
+design task — the load-bearing compiler mechanism is confirmed real and
+free, not speculative — worth its own dedicated session when the project is
+ready to pick this up, not a natural continuation of the Stage A
+build-porting work already done.
 
 ### Researched (2026-09-07): running the inferior in a separate browser tab — real sandboxing win, and a genuine debugging shortcut, but doesn't change the CDP-reachability "no" above
 
