@@ -41,6 +41,13 @@ public:
 
   static llvm::Expected<llvm::StringRef> GetSDKRoot(SDKOptions options);
 
+  // Only actually reached on a plain-POSIX fallback with no more specific
+  // per-OS HostInfo subclass (see lldb/Host/HostInfo.h's #else case) -- every
+  // real OS (Linux/FreeBSD/etc.) overrides this in its own subclass instead.
+  // WASI is the only target that currently takes this path, and has no
+  // equivalent of /proc/self/exe or similar to implement it with.
+  static FileSpec GetProgramFileSpec();
+
 protected:
   static bool ComputeSupportExeDirectory(FileSpec &file_spec);
   static bool ComputeHeaderDirectory(FileSpec &file_spec);

@@ -162,6 +162,18 @@ UserIDResolver &HostInfoPosix::GetUserIDResolver() {
   return *g_user_id_resolver;
 }
 
+#if defined(__wasi__)
+// WASI has no users/groups at all (no getuid()/getgid()/geteuid()/
+// getegid()) -- everything on this target runs as a single implicit
+// "user", so report a fixed id rather than failing to compile.
+uint32_t HostInfoPosix::GetUserID() { return 0; }
+
+uint32_t HostInfoPosix::GetGroupID() { return 0; }
+
+uint32_t HostInfoPosix::GetEffectiveUserID() { return 0; }
+
+uint32_t HostInfoPosix::GetEffectiveGroupID() { return 0; }
+#else
 uint32_t HostInfoPosix::GetUserID() { return getuid(); }
 
 uint32_t HostInfoPosix::GetGroupID() { return getgid(); }
@@ -169,13 +181,23 @@ uint32_t HostInfoPosix::GetGroupID() { return getgid(); }
 uint32_t HostInfoPosix::GetEffectiveUserID() { return geteuid(); }
 
 uint32_t HostInfoPosix::GetEffectiveGroupID() { return getegid(); }
+#endif
 
 FileSpec HostInfoPosix::GetDefaultShell() {
   if (const char *v = ::getenv("SHELL"))
     return FileSpec(v);
+#if !defined(__wasi__)
   if (std::optional<PasswdEntry> password = GetPassword(::geteuid()))
     return FileSpec(password->shell);
+#endif
   return FileSpec("/bin/sh");
+}
+
+FileSpec HostInfoPosix::GetProgramFileSpec() {
+  // No portable way to find our own executable's path without a per-OS
+  // mechanism (see the declaration comment); every subclass that has one
+  // overrides this instead.
+  return FileSpec();
 }
 
 bool HostInfoPosix::ComputeSupportExeDirectory(FileSpec &file_spec) {
