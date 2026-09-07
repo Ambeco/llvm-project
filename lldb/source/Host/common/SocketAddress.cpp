@@ -29,6 +29,20 @@
 
 #include "lldb/Host/PosixApi.h"
 
+#if defined(__wasi__)
+// This file is meant to stay self-contained (see the comment at the top), so
+// on WASI -- which has no getaddrinfo()/<netdb.h> at all -- report the
+// unsupported paths with a plain abort() rather than pulling in LLVM's error
+// handling.
+#include <cstdio>
+#include <cstdlib>
+static void wasi_no_getaddrinfo() {
+  fprintf(stderr, "SocketAddress: getaddrinfo() is not implemented on WASI "
+                   "(no sockets API / <netdb.h> at all)\n");
+  abort();
+}
+#endif
+
 // WindowsXP needs an inet_ntop implementation
 #ifdef _WIN32
 
@@ -178,11 +192,16 @@ bool SocketAddress::SetPort(uint16_t port) {
 // SocketAddress assignment operator
 const SocketAddress &SocketAddress::
 operator=(const struct addrinfo *addr_info) {
+#if defined(__wasi__)
+  (void)addr_info;
+  wasi_no_getaddrinfo();
+#else
   Clear();
   if (addr_info && addr_info->ai_addr && addr_info->ai_addrlen > 0 &&
       size_t(addr_info->ai_addrlen) <= sizeof m_socket_addr) {
     ::memcpy(&m_socket_addr, addr_info->ai_addr, addr_info->ai_addrlen);
   }
+#endif
   return *this;
 }
 
@@ -225,6 +244,15 @@ SocketAddress::GetAddressInfo(const char *hostname, const char *servname,
                               int ai_flags) {
   std::vector<SocketAddress> addr_list;
 
+#if defined(__wasi__)
+  (void)hostname;
+  (void)servname;
+  (void)ai_family;
+  (void)ai_socktype;
+  (void)ai_protocol;
+  (void)ai_flags;
+  wasi_no_getaddrinfo();
+#else
   struct addrinfo hints;
   memset(&hints, 0, sizeof(hints));
   hints.ai_family = ai_family;
@@ -243,6 +271,7 @@ SocketAddress::GetAddressInfo(const char *hostname, const char *servname,
 
   if (service_info_list)
     ::freeaddrinfo(service_info_list);
+#endif
   return addr_list;
 }
 

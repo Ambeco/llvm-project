@@ -81,7 +81,12 @@ private:
 
   struct SignalInfo {
     std::list<Callback> callbacks;
+#if !defined(__wasi__)
+    // WASI has no sigaction()/real signal delivery at all (see
+    // MainLoopPosix.cpp's RegisterSignal/UnregisterSignal, which are stubbed
+    // out to fail on this target) -- there is no "old disposition" to save.
     struct sigaction old_action;
+#endif
     bool was_blocked : 1;
   };
   class RunImpl;

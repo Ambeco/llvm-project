@@ -33,7 +33,18 @@ add_custom_target(lldb-sbapi-dwarf-enums
   DEPENDS ${sb_languages_file})
 set_target_properties(lldb-sbapi-dwarf-enums PROPERTIES FOLDER "LLDB/Tablegenning")
 
-add_lldb_library(liblldb SHARED ${option_framework}
+# wasm32/WASI (this fork's build target) has no dynamic-linking support at
+# all -- CMake's own platform-information module refuses to declare a SHARED
+# library there, which fails configure outright. Fall back to STATIC in that
+# case, mirroring the same LLVM_ENABLE_PIC-driven SHARED/STATIC choice
+# clang/tools/libclang/CMakeLists.txt already makes for libclang.
+if(LLVM_ENABLE_PIC)
+  set(liblldb_libkind SHARED)
+else()
+  set(liblldb_libkind STATIC)
+endif()
+
+add_lldb_library(liblldb ${liblldb_libkind} ${option_framework}
   SBAddress.cpp
   SBAddressRange.cpp
   SBAddressRangeList.cpp

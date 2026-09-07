@@ -11,6 +11,7 @@
 #include "lldb/Host/Config.h"
 #include "lldb/Utility/LLDBLog.h"
 #include "lldb/Utility/Log.h"
+#include "llvm/Support/ErrorHandling.h"
 
 #if LLDB_ENABLE_POSIX
 #include <arpa/inet.h>
@@ -35,8 +36,16 @@ UDPSocket::UDPSocket(NativeSocket socket)
 UDPSocket::UDPSocket(bool should_close) : Socket(ProtocolUdp, should_close) {}
 
 ssize_t UDPSocket::Send(const void *buf, const size_t num_bytes) {
+#if defined(__wasi__)
+  // WASI has no sendto()/sockets at all -- see the top-level comment in
+  // TCPSocket.cpp. CreateConnected() above always fails on this target, so
+  // a live UDPSocket instance should never actually exist to call this.
+  llvm_unreachable("UDPSocket::Send called on WASI, where no live socket "
+                   "can ever exist");
+#else
   return ::sendto(m_socket, static_cast<const char *>(buf), num_bytes, 0,
                   m_sockaddr, m_sockaddr.GetLength());
+#endif
 }
 
 Status UDPSocket::Connect(llvm::StringRef name) {
@@ -59,6 +68,13 @@ UDPSocket::CreateConnected(llvm::StringRef name) {
   if (!host_port)
     return host_port.takeError();
 
+#if defined(__wasi__)
+  // WASI has no getaddrinfo()/<netdb.h> at all -- there is no way to resolve
+  // a hostname (or even parse a numeric one via the same API real hosts use)
+  // to hand to ::bind()/::connect() below.
+  return Status::FromErrorStringWithFormat("%s", g_not_supported_error)
+      .ToError();
+#else
   // At this point we have setup the receive port, now we need to setup the UDP
   // send socket
 
@@ -123,6 +139,7 @@ UDPSocket::CreateConnected(llvm::StringRef name) {
                       (struct sockaddr *)&source_info, &address_len);
 
   return std::move(socket);
+#endif // __wasi__
 }
 
 std::string UDPSocket::GetRemoteConnectionURI() const {

@@ -44,6 +44,7 @@ struct GlobalSignalInfo {
 } // namespace
 static GlobalSignalInfo g_signal_info[NSIG];
 
+#if !defined(__wasi__)
 static void SignalHandler(int signo, siginfo_t *info, void *) {
   assert(signo < NSIG);
 
@@ -69,6 +70,7 @@ static void SignalHandler(int signo, siginfo_t *info, void *) {
   assert(bytes_written == 1 || (bytes_written == -1 && errno == EAGAIN));
   (void)bytes_written;
 }
+#endif // !__wasi__
 
 class ToTimeSpec {
 public:
@@ -271,6 +273,19 @@ MainLoopPosix::RegisterReadObject(const IOObjectSP &object_sp,
 MainLoopPosix::SignalHandleUP
 MainLoopPosix::RegisterSignal(int signo, const Callback &callback,
                               Status &error) {
+#if defined(__wasi__)
+  // WASI has no sigaction()/real signal delivery at all -- there is no OS
+  // signal for a wasm sandbox to catch (consistent with
+  // llvm::sys::SetInterruptFunction's existing silent-no-op degradation on
+  // this target, see documents/remaining_work.md's clangd scoping note --
+  // but this is a request for an actual handler, not a best-effort Ctrl-C
+  // hook, so it fails loudly instead of silently doing nothing).
+  error = Status::FromErrorStringWithFormat(
+      "MainLoopPosix::RegisterSignal(%d): not supported on WASI, which has "
+      "no signal delivery at all",
+      signo);
+  return nullptr;
+#else
   auto signal_it = m_signals.find(signo);
   if (signal_it != m_signals.end()) {
     auto callback_it = signal_it->second.callbacks.insert(
@@ -302,6 +317,7 @@ MainLoopPosix::RegisterSignal(int signo, const Callback &callback,
 
   return SignalHandleUP(new SignalHandle(
       *this, signo, insert_ret.first->second.callbacks.begin()));
+#endif // !__wasi__
 }
 
 void MainLoopPosix::UnregisterReadObject(IOObject::WaitableHandle handle) {
@@ -312,6 +328,12 @@ void MainLoopPosix::UnregisterReadObject(IOObject::WaitableHandle handle) {
 
 void MainLoopPosix::UnregisterSignal(
     int signo, std::list<Callback>::iterator callback_it) {
+#if defined(__wasi__)
+  // RegisterSignal never succeeds (and so never inserts into m_signals) on
+  // WASI, so this should never actually be reached.
+  llvm_unreachable(
+      "UnregisterSignal called on WASI, where RegisterSignal always fails");
+#else
   auto it = m_signals.find(signo);
   assert(it != m_signals.end());
 
@@ -332,6 +354,7 @@ void MainLoopPosix::UnregisterSignal(
 
   m_signals.erase(it);
   g_signal_info[signo] = {};
+#endif // !__wasi__
 }
 
 Status MainLoopPosix::Run() {

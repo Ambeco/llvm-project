@@ -17,7 +17,7 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__wasi__)
 #include <pwd.h>
 #endif
 
@@ -47,7 +47,9 @@ bool StandardTildeExpressionResolver::ResolvePartial(StringRef Expr,
   assert(Expr.empty() || Expr[0] == '~');
 
   Output.clear();
-#if defined(_WIN32) || defined(__ANDROID__)
+#if defined(_WIN32) || defined(__ANDROID__) || defined(__wasi__)
+  // No pwd.h / user database on WASI -- there is no such thing as other
+  // users' home directories to enumerate.
   return false;
 #else
   if (Expr.empty())

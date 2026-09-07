@@ -15,12 +15,18 @@
 
 #ifndef _WIN32
 #include <dlfcn.h>
+// WASI has no user/group database, no getaddrinfo(), no fork/exec-based
+// process spawning (posix_spawn) or child-process reaping (sys/wait.h) at
+// all -- there is no such thing as another process to spawn or wait for. The
+// few functions below that would need these are stubbed out for __wasi__.
+#if !defined(__wasi__)
 #include <grp.h>
 #include <netdb.h>
 #include <pwd.h>
 #include <spawn.h>
-#include <sys/stat.h>
 #include <sys/wait.h>
+#endif
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -61,6 +67,7 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Config/llvm-config.h" // for LLVM_ON_UNIX
 #include "llvm/Support/Errno.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Program.h"
 
@@ -115,6 +122,21 @@ void LogChannelSystem::Terminate() { g_system_log.Disable(); }
 extern "C" char **environ;
 
 Environment Host::GetEnvironment() { return Environment(environ); }
+
+#if defined(__wasi__)
+
+// WASI has no waitpid()/fork()/exec() at all -- there is no native child
+// process for lldb.wasm to ever monitor (Process/wasm is a pure GDB-remote
+// client; see documents/remaining_work.md). Fail loudly rather than
+// pretending to launch a monitor thread that could never do anything.
+llvm::Expected<HostThread> Host::StartMonitoringChildProcess(
+    const Host::MonitorChildProcessCallback &callback, lldb::pid_t pid) {
+  return llvm::createStringError(
+      "Host::StartMonitoringChildProcess is not supported on WASI: there is "
+      "no native child-process launching/waiting at all on this target");
+}
+
+#else // !__wasi__
 
 static thread_result_t
 MonitorChildProcessThreadFunction(::pid_t pid,
@@ -238,6 +260,8 @@ MonitorChildProcessThreadFunction(::pid_t pid,
   return nullptr;
 }
 
+#endif // !__wasi__
+
 #endif // #if !defined (__APPLE__) && !defined (_WIN32)
 
 lldb::pid_t Host::GetCurrentProcessID() { return ::getpid(); }
@@ -350,6 +374,10 @@ bool Host::ResolveExecutableInBundle(FileSpec &file) { return false; }
 
 FileSpec Host::GetModuleFileSpecForHostAddress(const void *host_addr) {
   FileSpec module_filespec;
+#if !defined(__wasi__)
+  // WASI's libc declares Dl_info/dladdr() only when
+  // __wasilibc_unmodified_upstream is set (it isn't for this fork) -- there
+  // is no real dynamic-loader address-to-module lookup on this target.
   Dl_info info;
   if (::dladdr(host_addr, &info)) {
     if (info.dli_fname) {
@@ -357,6 +385,7 @@ FileSpec Host::GetModuleFileSpecForHostAddress(const void *host_addr) {
       FileSystem::Instance().Resolve(module_filespec);
     }
   }
+#endif
   return module_filespec;
 }
 
@@ -603,7 +632,17 @@ Status Host::LaunchProcess(ProcessLaunchInfo &launch_info) {
 #endif // !defined(__APPLE__)
 
 #ifndef _WIN32
-void Host::Kill(lldb::pid_t pid, int signo) { ::kill(pid, signo); }
+void Host::Kill(lldb::pid_t pid, int signo) {
+#if defined(__wasi__)
+  // WASI has no kill() at all (declared only when
+  // __wasilibc_unmodified_upstream is set, which isn't the case here) --
+  // there is no other process on this target to send a signal to.
+  (void)pid;
+  (void)signo;
+#else
+  ::kill(pid, signo);
+#endif
+}
 
 #endif
 
@@ -672,7 +711,23 @@ std::unique_ptr<Connection> Host::CreateDefaultConnection(llvm::StringRef url) {
   return std::unique_ptr<Connection>(new ConnectionFileDescriptor());
 }
 
-#if defined(LLVM_ON_UNIX)
+#if defined(__wasi__)
+// WaitStatus::Decode below just decodes the standard POSIX wait-status
+// bit layout out of an int -- it's not a local waitpid() call (this decodes
+// status values that arrive over the wire from a remote GDB-remote stub, see
+// Process/gdb-remote), so it's meaningful on WASI even though WASI's libc
+// doesn't ship <sys/wait.h>/these macros at all. Define them locally with the
+// same bit layout every other POSIX platform this code already runs on uses.
+#define WIFEXITED(status) (((status) & 0x7f) == 0)
+#define WEXITSTATUS(status) (((status) >> 8) & 0xff)
+#define WIFSIGNALED(status)                                                   \
+  ((((status) & 0x7f) + 1) >> 1 > 0 && ((status) & 0x7f) != 0x7f)
+#define WTERMSIG(status) ((status) & 0x7f)
+#define WIFSTOPPED(status) (((status) & 0xff) == 0x7f)
+#define WSTOPSIG(status) WEXITSTATUS(status)
+#endif
+
+#if defined(LLVM_ON_UNIX) || defined(__wasi__)
 WaitStatus WaitStatus::Decode(int wstatus) {
   if (WIFEXITED(wstatus))
     return {Exit, uint8_t(WEXITSTATUS(wstatus))};

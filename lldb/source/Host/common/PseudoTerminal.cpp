@@ -11,6 +11,7 @@
 #include "lldb/Host/FileSystem.h"
 #include "llvm/Support/Errc.h"
 #include "llvm/Support/Errno.h"
+#include "llvm/Support/ErrorHandling.h"
 #include <cassert>
 #include <climits>
 #include <cstdio>
@@ -63,7 +64,9 @@ void PseudoTerminal::Reset() {
 
 llvm::Error PseudoTerminal::OpenFirstAvailablePrimary(int oflag) {
   Reset();
-#if LLDB_ENABLE_POSIX
+// WASI has no PTYs at all (no posix_openpt/grantpt/unlockpt/ptsname) -- a
+// browser sandbox has no terminal devices to allocate.
+#if LLDB_ENABLE_POSIX && !defined(__wasi__)
   // Open the primary side of a pseudo terminal
   m_primary_fd = ::posix_openpt(oflag);
   if (m_primary_fd < 0) {
@@ -103,7 +106,7 @@ llvm::Error PseudoTerminal::OpenSecondary(int oflag) {
       std::error_code(errno, std::generic_category()));
 }
 
-#if !HAVE_PTSNAME_R || defined(__APPLE__)
+#if (!HAVE_PTSNAME_R || defined(__APPLE__)) && !defined(__wasi__)
 static std::string use_ptsname(int fd) {
   static std::mutex mutex;
   std::lock_guard<std::mutex> guard(mutex);
@@ -115,7 +118,12 @@ static std::string use_ptsname(int fd) {
 
 std::string PseudoTerminal::GetSecondaryName() const {
   assert(m_primary_fd >= 0);
-#if HAVE_PTSNAME_R
+#if defined(__wasi__)
+  // No PTYs at all on WASI -- OpenFirstAvailablePrimary() above always
+  // fails, so m_primary_fd should never actually be valid here.
+  llvm_unreachable("PseudoTerminal::GetSecondaryName called on WASI, where "
+                   "no primary PTY fd can ever be valid");
+#elif HAVE_PTSNAME_R
 #if defined(__APPLE__)
   if (__builtin_available(macos 10.13.4, iOS 11.3, tvOS 11.3, watchOS 4.4, *)) {
 #endif

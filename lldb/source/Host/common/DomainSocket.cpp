@@ -69,6 +69,14 @@ std::string DomainSocket::URIPathToNativePath(llvm::StringRef path) {
   return path.str();
 }
 
+// WASI has no AF_UNIX sockets at all: its <sys/un.h> declares an empty
+// sockaddr_un with no sun_path member, and none of connect()/bind()/
+// listen()/getsockname()/getpeername() are declared. Every function below
+// that would need them is stubbed out to loudly report "not supported"
+// instead, matching llvm::raw_socket_stream's WASI handling
+// (llvm/lib/Support/raw_socket_stream.cpp).
+#if !defined(__wasi__)
+
 static bool SetSockAddr(llvm::StringRef name, const size_t name_offset,
                         sockaddr_un *saddr_un, socklen_t &saddr_un_len) {
   if (name.size() + name_offset > sizeof(saddr_un->sun_path))
@@ -92,6 +100,8 @@ static bool SetSockAddr(llvm::StringRef name, const size_t name_offset,
   return true;
 }
 
+#endif // !__wasi__
+
 DomainSocket::DomainSocket(bool should_close)
     : DomainSocket(kInvalidSocketValue, should_close) {}
 
@@ -114,6 +124,20 @@ DomainSocket::DomainSocket(SocketProtocol protocol, NativeSocket socket,
     : Socket(protocol, should_close) {
   m_socket = socket;
 }
+
+#if defined(__wasi__)
+
+Status DomainSocket::Connect(llvm::StringRef name) {
+  return Status::FromErrorString(
+      "unix domain sockets are not supported on WASI (no AF_UNIX at all)");
+}
+
+Status DomainSocket::Listen(llvm::StringRef name, int backlog) {
+  return Status::FromErrorString(
+      "unix domain sockets are not supported on WASI (no AF_UNIX at all)");
+}
+
+#else // !__wasi__
 
 Status DomainSocket::Connect(llvm::StringRef name) {
   std::string native_name = URIPathToNativePath(name);
@@ -156,6 +180,8 @@ Status DomainSocket::Listen(llvm::StringRef name, int backlog) {
   return error;
 }
 
+#endif // !__wasi__
+
 llvm::Expected<std::vector<MainLoopBase::ReadHandleUP>> DomainSocket::Accept(
     MainLoopBase &loop,
     std::function<void(std::unique_ptr<Socket> socket)> sock_cb) {
@@ -187,6 +213,12 @@ void DomainSocket::DeleteSocketFile(llvm::StringRef name) {
   llvm::sys::fs::remove(name);
 }
 
+#if defined(__wasi__)
+
+std::string DomainSocket::GetSocketName() const { return ""; }
+
+#else // !__wasi__
+
 std::string DomainSocket::GetSocketName() const {
   if (m_socket == kInvalidSocketValue)
     return "";
@@ -209,6 +241,8 @@ std::string DomainSocket::GetSocketName() const {
   return name.str();
 }
 
+#endif // !__wasi__
+
 std::string DomainSocket::GetRemoteConnectionURI() const {
   std::string name = GetSocketName();
   if (name.empty())
@@ -218,6 +252,20 @@ std::string DomainSocket::GetRemoteConnectionURI() const {
     return llvm::formatv("unix-connect://{0}", NativePathToURIPath(name));
   return llvm::formatv("unix-abstract-connect://{0}", name);
 }
+
+#if defined(__wasi__)
+
+std::vector<std::string> DomainSocket::GetListeningConnectionURI() const {
+  return {};
+}
+
+llvm::Expected<std::unique_ptr<DomainSocket>>
+DomainSocket::FromBoundNativeSocket(NativeSocket sockfd, bool should_close) {
+  return llvm::createStringError(
+      "unix domain sockets are not supported on WASI (no AF_UNIX at all)");
+}
+
+#else // !__wasi__
 
 std::vector<std::string> DomainSocket::GetListeningConnectionURI() const {
   if (m_socket == kInvalidSocketValue)
@@ -250,3 +298,5 @@ DomainSocket::FromBoundNativeSocket(NativeSocket sockfd, bool should_close) {
 #endif
   return std::make_unique<DomainSocket>(sockfd, should_close);
 }
+
+#endif // !__wasi__

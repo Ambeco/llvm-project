@@ -17,7 +17,14 @@
 #include <ws2tcpip.h>
 typedef ADDRESS_FAMILY sa_family_t;
 #else
+// WASI's wasip1 libc has <sys/socket.h>/<netinet/in.h> (declared, but with no
+// working implementation behind them -- there is no real sockets syscall
+// layer), but no <netdb.h>/getaddrinfo() at all. See Socket.cpp/TCPSocket.cpp
+// for how the addrinfo-dependent paths are stubbed out to loudly report
+// "not implemented" rather than silently doing nothing.
+#if !defined(__wasi__)
 #include <netdb.h>
+#endif
 #include <netinet/in.h>
 #include <sys/socket.h>
 #endif

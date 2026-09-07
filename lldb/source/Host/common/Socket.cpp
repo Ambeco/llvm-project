@@ -28,7 +28,12 @@
 
 #if LLDB_ENABLE_POSIX
 #include <arpa/inet.h>
+// WASI's wasip1 libc has no <netdb.h>/getaddrinfo() at all; nothing in this
+// file uses it directly (SocketAddress.cpp is where getaddrinfo() itself is
+// stubbed out for WASI).
+#if !defined(__wasi__)
 #include <netdb.h>
+#endif
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
@@ -395,27 +400,48 @@ Status Socket::Close() {
 
 int Socket::GetOption(NativeSocket sockfd, int level, int option_name,
                       int &option_value) {
+#if defined(__wasi__)
+  // WASI has no getsockopt() (and no sockets at all -- see the top-level
+  // comment in TCPSocket.cpp).
+  return -1;
+#else
   get_socket_option_arg_type option_value_p =
       reinterpret_cast<get_socket_option_arg_type>(&option_value);
   socklen_t option_value_size = sizeof(int);
   return ::getsockopt(sockfd, level, option_name, option_value_p,
                       &option_value_size);
+#endif
 }
 
 int Socket::SetOption(NativeSocket sockfd, int level, int option_name,
                       int option_value) {
+#if defined(__wasi__)
+  // WASI has no setsockopt() (and no sockets at all -- see the top-level
+  // comment in TCPSocket.cpp).
+  return -1;
+#else
   set_socket_option_arg_type option_value_p =
       reinterpret_cast<set_socket_option_arg_type>(&option_value);
   return ::setsockopt(sockfd, level, option_name, option_value_p,
                       sizeof(option_value));
+#endif
 }
 
 ssize_t Socket::Send(const void *buf, const size_t num_bytes) {
+#if defined(__wasi__)
+  // WASI has no send()/sockets at all -- see the top-level comment in
+  // TCPSocket.cpp. A real Socket instance can never exist on this target
+  // (every constructor path goes through CreateSocket(), which always
+  // fails), so this should never actually be reached.
+  llvm_unreachable("Socket::Send called on WASI, where no live socket can "
+                   "ever exist");
+#else
   int flags = 0;
 #if defined(MSG_NOSIGNAL)
   flags |= MSG_NOSIGNAL;
 #endif
   return ::send(m_socket, static_cast<const char *>(buf), num_bytes, flags);
+#endif
 }
 
 void Socket::SetLastError(Status &error) {
@@ -446,6 +472,17 @@ int Socket::CloseSocket(NativeSocket sockfd) {
 
 NativeSocket Socket::CreateSocket(const int domain, const int type,
                                   const int protocol, Status &error) {
+#if defined(__wasi__)
+  // WASI has no socket() (and no sockets at all -- see the top-level comment
+  // in TCPSocket.cpp). This is the one real entry point every socket
+  // creation path (TCP/UDP/domain) funnels through, so failing loudly here
+  // is what actually makes all of those paths fail rather than silently
+  // misbehave with an invalid fd.
+  error = Status::FromErrorString(
+      "Socket::CreateSocket is not supported on WASI: there is no sockets "
+      "API at all on this target");
+  return kInvalidSocketValue;
+#else
   error.Clear();
   auto socket_type = type;
 #ifdef SOCK_CLOEXEC
@@ -462,6 +499,7 @@ NativeSocket Socket::CreateSocket(const int domain, const int type,
 #endif
 
   return sock;
+#endif
 }
 
 Status Socket::Accept(const Timeout<std::micro> &timeout, Socket *&socket) {

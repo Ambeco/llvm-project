@@ -36,6 +36,88 @@
 using namespace lldb;
 using namespace lldb_private;
 
+// WASI has no sockets API at all -- socket()/connect()/bind()/listen()/
+// getsockname()/getpeername()/setsockopt() and SO_REUSEADDR/TCP_NODELAY are
+// all unavailable (declared in wasi-libc's headers only when
+// __wasilibc_unmodified_upstream is set, which it isn't for this fork). This
+// mirrors llvm::raw_socket_stream's existing WASI handling
+// (llvm/lib/Support/raw_socket_stream.cpp): every real network operation
+// below is replaced with a loud "not supported" error, and pure accessors
+// that would otherwise call getsockname()/getpeername() return their
+// harmless empty/zero default instead (they're queried after a real
+// connection exists, which can never happen here).
+#if defined(__wasi__)
+
+TCPSocket::TCPSocket(bool should_close) : Socket(ProtocolTcp, should_close) {}
+
+TCPSocket::TCPSocket(NativeSocket socket, const TCPSocket &listen_socket)
+    : Socket(ProtocolTcp, listen_socket.m_should_close_fd) {
+  m_socket = socket;
+}
+
+TCPSocket::TCPSocket(NativeSocket socket, bool should_close)
+    : Socket(ProtocolTcp, should_close) {
+  m_socket = socket;
+}
+
+TCPSocket::~TCPSocket() = default;
+
+llvm::Expected<TCPSocket::Pair> TCPSocket::CreatePair() {
+  return llvm::createStringError(
+      "TCPSocket::CreatePair is not supported on WASI: there is no sockets "
+      "API at all on this target");
+}
+
+bool TCPSocket::IsValid() const { return false; }
+
+uint16_t TCPSocket::GetLocalPortNumber() const { return 0; }
+
+std::string TCPSocket::GetLocalIPAddress() const { return ""; }
+
+uint16_t TCPSocket::GetRemotePortNumber() const { return 0; }
+
+std::string TCPSocket::GetRemoteIPAddress() const { return ""; }
+
+std::string TCPSocket::GetRemoteConnectionURI() const { return ""; }
+
+std::vector<std::string> TCPSocket::GetListeningConnectionURI() const {
+  return {};
+}
+
+Status TCPSocket::CreateSocket(int domain) {
+  return Status::FromErrorString(
+      "TCPSocket::CreateSocket is not supported on WASI: there is no "
+      "sockets API at all on this target");
+}
+
+Status TCPSocket::Connect(llvm::StringRef name) {
+  return Status::FromErrorString(
+      "TCPSocket::Connect is not supported on WASI: there is no sockets API "
+      "at all on this target");
+}
+
+Status TCPSocket::Listen(llvm::StringRef name, int backlog) {
+  return Status::FromErrorString(
+      "TCPSocket::Listen is not supported on WASI: there is no sockets API "
+      "at all on this target");
+}
+
+void TCPSocket::CloseListenSockets() {}
+
+llvm::Expected<std::vector<MainLoopBase::ReadHandleUP>>
+TCPSocket::Accept(MainLoopBase &loop,
+                  std::function<void(std::unique_ptr<Socket> socket)> sock_cb) {
+  return llvm::createStringError(
+      "TCPSocket::Accept is not supported on WASI: there is no sockets API "
+      "at all on this target");
+}
+
+int TCPSocket::SetOptionNoDelay() { return -1; }
+
+int TCPSocket::SetOptionReuseAddress() { return -1; }
+
+#else // !__wasi__
+
 static const int kType = SOCK_STREAM;
 
 TCPSocket::TCPSocket(bool should_close) : Socket(ProtocolTcp, should_close) {}
@@ -315,3 +397,5 @@ int TCPSocket::SetOptionNoDelay() {
 int TCPSocket::SetOptionReuseAddress() {
   return SetOption(SOL_SOCKET, SO_REUSEADDR, 1);
 }
+
+#endif // !__wasi__

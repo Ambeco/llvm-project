@@ -29,7 +29,10 @@
 #else
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+// WASI has no termios; nothing in this file actually uses it.
+#if !defined(__wasi__)
 #include <termios.h>
+#endif
 #include <unistd.h>
 #endif
 
