@@ -192,6 +192,35 @@ overload -- the host won't infer it for us.
     suggests it might be a lower-level toolkit some of this is built on,
     possibly with more primitives than the `wasm-wasi-core` public API
     exposes.
+  - **Correction (2026-09-06):** LLDB upstream does have a full wasm
+    debugging *client* implemented -- `lldb/source/Plugins/Process/wasm/`
+    (a `ProcessGDBRemote` subclass speaking wasm-specific GDB-remote
+    packets: `qWasmCallStack`, `qWasmLocal`, `qWasmGlobal`,
+    `qWasmStackValue`), plus `ObjectFile/wasm` and a DWARF `SymbolFile`
+    variant that understands wasm's tagged 64-bit address space (instance
+    id + offset). `lldb.wasm` itself now builds and runs -- see
+    `documents/remaining_work.md`'s lldb.wasm entry.
+  - **Corrected again (2026-09-07): the "V8 implements the stub, reachable
+    the same way Chrome's DWARF extension works" claim above was wrong.**
+    Chrome's official "C/C++ DevTools Support (DWARF)" extension does not
+    talk GDB-remote to V8 at all -- it uses the Chrome DevTools Protocol
+    (CDP) for all runtime control and only uses LLDB-derived code as an
+    offline DWARF-parsing library. V8 exposes no GDB-remote stub to the
+    browser. LLDB's actual upstream browser-debugging path
+    (`PlatformWebInspectorWasm`) targets Safari/WebKit instead, and
+    requires launching a native macOS system binary
+    (`/System/Cryptexes/App/usr/libexec/webinspector-wasm-lldb-platform`)
+    as a local subprocess -- unreachable from web-hosted extension code
+    regardless of browser. And CDP itself is reachable only via
+    `--remote-debugging-port` or a real installed Chromium browser
+    extension with the `"debugger"` permission (`chrome.debugger`) --
+    neither available to a VS Code for Web extension, which is sandboxed
+    JS with no `chrome.*` API surface at all, a different extensibility
+    model entirely. Full sourcing and the resulting design implication
+    (debugging here needs compile-time instrumentation, not
+    runtime introspection of the browser's own V8) is in
+    `documents/remaining_work.md`'s lldb.wasm scoping note -- this is now
+    a settled "no", not an open research question.
 
 ## How this maps onto this repo's own prototypes
 

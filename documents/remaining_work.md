@@ -235,29 +235,101 @@ Three genuinely separate pieces of work, very different risk profiles:
    client normally reaches its target over a TCP socket or pipe
    (`ConnectionFileDescriptor`) — WASI has no BSD sockets at all (already
    a hard stub in this fork, see `llvm/lib/Support/raw_socket_stream.cpp`
-   in `documents/design.md`). `lldb.wasm` would need a new `Connection`
-   backend that marshals GDB-remote protocol bytes through something a JS
-   host provides — conceptually the same shape as the existing
-   spawn-hook (a host-installed function-pointer-table slot) or the
-   `wasi_threaded_io` RPC design, just carrying debug-protocol bytes
-   instead of subprocess argv or file I/O. Not attempted; new
-   infrastructure, not a CMake flag.
-3. **Reaching V8's stub from inside a VS Code Web extension.** The one
-   real open question, and the one that determines whether 1 and 2 are
-   even worth doing: V8's wasm-gdb-remote-stub surface is normally only
-   reachable via the Chrome DevTools Protocol from an attached devtools
-   client, not from arbitrary extension-host code running in the same
-   browser tab. Whether a VS Code Web extension can get at it at all
-   (some CDP-adjacent API, or none) is unresearched — this is a
-   `documents/vscode-wasi-host.md`/js-host-contract question, not an LLVM
-   source question, and it's the piece most likely to actually block
-   this, independent of how much LLDB porting effort goes in.
+   in `documents/design.md`). See item 3 below — this is now moot for the
+   "debug the browser's own live V8" design, since there is no live V8
+   GDB-remote endpoint to transport bytes *to*. Kept as a record of the
+   original plan.
+3. **Resolved (2026-09-07), and it's a "no": reaching a live wasm-gdb-remote
+   stub from inside a browser tab is not possible via any documented
+   browser API — for either Chrome/V8 or Safari/WebKit.** Corrects the
+   2026-09-06 note above (in `documents/vscode-wasi-host.md` too), which
+   had this backwards: read directly rather than assumed from reputation.
+   - **Chrome does *not* use GDB-remote to talk to V8 at all.** Read
+     Jonas Devlieghere's account of how the official "C/C++ DevTools
+     Support (DWARF)" extension actually works: it uses the **Chrome
+     DevTools Protocol (CDP)** for all runtime control (breakpoints,
+     stepping, stack/variable inspection) and only uses LLDB-derived code
+     as an **offline DWARF-parsing library** — loading the `.wasm`
+     module's debug info into a dummy process purely to decode types and
+     pretty-print values, never as a live GDB-remote client attached to
+     V8. **V8 does not expose a GDB-remote stub to the browser at all.**
+     The earlier note's "V8 already implements the server/stub side...
+     the same machinery behind Chrome's...extension" claim was simply
+     wrong — it conflated the *documented protocol* (which does list V8
+     as an implementer, in some embedding) with what Chrome's own
+     browser-integrated tooling actually uses, which is CDP, a completely
+     different protocol.
+   - **LLDB's own upstream browser-debugging path targets Safari/WebKit,
+     not Chrome/V8, and it's local-native, not reachable from web
+     content either.** This fork's own `822f549e9` base of upstream
+     `main` already contains `lldb/source/Plugins/Platform/WebAssembly/
+     PlatformWebInspectorWasm.{h,cpp}` — read directly rather than
+     searched for, since it's sitting in this checkout. Its
+     `LaunchPlatformServer()` hard-codes
+     `kServerBinary = "/System/Cryptexes/App/usr/libexec/
+     webinspector-wasm-lldb-platform"` (a macOS-only system binary living
+     under the OS's cryptex mount, i.e. shipped as part of the OS itself,
+     not installable elsewhere) and launches it as a **local subprocess**
+     that presumably bridges WebKit's Web Inspector protocol to a GDB-remote
+     TCP server on `localhost`, which `PlatformWasm::ConnectRemote` then
+     connects to like any other `gdb-server` platform. This is Safari-only,
+     requires a real native process launch (`Host::LaunchProcess`) and a
+     specific macOS system component — categorically unreachable from
+     inside a browser tab or a VS Code for Web extension (which has no
+     ability to launch native OS processes at all, by design).
+   - **CDP itself is not reachable from web-hosted code either.** CDP is
+     exposed only two ways: (a) an external process connecting to a
+     browser launched with `--remote-debugging-port`, or (b) a real,
+     user-installed **browser extension** (a Chromium extension with a
+     `manifest.json`, not a VS Code extension) declaring the `"debugger"`
+     permission, which unlocks the `chrome.debugger` API — and even then,
+     only a subset of CDP domains. Neither path is available to code
+     running inside a VS Code for Web extension host: it is sandboxed JS
+     loaded by the vscode.dev web app, with zero `chrome.*` API surface —
+     a completely different, far less privileged extensibility model than
+     an installed Chromium browser extension. There is no other
+     documented bridge from ordinary page/worker JS to the browser's own
+     CDP endpoint for its own tab.
+   - **Conclusion:** items 1 and 2 above, as originally scoped (build
+     `lldb.wasm`'s GDB-remote client + a transport to reach the browser's
+     *live* wasm execution state), are blocked by browser security design,
+     not by missing engineering effort — there is no live debugging target
+     to transport bytes to from inside this project's actual deployment
+     context (a VS Code for Web extension). This doesn't have an
+     engineering fix; it needs a different design.
 
-Rough shape, not a time estimate: (1) and (2) are real but bounded
-engineering, similar in spirit to work already done elsewhere in this
-fork; (3) is a feasibility question that should be answered *first*,
-since a "no" there means 1 and 2 need a different design (e.g. a
-from-scratch stub instead of leaning on V8's) rather than just more time.
+## What real wasm debugging in this project would actually require
+
+Given the above, a debugger here cannot lean on the browser's own wasm
+execution being introspectable from the outside — nothing running as a VS
+Code for Web extension can reach that. The self-contained alternative,
+consistent with this project's whole approach (no native tooling, no
+privileged browser APIs, everything runs as ordinary page/worker JS): treat
+debugging as a **compile-time instrumentation** problem instead of a
+**runtime-introspection** problem.
+- Recompile the target program (or `lld.wasm`'s output) with breakpoint/step
+  hooks injected at potential stop points — e.g. an imported host function
+  the instrumented wasm calls at each source line or function entry/exit,
+  which the *hosting JS* (which this project's own host code controls, since
+  it supplies every import) can intercept, inspect locals via wasm
+  local/global accessors, and block on (e.g. via `Atomics.wait` if the
+  inferior runs on a worker thread) until told to resume.
+- `clang.wasm` already emits real DWARF (`-g` is a free, ordinary compiler
+  flag) for line/variable mapping; `lldb.wasm`'s existing `ObjectFile/wasm`
+  + DWARF `SymbolFile` (Stage A, already built and working — see above)
+  could still do all the *symbolic* work (resolving a PC/local index to a
+  source line or variable name) — what's missing is only the *live control*
+  half (stopping/stepping/reading memory), which would need a from-scratch
+  `Process`/`Connection` pair speaking to this instrumentation scheme
+  instead of a real GDB-remote stub.
+- This is a real, unscoped design task, not a small follow-up — it would
+  need its own investigation into where hooks can be injected cheaply (wasm
+  has no simple "single-step" trap), how much overhead instrumentation adds,
+  and how far short of real LLDB-quality debugging (watchpoints, multi-thread
+  awareness, expression evaluation touching live memory) a JS-callback-based
+  scheme can practically get. Worth its own dedicated session when the
+  project is ready to pick this up — not a natural continuation of the
+  Stage A build-porting work already done.
 
 ## Upstream contribution (`upstream-fixes` branch)
 
