@@ -246,6 +246,149 @@ hosting JS has to reconstruct/report failure itself); and the hosting JS
 (`RunInterruptHandlers()`/`CleanupOnSignal()`) since the wasm instance
 itself can't run any code once terminated.
 
+### Debugging design: compile-time instrumentation + `lldb.wasm` as a symbol/value library
+
+The debugger is not a live GDB-remote client attached to a running wasm
+instance — no such attachment point is reachable from inside a VS Code for
+Web extension (see the CDP/GDB-remote unreachability finding under
+"Alternatives considered" below). Instead:
+
+- **Control flow (pause/resume/step) is compiler-instrumented, not
+  LLDB-driven.** The user's program is compiled with a hook (`clang`'s
+  `-fsanitize-coverage=trace-pc-guard`, or a small custom LLVM pass keyed
+  to DWARF line-table rows) that calls a host-imported function on every
+  edge/line. That import blocks the worker via `Atomics.wait` on a shared
+  flag until JS tells it to step or continue — the same thread-coordination
+  pattern this project already uses elsewhere. This is opt-in (a distinct
+  "Debug" build, separate from a plain "Run" build), since the
+  instrumentation has real per-edge overhead not worth paying on an
+  ordinary run, and it's scoped to the user's compiled program only, never
+  to clang.wasm/lld.wasm themselves.
+- **Reading raw state needs no LLDB and no serialization boundary.**
+  Locals/globals live in the shared `WebAssembly.Memory`, directly readable
+  from JS as a plain typed array.
+- **`lldb.wasm` supplies symbol/type/value *decoding*, as a library, not a
+  live debugger.** Two jobs LLDB is worth keeping for, both non-trivial to
+  reimplement from scratch: resolving "wasm PC X" → "`foo.c` line 42, local
+  `x` at address A of DWARF type T" (`ObjectFile/wasm` + the DWARF
+  `SymbolFile`), and turning a raw address + DWARF type into a real
+  pretty-printed value (`ValueObject`/`DataFormatters`, and the Clang-based
+  expression parser if expression evaluation is wanted). A custom JS debug
+  adapter drives pause/resume/memory-reads itself; `lldb.wasm` is called
+  into purely for this decoding, not through `Process`/`Target`'s
+  live-process orchestration and not through the `lldb`/`lldb-dap` CLI
+  tools (their command-interpreter/REPL layer is dead weight for a library
+  consumer that never takes human command-line input).
+- **Value formatting still needs a `Process`, but only for memory reads —
+  not for control.** LLDB's `ValueObject`/`DataFormatters` machinery
+  dereferences pointers and walks containers by having LLDB itself issue
+  memory reads through its `Process` abstraction; it doesn't accept
+  pre-fetched bytes from the caller. The fix is a small custom `Process`
+  plugin (`ProcessWasmMemory`) implementing only `DoReadMemory`/
+  `DoWriteMemory`, forwarding to a JS-imported callback that reads the
+  shared `WebAssembly.Memory` directly — no launch, no resume, no
+  step, no wire protocol, since the instrumentation hooks above already own
+  all control flow. Everything else on the `Process` interface stays a
+  loud "not supported" stub.
+- **One piece of state doesn't come from linear memory: the per-frame
+  base address, and it has to come from the instrumentation hook, not from
+  a memory read.** Verified directly (`wasi-sdk`'s own `clang -O0 -g`,
+  `llvm-dwarfdump` on the output): ordinary locals/parameters use plain
+  `DW_OP_fbreg +offset` — a real linear-memory address, exactly like any
+  other target, once the frame base is known. Only `DW_AT_frame_base`
+  itself is unusual, resolving through wasm's own DWARF vendor extension
+  (`DW_OP_WASM_location`, tag `LOCAL`, naming one synthetic wasm-bytecode
+  local LLVM allocates per function to hold the frame pointer) — a value
+  that lives in genuine, non-memory-addressable wasm-VM local state, not
+  in `WebAssembly.Memory`, so no JS-side memory read can ever recover it.
+  Upstream's answer for a *live* target is `Process/wasm`'s
+  `WasmVirtualRegisterKinds`/`RegisterContextWasm`
+  (`lldb/source/Utility/WasmVirtualRegisters.h`,
+  `SymbolFileWasm::ParseVendorDWARFOpcode`) — a generic, GDB-remote-free
+  mechanism (register numbers, not packets) that `ProcessWasmMemory`
+  reuses directly: a small `RegisterContextWasmMemory` answers a read of
+  the synthetic "local N" register from a value cached from the *last
+  stop*, not fetched live.
+- **That cached value doesn't need a compiler change to reach JS — it's
+  already sitting in an ordinary wasm global, one export flag away from
+  being directly readable.** Verified (same `wasi-sdk` toolchain, a real
+  compile+link+`llvm-objdump`): the local `DW_AT_frame_base` names is
+  populated, once, by copying the mutable global `__stack_pointer` into it
+  at function entry (standard wasm "explicit locals" codegen, since wasm
+  bytecode has no addressable frame-pointer register) — and for `-O0`
+  (no VLAs, no dynamic stack realignment) that snapshot never changes for
+  the rest of the function body, so at any statement-boundary hook call
+  after the prologue, that local's value and the live `__stack_pointer`
+  global are numerically identical. `wasm-ld` doesn't export
+  `__stack_pointer` by default, but `-Wl,--export=__stack_pointer` makes
+  it a plain, always-current `WebAssembly.Global` JS can read directly
+  off `instance.exports` — no hook argument, no shadow state, no compiler
+  change at all. This also just works for a `-pthread` build without
+  extra design: mutable globals are per-instance, and each spawned worker
+  gets its own fresh copy, so reading it off the specific worker that hit
+  the hook already gives that thread's own stack pointer. **This replaces
+  the earlier plan of adding a hook argument** — the "Hooks" open item
+  above goes back to needing no new codegen work, just the existing
+  `-fsanitize-coverage=trace-pc-guard`/`-finstrument-functions` flags plus
+  this one link flag.
+- Backtraces (walking caller frames, not just the innermost one) are a
+  separate, still-open gap: `__stack_pointer` only ever exposes the
+  *current* frame's base, not any suspended caller's. Closing that for
+  real would need `-finstrument-functions`' entry/exit hooks to build a
+  JS-side shadow call stack (recording `__stack_pointer` at each entry),
+  since nothing here walks the wasm engine's actual call stack.
+- **Build shape: keep the existing full `lldb.wasm` static-link config,
+  add a thin C wrapper (`lldb/tools/lldb-wasm-reactor`) and export it as a
+  WASI reactor module** (`-mexec-model=reactor`: no `main`, entered via
+  `_initialize`; `__attribute__((export_name(...)))` in the source itself
+  for the handful of functions JS needs — create target from the compiled
+  module, resolve PC→line/function, format a value/expression — rather
+  than `wasm-ld --export=` flags). Built and verified linking clean.
+  Uses `SBDebugger::Initialize()` for setup (so `SystemInitializerFull`
+  still runs, force-calling every plugin's `Initialize()`) rather than a
+  from-scratch minimal initializer — simpler, and the user confirmed
+  binary size (~96 MiB today) is a deliberately deferred concern, not a
+  blocker for this design; a curated-`LINK_LIBS` size pass, if ever done,
+  would need its own initializer instead. Target/process creation itself
+  goes through the internal `Debugger`/`TargetList`/`Target` API directly
+  (`Target::CreateProcess(listener, "wasm-memory", nullptr, true)`), not
+  the public `SBTarget`, since `SBTarget`'s constructor-from-`TargetSP` is
+  `protected` and there is no public SB entry point for "attach this
+  specific, already-registered `Process` plugin, no launch."
+- **A real gap this surfaced: no `Platform` plugin was ever the WASI host
+  platform.** Every existing per-OS `Platform`'s host self-registration is
+  gated on `#if defined(__linux__)`/`_WIN32`/etc., none of which is ever
+  defined compiling *for* WASI — so `Platform::GetHostPlatform()` returned
+  null and any real `Target` creation crashed (`Debugger`'s constructor
+  only `assert()`s it's non-null, compiled out in this `-DNDEBUG` build).
+  Fixed with a new, deliberately minimal `PlatformWasi`
+  (`lldb/source/Plugins/Platform/WASI/`) that self-registers as host under
+  `#if defined(__wasi__)` — distinct from `Plugins/Platform/WebAssembly`'s
+  `PlatformWasm`, which represents a wasm program as a debug *target*, an
+  unrelated concept.
+- **Real multithreading works from a reactor module — verified,** after
+  two real but narrow test-harness bugs (not flaws in real multithreading,
+  wasi-threads, or the reactor-module entry point itself) were found and
+  fixed: `Target::SetExecutableModule`'s default parallel symbol-preload
+  path (`llvm::ThreadPoolTaskGroup`, the same mechanism `lld.wasm`'s own
+  `parallelFor`/`parallelForEach` already use successfully) now completes
+  correctly when driven from `lldb-wasm-reactor.wasm`. See
+  `documents/remaining_work.md` for the full investigation. Two lessons
+  worth keeping in mind for any *real* multithreaded host of this reactor
+  (this project's fixed test harness already reflects both):
+  1. A spawned worker thread re-instantiates its own copy of the module,
+     so it must be supplied the same custom imports (here, `wasm_dbg`'s
+     `read_memory`/`write_memory`) the top-level instantiation was —
+     omitting them fails the spawned thread's own instantiation, not the
+     top-level one.
+  2. A spawned thread must never call the module's `_initialize()` export
+     (only bind memory the way `_initialize` otherwise would as a side
+     effect) — `_initialize` is a reactor's one-time, main-instance-only
+     setup entry, and calling it again against already-initialized shared
+     memory traps.
+  This is worth two lines in `documents/js-host-contract.md` once a real
+  (non-test-harness) multithreaded host needs this.
+
 ## Known limitations
 
 - **File I/O across threads: fixed, linked in automatically.** Each
@@ -299,10 +442,18 @@ itself can't run any code once terminated.
   root-caused. See `documents/threaded-file-io-rpc-plan.md`'s constraint
   #3 for detail — relevant once a dedicated I/O-server thread starts
   running real request-dispatch work.
-- **Real per-source-line debugging is unexplored.** `documents/
-  vscode-wasi-host.md` was written specifically to capture the
-  `wasm-wasi-core` API surface relevant to this, but no actual debugger
-  implementation work has started.
+- **`ProcessWasmMemory`, the wrapper API, and the reactor-module export
+  build described above are all designed but not yet implemented.** See
+  `documents/remaining_work.md`.
+- **Running the compiled program in its own real browser tab** (rather
+  than inline in the extension host) is a separate, independent win worth
+  doing regardless of the debugger — real OS-level sandboxing via Chrome's
+  site isolation, "for free" via `vscode.env.openExternal`, and it makes
+  Chrome's own built-in DWARF DevTools support usable immediately as a
+  fallback debugging path. Cross-context communication
+  (`openExternal` returns no `Window` handle) and `SharedArrayBuffer`
+  cross-origin-isolation headers for the runner page are the two open
+  questions there; see `documents/remaining_work.md`.
 
 ## Where things stand (as of this writing)
 
@@ -315,3 +466,59 @@ automatically into every `-pthread` WASI-threads output binary (see
 `documents/remaining_work.md` and `documents/threaded-file-io-rpc-plan.md`
 for detail and the still-open follow-ups). No PR has been opened upstream
 from `upstream-fixes` yet.
+
+## Alternatives considered
+
+### Debugging: live GDB-remote attachment to the browser's own running wasm
+
+- Pros: reuses `lldb.wasm`'s existing `Process/wasm`/`Process/gdb-remote`
+  client and V8's documented wasm GDB-remote packets
+  (`qWasmCallStack`/`qWasmLocal`/etc.) essentially as-is; no compiler
+  instrumentation needed.
+- Cons: not reachable at all from inside a VS Code for Web extension.
+  Chrome's own DWARF DevTools support doesn't use GDB-remote against V8
+  either — it uses the Chrome DevTools Protocol (CDP) for control and
+  LLDB-derived code only as an offline DWARF-decoding library, matching
+  the design taken here. CDP itself needs either an external
+  `--remote-debugging-port` connection or a real installed Chromium
+  extension with the `"debugger"` permission — neither available to
+  sandboxed extension-host JS. LLDB's own upstream Safari/WebKit
+  browser-debugging path (`Platform/WebAssembly/
+  PlatformWebInspectorWasm`) is also a dead end here: it launches a
+  macOS-only system binary as a local subprocess, unreachable from any
+  browser tab or extension host.
+
+### Debugging: full GDB-remote `lldb.wasm` (Stage B) with a custom transport
+
+- Pros: would have reused more of LLDB's existing machinery (the real
+  `Process`/`Target` live-debugging path) if a reachable transport existed.
+- Cons: moot regardless of transport design, since there is no live
+  GDB-remote endpoint inside a browser tab to transport bytes to (see
+  above) — this isn't a missing-engineering problem, it's a browser
+  security-model dead end.
+
+### `lldb.wasm` as a library: curate a minimal `LINK_LIBS`/plugin set now, upfront
+
+- Pros: would ship a much smaller binary than today's ~96 MiB Stage-A
+  build.
+- Cons: `lldbCore`/`lldbTarget`/`lldbSymbol` are mutually circular and
+  unavoidably pull in `lldbBreakpoint`/`lldbInterpreter` regardless of
+  curation, so the size win is smaller than it first appears; and
+  `SBDebugger`'s `SystemInitializerFull` force-calls `Initialize()` on
+  every plugin actually linked in, so realizing any size win at all
+  requires a custom initializer in addition to a curated plugin list —
+  real, but separable, extra engineering not needed to get a working
+  debugger. Deferred as a later size-optimization pass once the wrapper
+  API shape (this design) is proven.
+
+### Running the compiled program in the extension's own tab/iframe, rather than a separate tab
+
+- Pros: no cross-context communication problem — the extension can
+  directly own and message the wasm instance.
+- Cons: gives up the real OS-level process/site-isolation sandboxing a
+  separate top-level tab gets "for free" via `vscode.env.openExternal`
+  (VS Code's own Webview iframes already use the separate-origin trick
+  for the same sandboxing reason); also forecloses using Chrome's
+  built-in DWARF DevTools support as an immediate fallback debugging path,
+  since that targets a real top-level tab's own DevTools, not a nested
+  iframe.

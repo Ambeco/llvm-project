@@ -111,11 +111,33 @@ export function makeFakeInstance(instance, memory, { forThread } = {}) {
 /// synchronously, per real pthread_create() semantics: a thread is
 /// considered "spawned" the moment it's created, not when it finishes --
 /// unlike subprocess spawn, this never has to block on Atomics.wait.
-export function makeThreadSpawn({ wasmPath, memory, preopens, tidCounter }) {
+///
+/// `extraImportsModule` (a file URL string, or omitted) names a module
+/// exporting `buildImports(config, { memory }) -> importsObject` -- for an
+/// embedder whose module imports something beyond plain WASI/env.memory/
+/// thread-spawn (e.g. lldb-wasm-reactor.wasm's own `wasm_dbg.read_memory`/
+/// `write_memory`; see documents/design.md). Every spawned thread
+/// re-instantiates its own fresh copy of the module (see
+/// wasi_thread_worker.mjs's file comment) and so needs to satisfy the same
+/// import surface the main instance does, but a JS *function* can't cross
+/// the `workerData` structured-clone boundary -- `extraImportsConfig` is
+/// the cloneable data `buildImports` needs to reconstruct equivalent
+/// functions from scratch inside the worker, not the functions themselves.
+/// Omitting `extraImportsModule` when the module needs one produces the
+/// exact failure this comment exists to prevent silently recurring:
+/// `WebAssembly.instantiate()` throwing inside the spawned worker,
+/// invisible to the caller because `postMessage` back to a parent that's
+/// itself blocked inside a synchronous wasm call (e.g. a real thread pool's
+/// `wait()`) never gets delivered -- the pool then waits forever on a
+/// thread that silently died before ever entering wasm. See
+/// documents/remaining_work.md's 2026-09-09 entry for the full incident.
+export function makeThreadSpawn({ wasmPath, memory, preopens, tidCounter,
+                                 extraImportsModule, extraImportsConfig }) {
   return function threadSpawn(startArg) {
     const tid = Atomics.add(tidCounter, 0, 1);
     const worker = new Worker(threadWorkerScript, {
-      workerData: { wasmPath, memory, tid, startArg, preopens, tidCounterSAB: tidCounter.buffer },
+      workerData: { wasmPath, memory, tid, startArg, preopens, tidCounterSAB: tidCounter.buffer,
+                   extraImportsModule, extraImportsConfig },
     });
     worker.on('error', (err) => {
       console.error(`wasi_thread_hook: thread ${tid} worker error:`, err);
@@ -146,7 +168,8 @@ export async function loadModule(wasmPath) {
 /// `makeFakeInstance(instance, memory)` before `wasi.start()`/
 /// `wasi.initialize()`, and to `installSpawnHook(instance, { ..., memory })`
 /// if also installing the subprocess-spawn hook.
-export async function instantiateThreaded(wasmModule, bytes, importObjectBase, { wasmPath, preopens }) {
+export async function instantiateThreaded(wasmModule, bytes, importObjectBase,
+                                          { wasmPath, preopens, extraImportsModule, extraImportsConfig }) {
   const limits = readImportedMemoryLimits(bytes);
   if (!limits)
     throw new Error(`${wasmPath}: does not import memory -- not built with wasi-threads support`);
@@ -163,7 +186,8 @@ export async function instantiateThreaded(wasmModule, bytes, importObjectBase, {
   importObject.env = { ...importObjectBase.env, memory };
   importObject.wasi = {
     ...importObjectBase.wasi,
-    'thread-spawn': makeThreadSpawn({ wasmPath, memory, preopens, tidCounter }),
+    'thread-spawn': makeThreadSpawn({ wasmPath, memory, preopens, tidCounter,
+                                     extraImportsModule, extraImportsConfig }),
   };
 
   const instance = await WebAssembly.instantiate(wasmModule, importObject);

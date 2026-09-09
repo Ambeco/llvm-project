@@ -18,7 +18,8 @@ import { workerData, parentPort } from 'node:worker_threads';
 import { makeThreadSpawn, makeFakeInstance } from './wasi_thread_hook.mjs';
 import { installSpawnHook } from './wasi_spawn_shim.mjs';
 
-const { wasmPath, memory, tid, startArg, preopens, tidCounterSAB } = workerData;
+const { wasmPath, memory, tid, startArg, preopens, tidCounterSAB,
+       extraImportsModule, extraImportsConfig } = workerData;
 const tidCounter = new Int32Array(tidCounterSAB);
 
 try {
@@ -29,16 +30,43 @@ try {
   const importObject = wasi.getImportObject();
   importObject.env = { memory };
   importObject.wasi = {
-    'thread-spawn': makeThreadSpawn({ wasmPath, memory, preopens, tidCounter }),
+    'thread-spawn': makeThreadSpawn({ wasmPath, memory, preopens, tidCounter,
+                                     extraImportsModule, extraImportsConfig }),
   };
+  // A function can't cross the workerData structured-clone boundary, so an
+  // embedder whose module imports something beyond plain WASI/env.memory/
+  // thread-spawn (see makeThreadSpawn's doc comment in wasi_thread_hook.mjs)
+  // supplies a module that rebuilds equivalent functions from
+  // `extraImportsConfig` instead. Omitting this when needed makes
+  // WebAssembly.instantiate() below throw -- see the catch block, and
+  // documents/remaining_work.md's 2026-09-09 entry for why that failure is
+  // otherwise invisible (postMessage back to a parent blocked inside a
+  // synchronous wasm call, e.g. a thread pool's wait(), is never delivered).
+  if (extraImportsModule) {
+    const { buildImports } = await import(extraImportsModule);
+    Object.assign(importObject, buildImports(extraImportsConfig, { memory }));
+  }
 
   const instance = await WebAssembly.instantiate(wasmModule, importObject);
 
-  // Binds node:wasi's syscalls to our externally-supplied `memory` instead
-  // of the (nonexistent, for an imported-memory module) instance.exports
-  // .memory -- see wasi_thread_hook.mjs's file comment. forThread:true
-  // because this is not the command/_start entry point.
-  wasi.initialize(makeFakeInstance(instance, memory, { forThread: true }));
+  // NOT wasi.initialize(): besides binding node:wasi's syscalls to our
+  // externally-supplied `memory` (needed the same way for every module,
+  // command or reactor -- see the file-level comment on
+  // makeFakeInstance()), wasi.initialize() also calls the module's
+  // _initialize() export if present. _initialize is a *reactor's*
+  // one-time top-level setup entry point (see
+  // lldb/tools/lldb-wasm-reactor/CMakeLists.txt's -mexec-model=reactor
+  // comment), not a per-thread one -- calling it again here, in a spawned
+  // thread's own fresh instance sharing already-initialized memory with
+  // the main instance, traps (`unreachable`) inside wasi-libc's own
+  // double-init guard. A command-style module (clang.wasm/lld.wasm) has no
+  // _initialize export at all, so calling wasi.initialize() for its own
+  // spawned threads was always harmless by accident, not by design --
+  // confirmed directly (`node -e "console.log(WASI.prototype.initialize
+  // .toString())"`): initialize() is just finalizeBindings() plus that
+  // conditional _initialize() call. See documents/remaining_work.md's
+  // 2026-09-09 entry for the incident this was found from.
+  wasi.finalizeBindings(makeFakeInstance(instance, memory, { forThread: true }));
 
   // Nested subprocess-spawn support (Program.inc's own extension point,
   // unrelated to wasi-threads): best-effort, since a leaf binary that
