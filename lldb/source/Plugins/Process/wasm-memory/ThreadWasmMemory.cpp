@@ -8,6 +8,7 @@
 
 #include "ThreadWasmMemory.h"
 #include "RegisterContextWasmMemory.h"
+#include "UnwindWasmMemory.h"
 
 #include "lldb/Target/StopInfo.h"
 
@@ -33,15 +34,19 @@ RegisterContextSP ThreadWasmMemory::GetRegisterContext() {
 
 RegisterContextSP
 ThreadWasmMemory::CreateRegisterContextForFrame(StackFrame *frame) {
-  // There is exactly one frame -- the innermost one -- since nothing here
-  // unwinds the wasm engine's real call stack. See the class comment.
   uint32_t concrete_frame_idx = frame ? frame->GetConcreteFrameIndex() : 0;
   if (concrete_frame_idx == 0)
     return GetRegisterContext();
-  return nullptr;
+  return GetUnwinder().CreateRegisterContextForFrame(frame);
 }
 
 bool ThreadWasmMemory::CalculateStopInfo() {
   SetStopInfo(StopInfo::CreateStopReasonToTrace(*this));
   return true;
+}
+
+Unwind &ThreadWasmMemory::GetUnwinder() {
+  if (!m_unwinder_up)
+    m_unwinder_up = std::make_unique<UnwindWasmMemory>(*this);
+  return *m_unwinder_up;
 }

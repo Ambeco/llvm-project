@@ -331,12 +331,32 @@ Web extension (see the CDP/GDB-remote unreachability finding under
   above goes back to needing no new codegen work, just the existing
   `-fsanitize-coverage=trace-pc-guard`/`-finstrument-functions` flags plus
   this one link flag.
-- Backtraces (walking caller frames, not just the innermost one) are a
-  separate, still-open gap: `__stack_pointer` only ever exposes the
-  *current* frame's base, not any suspended caller's. Closing that for
-  real would need `-finstrument-functions`' entry/exit hooks to build a
-  JS-side shadow call stack (recording `__stack_pointer` at each entry),
-  since nothing here walks the wasm engine's actual call stack.
+- **Backtraces (walking caller frames, not just the innermost one): a JS-
+  side shadow call stack, built from the statement-boundary hook alone —
+  no `-finstrument-functions`.** That flag was the obvious first idea, but
+  is a dead end on wasm32: the `__cyg_profile_func_enter/exit` calls come
+  from an LLVM pass (`EntryExitInstrumenter`), not Clang directly, and it
+  unconditionally uses the `llvm.returnaddress` intrinsic for the
+  call-site argument — unimplemented for WebAssembly (confirmed: a real
+  compile attempt fails outright, `error: Non-Emscripten WebAssembly
+  hasn't implemented __builtin_return_address`). Implementing that would
+  mean real WebAssembly-backend engineering (a synthetic shadow-stack
+  scheme), the opposite of minimizing deltas from mainline. Instead: the
+  statement-boundary hook already fires in every function, including
+  callees, so the JS host can maintain its own stack of `{pc, frame_base}`
+  purely by comparing `__stack_pointer`'s value between consecutive hook
+  firings — lower means a deeper call was just entered (push), higher
+  means one or more calls returned (pop to match), same means just update
+  the top frame's `pc`. Zero new compiler flags, zero LLVM passes. One
+  honest limitation: a true "leaf" function that never touches
+  `__stack_pointer` at all (no locals, no need for a frame) is invisible
+  to this scheme — rare at `-O0`, but real. The LLDB-side plumbing for
+  this (`ProcessWasmMemory` reporting a full frame stack,
+  `UnwindWasmMemory` supplying it to `StackFrameList`) is implemented and
+  confirmed structurally correct for the innermost frame; verifying it
+  for outer frames is currently blocked by an unrelated, newly found bug
+  in symbol resolution for the third-and-later function in a wasm module
+  — see `documents/remaining_work.md`.
 - **Build shape: keep the existing full `lldb.wasm` static-link config,
   add a thin C wrapper (`lldb/tools/lldb-wasm-reactor`) and export it as a
   WASI reactor module** (`-mexec-model=reactor`: no `main`, entered via

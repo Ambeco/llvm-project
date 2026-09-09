@@ -147,15 +147,23 @@ size_t ProcessWasmMemory::DoWriteMemory(lldb::addr_t addr, const void *buf,
   return n;
 }
 
-void ProcessWasmMemory::SetStopState(
-    lldb::addr_t pc, const std::map<uint32_t, uint64_t> &wasm_locals) {
-  m_current_pc = pc;
-  m_wasm_locals = wasm_locals;
+void ProcessWasmMemory::SetStopState(std::vector<WasmFrame> frames) {
+  m_frames = std::move(frames);
 }
 
-bool ProcessWasmMemory::GetWasmLocal(uint32_t index, uint64_t &value) const {
-  auto it = m_wasm_locals.find(index);
-  if (it == m_wasm_locals.end())
+lldb::addr_t ProcessWasmMemory::GetFramePC(size_t frame_idx) const {
+  if (frame_idx >= m_frames.size())
+    return LLDB_INVALID_ADDRESS;
+  return m_frames[frame_idx].pc;
+}
+
+bool ProcessWasmMemory::GetFrameWasmLocal(size_t frame_idx, uint32_t index,
+                                          uint64_t &value) const {
+  if (frame_idx >= m_frames.size())
+    return false;
+  const auto &wasm_locals = m_frames[frame_idx].wasm_locals;
+  auto it = wasm_locals.find(index);
+  if (it == wasm_locals.end())
     return false;
   value = it->second;
   return true;

@@ -88,7 +88,10 @@ bool RegisterContextWasmMemory::ReadRegister(const RegisterInfo *reg_info,
   auto &process = static_cast<ProcessWasmMemory &>(*CalculateProcess());
 
   if (reg_info == &m_pc_reg_info) {
-    value.SetUInt(process.GetCurrentPC(), reg_info->byte_size);
+    lldb::addr_t pc = process.GetFramePC(m_concrete_frame_idx);
+    if (pc == LLDB_INVALID_ADDRESS)
+      return false;
+    value.SetUInt(pc, reg_info->byte_size);
     return true;
   }
 
@@ -101,7 +104,8 @@ bool RegisterContextWasmMemory::ReadRegister(const RegisterInfo *reg_info,
   }
 
   uint64_t raw_value = 0;
-  if (!process.GetWasmLocal(wasm_reg_info->index, raw_value))
+  if (!process.GetFrameWasmLocal(m_concrete_frame_idx, wasm_reg_info->index,
+                                 raw_value))
     return false;
   value.SetUInt(raw_value, wasm_reg_info->byte_size);
   return true;

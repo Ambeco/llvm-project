@@ -44,6 +44,7 @@
 #include <cstring>
 #include <map>
 #include <string>
+#include <vector>
 
 using namespace lldb;
 using namespace lldb_private;
@@ -114,6 +115,39 @@ int32_t CopyToBuffer(llvm::StringRef text, char *out_buf,
     out_buf[n] = '\0';
   }
   return static_cast<int32_t>(text.size());
+}
+
+/// Appends `pc`'s `"file:line"` (or, lacking line info, a function/symbol
+/// name, or lacking even that, the bare address) to `stream`. Shared by
+/// `wasm_dbg_resolve_pc` and `wasm_dbg_get_backtrace`. Returns false if
+/// `pc` isn't in any loaded module at all (nothing appended in that case).
+bool AppendResolvedPc(TargetSP target_sp, uint64_t pc, Stream &stream) {
+  // `ResolveLoadAddress` only knows addresses a live process/dynamic loader
+  // has actually loaded into the `SectionLoadHistory` -- nothing so far
+  // does that for `ProcessWasmMemory` (it was never launched or attached
+  // to in the usual sense; see documents/design.md). Since a wasm module
+  // has no relocation to speak of, its file (static) addresses and
+  // "loaded" addresses coincide anyway, so fall back to the static
+  // resolution path any offline/no-process tool uses.
+  Address addr;
+  if (!target_sp->ResolveLoadAddress(pc, addr) &&
+      !target_sp->ResolveFileAddress(pc, addr))
+    return false;
+
+  SymbolContext sc;
+  addr.CalculateSymbolContext(&sc);
+
+  if (sc.line_entry.IsValid()) {
+    stream.Printf("%s:%u", sc.line_entry.GetFile().GetPath().c_str(),
+                 sc.line_entry.line);
+  } else if (sc.function) {
+    stream.PutCString(sc.function->GetName().AsCString("<unknown function>"));
+  } else if (sc.symbol) {
+    stream.PutCString(sc.symbol->GetName().AsCString("<unknown symbol>"));
+  } else {
+    stream.Printf("0x%llx", static_cast<unsigned long long>(pc));
+  }
+  return true;
 }
 
 } // namespace
@@ -216,26 +250,43 @@ int32_t wasm_dbg_create_target(const char *module_path) {
   return 0;
 }
 
-/// Records a new stop at `pc`, with the current value of `count` Wasm
-/// virtual registers -- in practice today, just `DW_AT_frame_base`'s one
-/// synthetic local (see documents/design.md) -- supplied in the parallel
-/// `local_indices`/`local_values` arrays. The instrumentation hook that
-/// triggered this stop must supply these values directly: they are real
-/// wasm-bytecode-local state, not recoverable from `WebAssembly.Memory`.
-/// Invalidates the previously-stopped frame's cached state.
-void wasm_dbg_set_stop(uint64_t pc, const uint32_t *local_indices,
-                       const uint64_t *local_values, uint32_t count)
+/// Records a new stop: the full shadow call stack the JS host itself
+/// maintains (see documents/design.md's backtrace note -- nothing here
+/// walks wasm's real call stack; nothing outside the wasm engine can).
+/// `frame_pcs[0]` is the innermost frame (where the instrumentation hook
+/// actually fired), increasing indices walk outward toward `main`.
+/// `local_frame_indices[i]`/`local_wasm_indices[i]`/`local_values[i]`
+/// (all length `local_count`) give each frame's current value of whatever
+/// Wasm virtual registers (see `Utility/WasmVirtualRegisters.h`) its own
+/// `DW_AT_frame_base` needs -- in practice today, just one `eWasmTagLocal`
+/// entry per frame, since that's the only tag real `-O0 -g` codegen
+/// actually emits. These values must be supplied directly: they are real
+/// wasm-bytecode-local state for whichever frame was active when the
+/// engine most recently ran that frame's own code, not recoverable from
+/// `WebAssembly.Memory`. Invalidates every previously-stopped frame's
+/// cached state.
+void wasm_dbg_set_stop(const uint64_t *frame_pcs, uint32_t frame_count,
+                       const uint32_t *local_frame_indices,
+                       const uint32_t *local_wasm_indices,
+                       const uint64_t *local_values, uint32_t local_count)
     WASM_EXPORT("wasm_dbg_set_stop");
-void wasm_dbg_set_stop(uint64_t pc, const uint32_t *local_indices,
-                       const uint64_t *local_values, uint32_t count) {
+void wasm_dbg_set_stop(const uint64_t *frame_pcs, uint32_t frame_count,
+                       const uint32_t *local_frame_indices,
+                       const uint32_t *local_wasm_indices,
+                       const uint64_t *local_values, uint32_t local_count) {
   ProcessWasmMemory *wasm_process = GetWasmProcess();
   if (!wasm_process)
     return;
 
-  std::map<uint32_t, uint64_t> wasm_locals;
-  for (uint32_t i = 0; i < count; ++i)
-    wasm_locals[local_indices[i]] = local_values[i];
-  wasm_process->SetStopState(pc, wasm_locals);
+  std::vector<ProcessWasmMemory::WasmFrame> frames(frame_count);
+  for (uint32_t i = 0; i < frame_count; ++i)
+    frames[i].pc = frame_pcs[i];
+  for (uint32_t i = 0; i < local_count; ++i) {
+    uint32_t frame_idx = local_frame_indices[i];
+    if (frame_idx < frame_count)
+      frames[frame_idx].wasm_locals[local_wasm_indices[i]] = local_values[i];
+  }
+  wasm_process->SetStopState(std::move(frames));
 
   if (ThreadSP thread_sp = wasm_process->GetThreadList().GetThreadAtIndex(0))
     thread_sp->ClearStackFrames();
@@ -256,52 +307,26 @@ int32_t wasm_dbg_resolve_pc(uint64_t pc, char *out_buf,
     return -1;
   }
 
-  // `ResolveLoadAddress` only knows addresses a live process/dynamic loader
-  // has actually loaded into the `SectionLoadHistory` -- nothing so far
-  // does that for `ProcessWasmMemory` (it was never launched or attached
-  // to in the usual sense; see documents/design.md). Since a wasm module
-  // has no relocation to speak of, its file (static) addresses and
-  // "loaded" addresses coincide anyway, so fall back to the static
-  // resolution path any offline/no-process tool uses.
-  Address addr;
-  if (!g_target_sp->ResolveLoadAddress(pc, addr) &&
-      !g_target_sp->ResolveFileAddress(pc, addr)) {
+  StreamString stream;
+  if (!AppendResolvedPc(g_target_sp, pc, stream)) {
     SetLastError(llvm::formatv("0x{0:x} is not in any loaded module", pc)
                      .str());
     return -2;
   }
-
-  SymbolContext sc;
-  addr.CalculateSymbolContext(&sc);
-
-  StreamString stream;
-  if (sc.line_entry.IsValid()) {
-    stream.Printf("%s:%u", sc.line_entry.GetFile().GetPath().c_str(),
-                 sc.line_entry.line);
-  } else if (sc.function) {
-    stream.PutCString(sc.function->GetName().AsCString("<unknown function>"));
-  } else if (sc.symbol) {
-    stream.PutCString(sc.symbol->GetName().AsCString("<unknown symbol>"));
-  } else {
-    stream.Printf("0x%llx", static_cast<unsigned long long>(pc));
-  }
   return CopyToBuffer(stream.GetString(), out_buf, out_buf_size);
 }
 
-/// Evaluates the variable-expression path `expr` (a plain variable name, or
-/// a path off one -- `x`, `x->y.z`, `arr[3]` -- via
-/// `StackFrame::GetValueForVariableExpressionPath`, not a full expression
-/// evaluator: no arithmetic, function calls, or casts) at the current stop,
-/// and writes its pretty-printed value (real `DataFormatters` output --
-/// `std::vector<int>` shows as `{1, 2, 3}`, not a hex dump) into
-/// `(out_buf, out_buf_size)`. Returns the untruncated length of the result,
-/// or a negative value if `expr` doesn't resolve or hasn't been stopped at
-/// yet.
-int32_t wasm_dbg_format_value(const char *expr, char *out_buf,
-                              uint32_t out_buf_size)
-    WASM_EXPORT("wasm_dbg_format_value");
-int32_t wasm_dbg_format_value(const char *expr, char *out_buf,
-                              uint32_t out_buf_size) {
+/// Writes one `"file:line"` (or function/symbol name, or bare address --
+/// see `wasm_dbg_resolve_pc`) per line, innermost frame first, for every
+/// frame in the shadow call stack the most recent `wasm_dbg_set_stop()`
+/// recorded. Walks real `Thread`/`StackFrameList` machinery (not
+/// `ProcessWasmMemory`'s frame data directly), the same path a real
+/// backtrace command would -- proof the `UnwindWasmMemory` plumbing itself
+/// works, not just the data underneath it. Returns the untruncated length
+/// of the result, or a negative value if there is no current stop.
+int32_t wasm_dbg_get_backtrace(char *out_buf, uint32_t out_buf_size)
+    WASM_EXPORT("wasm_dbg_get_backtrace");
+int32_t wasm_dbg_get_backtrace(char *out_buf, uint32_t out_buf_size) {
   ClearLastError();
   ProcessWasmMemory *wasm_process = GetWasmProcess();
   if (!wasm_process) {
@@ -314,9 +339,56 @@ int32_t wasm_dbg_format_value(const char *expr, char *out_buf,
                 "ProcessWasmMemory always reports exactly one)");
     return -1;
   }
-  StackFrameSP frame_sp = thread_sp->GetStackFrameAtIndex(0);
+
+  StreamString stream;
+  for (uint32_t i = 0; StackFrameSP frame_sp = thread_sp->GetStackFrameAtIndex(i);
+      ++i) {
+    if (i > 0)
+      stream.PutChar('\n');
+    stream.Printf("#%u ", i);
+    uint64_t pc = frame_sp->GetFrameCodeAddress().GetLoadAddress(
+        g_target_sp.get());
+    if (!AppendResolvedPc(g_target_sp, pc, stream))
+      stream.Printf("0x%llx", static_cast<unsigned long long>(pc));
+  }
+  return CopyToBuffer(stream.GetString(), out_buf, out_buf_size);
+}
+
+/// Evaluates the variable-expression path `expr` (a plain variable name, or
+/// a path off one -- `x`, `x->y.z`, `arr[3]` -- via
+/// `StackFrame::GetValueForVariableExpressionPath`, not a full expression
+/// evaluator: no arithmetic, function calls, or casts) in frame
+/// `frame_index` of the current stop's shadow call stack (0 = innermost,
+/// matching `wasm_dbg_set_stop()`'s `frame_pcs` ordering -- see
+/// `wasm_dbg_get_backtrace`), and writes its pretty-printed value (real
+/// `DataFormatters` output -- `std::vector<int>` shows as `{1, 2, 3}`, not
+/// a hex dump) into `(out_buf, out_buf_size)`. Returns the untruncated
+/// length of the result, or a negative value if `expr` doesn't resolve,
+/// `frame_index` doesn't exist, or hasn't been stopped at yet.
+int32_t wasm_dbg_format_value(uint32_t frame_index, const char *expr,
+                              char *out_buf, uint32_t out_buf_size)
+    WASM_EXPORT("wasm_dbg_format_value");
+int32_t wasm_dbg_format_value(uint32_t frame_index, const char *expr,
+                              char *out_buf, uint32_t out_buf_size) {
+  ClearLastError();
+  ProcessWasmMemory *wasm_process = GetWasmProcess();
+  if (!wasm_process) {
+    SetLastError("wasm_dbg_create_target() was not called (or failed)");
+    return -1;
+  }
+  ThreadSP thread_sp = wasm_process->GetThreadList().GetThreadAtIndex(0);
+  if (!thread_sp) {
+    SetLastError("no thread (this should be unreachable -- "
+                "ProcessWasmMemory always reports exactly one)");
+    return -1;
+  }
+  StackFrameSP frame_sp = thread_sp->GetStackFrameAtIndex(frame_index);
   if (!frame_sp) {
-    SetLastError("no frame -- has wasm_dbg_set_stop() been called yet?");
+    SetLastError(
+        llvm::formatv("no frame {0} -- has wasm_dbg_set_stop() been called "
+                      "yet, and does it include that many frames?",
+                      frame_index)
+            .str());
     return -1;
   }
 

@@ -10,16 +10,16 @@
 #define LLDB_SOURCE_PLUGINS_PROCESS_WASM_MEMORY_THREADWASMMEMORY_H
 
 #include "lldb/Target/Thread.h"
+#include "lldb/Target/Unwind.h"
 
 namespace lldb_private {
 namespace wasm {
 
-/// The one thread `ProcessWasmMemory` ever reports. There is only ever one
-/// stopped frame -- the innermost one, at whatever PC the instrumentation
-/// hook fired at -- since nothing here unwinds the wasm engine's real call
-/// stack (see `documents/design.md`'s frame-base note on why that would
-/// need the instrumentation to capture a shadow call stack itself, a
-/// separate, not-yet-implemented piece).
+/// The one thread `ProcessWasmMemory` ever reports. Its frames are exactly
+/// the shadow call stack `ProcessWasmMemory::SetStopState()` last recorded
+/// (see `UnwindWasmMemory`) -- nothing here unwinds the wasm engine's real
+/// call stack; nothing outside the engine itself can (see
+/// `documents/design.md`'s "Debugging design" section).
 class ThreadWasmMemory : public Thread {
 public:
   ThreadWasmMemory(Process &process, lldb::tid_t tid);
@@ -34,6 +34,8 @@ public:
   CreateRegisterContextForFrame(StackFrame *frame) override;
 
   bool CalculateStopInfo() override;
+
+  Unwind &GetUnwinder() override;
 
 private:
   lldb::RegisterContextSP m_register_context_sp;

@@ -180,15 +180,76 @@ GDB-remote/CDP approaches. Open implementation items:
     GetValueForVariableExpressionPath`'s subset (`x`/`x->y.z`/`arr[3]`) --
     whether a real Clang-JIT expression evaluator (arithmetic, casts,
     calls) is worth wiring in (`ExpressionParser/Clang`) is unmeasured
-    against real usage.
+    against real usage. Decided (2026-09-09): skip -- real execution of
+    JIT'd code needs a live inferior this design deliberately doesn't
+    have, so it could only ever handle the constant-foldable subset
+    anyway; not worth the complexity for what a variables/watch pane
+    needs.
   - Only single-variable/DW_OP_fbreg-style locals have been exercised.
     `eWasmTagGlobal`/`eWasmTagOperandStack` (see
     `RegisterContextWasmMemory`) remain unimplemented stubs -- not known
     to be needed yet (see `documents/design.md`'s frame-base note on why
     `-O0` mostly avoids them), but unverified against a real optimized or
-    unusual codegen shape.
-  - No backtraces (multi-frame) -- see `documents/design.md`'s shadow-call-
-    stack note.
+    unusual codegen shape. Deprioritized (2026-09-09): low user impact
+    even if hit (one variable fails to display, not a crash).
+
+- **Backtraces (multi-frame): the LLDB-side plumbing is implemented, but
+  blocked from full verification by a newly found, separate, real bug in
+  address/symbol resolution for the third-and-later function in a
+  multi-function wasm module.** `-finstrument-functions` (the obvious
+  choice) turned out to be a dead end on wasm32: Clang doesn't emit
+  `__cyg_profile_func_enter/exit` itself, an LLVM pass
+  (`EntryExitInstrumenter`) does, unconditionally using the
+  `llvm.returnaddress` intrinsic for the call-site argument, and the
+  WebAssembly backend has no lowering for it (`error: Non-Emscripten
+  WebAssembly hasn't implemented __builtin_return_address`) -- fixing that
+  would mean real WebAssembly-backend engineering (a synthetic shadow-stack
+  scheme), the opposite of minimizing deltas from mainline. Instead,
+  confirmed a zero-new-flags alternative works structurally: the JS host
+  builds its own shadow call stack purely by watching `__stack_pointer`
+  (already exported, from the frame-base work) change between
+  already-planned statement-boundary hook firings -- see
+  `documents/design.md`'s backtrace note for the full mechanism.
+  - **Implemented**: `Plugins/Process/wasm-memory/UnwindWasmMemory` (new,
+    modeled directly on `Plugins/Process/wasm`'s own `UnwindWasm`, just
+    backed by `ProcessWasmMemory`'s own recorded shadow stack instead of a
+    live GDB-remote call-stack query); `ProcessWasmMemory::SetStopState`
+    and `RegisterContextWasmMemory` extended from one frame to a full
+    `std::vector<WasmFrame>`; `ThreadWasmMemory::GetUnwinder()` wired up;
+    `wasm_dbg_set_stop`'s signature extended to a flat multi-frame array
+    (`frame_pcs`/`local_frame_indices`/`local_wasm_indices`/
+    `local_values`); a new `wasm_dbg_get_backtrace()` export added.
+  - **Verified working**: frame 0 (innermost) resolves and formats
+    correctly through the *entire* new path -- confirmed
+    `UnwindWasmMemory::DoGetFrameInfoAtIndex`/`DoCreateRegisterContextForFrame`
+    are called with the right per-frame data via temporary instrumentation
+    (removed after).
+  - **Blocked**: frame 1 (the second `wasm_dbg_set_stop`-supplied frame,
+    `caller()` -- the *third* DWARF-covered function in the test module,
+    after `_start` and `add()`) fails to resolve *at all*, at every
+    address tried across its whole range, including its own exact
+    `DW_AT_low_pc` -- confirmed via a bare `wasm_dbg_resolve_pc()` call on
+    one of its addresses, completely bypassing `StackFrame`/`UnwindWasmMemory`,
+    that this is not caused by anything in the multi-frame work above:
+    it resolves to the *first* function's own symbol/line ("_start")
+    instead of failing cleanly or matching `caller()`. `add()` (the
+    *second* DWARF-covered function) resolves correctly. Ruled out: wasm's
+    tagged 64-bit address encoding (`Plugins/ObjectFile/wasm/WasmAddress.h`)
+    -- confirmed via `grep` that `ObjectFileWasm.cpp` never uses it for
+    code addresses, only for live Memory/Global addressing elsewhere; a
+    constant translation between `DW_AT_low_pc` and the function's real
+    file offset -- confirmed via `llvm-objdump -d` that a *single* fixed
+    offset (the code section's own header length) converts every
+    function's DWARF `low_pc` to its real address correctly, including
+    `caller()`'s, so the raw numbers this test used were never the actual
+    bug. The evidence instead points at `SymbolFileDWARF`'s (or
+    `ObjectFile/wasm`'s) own address-range index only correctly
+    registering the first two DWARF-covered functions in a module, with
+    the third and beyond silently falling through to a nearest/default
+    match -- a real, pre-existing Stage-A gap, never exercised before
+    since no previous smoketest used more than two user functions. Worth
+    its own dedicated investigation into `SymbolFileDWARF`/
+    `ObjectFile/wasm`'s function-range indexing; not yet started.
 
 - **Hook granularity** (the one open design choice in the instrumentation
   scheme itself): `-fsanitize-coverage=trace-pc-guard`/`inline-8bit-counters`

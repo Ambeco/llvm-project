@@ -12,6 +12,7 @@
 #include "lldb/Target/Process.h"
 #include <functional>
 #include <map>
+#include <vector>
 
 namespace lldb_private {
 namespace wasm {
@@ -93,25 +94,42 @@ public:
   /// initial state otherwise.
   void CompleteAttach();
 
-  /// Records a new stop: the current PC, and the current value of every
-  /// Wasm virtual register (see `Utility/WasmVirtualRegisters.h`) the
-  /// instrumentation hook that triggered this stop reported -- in practice
-  /// today, just `DW_AT_frame_base`'s one synthetic `eWasmTagLocal`
-  /// register (see `documents/design.md`). Replaces whatever the previous
-  /// stop recorded; there is only ever one live stop at a time, since
-  /// nothing else can run while the instrumented program is blocked in its
-  /// hook.
-  void SetStopState(lldb::addr_t pc,
-                    const std::map<uint32_t, uint64_t> &wasm_locals);
+  /// One entry in the shadow call stack the JS host maintains itself (see
+  /// documents/design.md's backtrace note): frame 0 is the innermost
+  /// (where the instrumentation hook actually fired), increasing indices
+  /// walk outward toward `main`. `wasm_locals` holds the current value of
+  /// every Wasm virtual register (see `Utility/WasmVirtualRegisters.h`)
+  /// this frame's own `DW_AT_frame_base` needs -- in practice today, just
+  /// one `eWasmTagLocal` entry, since that's the only tag real `-O0 -g`
+  /// codegen actually emits.
+  struct WasmFrame {
+    lldb::addr_t pc;
+    std::map<uint32_t, uint64_t> wasm_locals;
+  };
 
-  lldb::addr_t GetCurrentPC() const { return m_current_pc; }
+  /// Records a new stop: the full shadow call stack (frame 0 innermost),
+  /// replacing whatever the previous stop recorded -- there is only ever
+  /// one live stop at a time, since nothing else can run while the
+  /// instrumented program is blocked in its hook. An empty `frames` is a
+  /// real, reportable "not stopped anywhere" state, not a one-frame stack
+  /// at address 0.
+  void SetStopState(std::vector<WasmFrame> frames);
 
-  /// Returns the last-reported value of Wasm virtual register `reg_num`
-  /// (as packed by `GetWasmRegister`), or `false` if that register wasn't
-  /// part of the current stop's report -- e.g. asking for a local the
-  /// instrumentation hook didn't happen to capture. Callers must treat that
-  /// as a real, reportable failure, not default to zero.
-  bool GetWasmLocal(uint32_t index, uint64_t &value) const;
+  size_t GetFrameCount() const { return m_frames.size(); }
+
+  /// Returns frame `frame_idx`'s PC, or `LLDB_INVALID_ADDRESS` if
+  /// `frame_idx >= GetFrameCount()`.
+  lldb::addr_t GetFramePC(size_t frame_idx) const;
+
+  /// Returns frame `frame_idx`'s last-reported value for Wasm virtual
+  /// register `index` (the low 30 bits `GetWasmVirtualRegisterIndex`
+  /// would extract, not a packed tag+index register number), or `false`
+  /// if that frame doesn't exist or didn't report that register -- e.g.
+  /// asking for a local the instrumentation hook didn't happen to
+  /// capture. Callers must treat that as a real, reportable failure, not
+  /// default to zero.
+  bool GetFrameWasmLocal(size_t frame_idx, uint32_t index,
+                         uint64_t &value) const;
 
 protected:
   JITLoaderList &GetJITLoaders() override;
@@ -119,8 +137,7 @@ protected:
 private:
   ReadMemoryCallback m_read_memory_cb;
   WriteMemoryCallback m_write_memory_cb;
-  lldb::addr_t m_current_pc = LLDB_INVALID_ADDRESS;
-  std::map<uint32_t, uint64_t> m_wasm_locals;
+  std::vector<WasmFrame> m_frames;
 
   ProcessWasmMemory(const ProcessWasmMemory &) = delete;
   const ProcessWasmMemory &operator=(const ProcessWasmMemory &) = delete;
