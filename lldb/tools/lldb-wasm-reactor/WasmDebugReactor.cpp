@@ -37,11 +37,13 @@
 #include "lldb/ValueObject/ValueObject.h"
 
 #include "llvm/Support/Error.h"
+#include "llvm/Support/FormatVariadic.h"
 
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <string>
 
 using namespace lldb;
 using namespace lldb_private;
@@ -83,6 +85,16 @@ namespace {
 DebuggerSP g_debugger_sp;
 TargetSP g_target_sp;
 
+/// Detail behind the most recent `wasm_dbg_*` call's negative return, if
+/// any -- see `wasm_dbg_get_last_error()`. Deliberately simple (one slot,
+/// not one per call) since nothing here is reentrant or concurrent: only
+/// one JS call into this module is ever active at a time.
+std::string g_last_error;
+
+void SetLastError(llvm::StringRef message) { g_last_error = message.str(); }
+void SetLastError(const Status &error) { g_last_error = error.AsCString(); }
+void ClearLastError() { g_last_error.clear(); }
+
 ProcessWasmMemory *GetWasmProcess() {
   if (!g_target_sp)
     return nullptr;
@@ -122,16 +134,32 @@ void *wasm_dbg_alloc(size_t size) { return std::malloc(size); }
 void wasm_dbg_free(void *ptr) WASM_EXPORT("wasm_dbg_free");
 void wasm_dbg_free(void *ptr) { std::free(ptr); }
 
+/// Returns detail behind the most recent `wasm_dbg_*` call's negative
+/// return value, written into `(out_buf, out_buf_size)` the same
+/// `snprintf`-length-convention way every other string-returning function
+/// here does. Empty (returns 0) if the most recent call succeeded, or if
+/// it failed at a point with no further detail to give (rare -- most
+/// failure paths set a real message, even a generic one, rather than
+/// leaving the previous call's message stale).
+int32_t wasm_dbg_get_last_error(char *out_buf, uint32_t out_buf_size)
+    WASM_EXPORT("wasm_dbg_get_last_error");
+int32_t wasm_dbg_get_last_error(char *out_buf, uint32_t out_buf_size) {
+  return CopyToBuffer(g_last_error, out_buf, out_buf_size);
+}
+
 /// One-time setup. Must be called before any other `wasm_dbg_*` function.
 /// Safe to call more than once (later calls are a no-op).
 int32_t wasm_dbg_init(void) WASM_EXPORT("wasm_dbg_init");
 int32_t wasm_dbg_init(void) {
+  ClearLastError();
   if (g_debugger_sp)
     return 0;
   SBDebugger::Initialize();
   g_debugger_sp = Debugger::CreateInstance();
-  if (!g_debugger_sp)
+  if (!g_debugger_sp) {
+    SetLastError("Debugger::CreateInstance() returned null");
     return -1;
+  }
   return 0;
 }
 
@@ -140,27 +168,37 @@ int32_t wasm_dbg_init(void) {
 /// same one `ObjectFile`/`SymbolFile` parsing already needs to read the
 /// module's own bytes) and attaches `ProcessWasmMemory` to it. Replaces any
 /// previously-created target. Returns 0 on success, a negative value on
-/// failure (no further detail today -- see documents/remaining_work.md
-/// for surfacing real Status text back to the caller as a follow-up).
+/// failure -- see `wasm_dbg_get_last_error()` for detail.
 int32_t wasm_dbg_create_target(const char *module_path)
     WASM_EXPORT("wasm_dbg_create_target");
 int32_t wasm_dbg_create_target(const char *module_path) {
-  if (!g_debugger_sp)
+  ClearLastError();
+  if (!g_debugger_sp) {
+    SetLastError("wasm_dbg_init() was not called (or failed)");
     return -1;
+  }
 
   TargetSP target_sp;
   Status error = g_debugger_sp->GetTargetList().CreateTarget(
       *g_debugger_sp, module_path, /*triple_str=*/llvm::StringRef(),
       eLoadDependentsNo, /*platform_options=*/nullptr, target_sp);
-  if (error.Fail() || !target_sp)
+  if (error.Fail() || !target_sp) {
+    if (error.Fail())
+      SetLastError(error);
+    else
+      SetLastError("TargetList::CreateTarget returned no target");
     return -2;
+  }
 
   ListenerSP listener_sp = g_debugger_sp->GetListener();
   ProcessSP process_sp = target_sp->CreateProcess(
       listener_sp, ProcessWasmMemory::GetPluginNameStatic(),
       /*crash_file=*/nullptr, /*can_connect=*/true);
-  if (!process_sp)
+  if (!process_sp) {
+    SetLastError("Target::CreateProcess(\"wasm-memory\") returned null -- "
+                "is the plugin registered?");
     return -3;
+  }
 
   auto *wasm_process = static_cast<ProcessWasmMemory *>(process_sp.get());
   wasm_process->SetMemoryCallbacks(
@@ -212,8 +250,11 @@ int32_t wasm_dbg_resolve_pc(uint64_t pc, char *out_buf, uint32_t out_buf_size)
     WASM_EXPORT("wasm_dbg_resolve_pc");
 int32_t wasm_dbg_resolve_pc(uint64_t pc, char *out_buf,
                             uint32_t out_buf_size) {
-  if (!g_target_sp)
+  ClearLastError();
+  if (!g_target_sp) {
+    SetLastError("wasm_dbg_create_target() was not called (or failed)");
     return -1;
+  }
 
   // `ResolveLoadAddress` only knows addresses a live process/dynamic loader
   // has actually loaded into the `SectionLoadHistory` -- nothing so far
@@ -224,8 +265,11 @@ int32_t wasm_dbg_resolve_pc(uint64_t pc, char *out_buf,
   // resolution path any offline/no-process tool uses.
   Address addr;
   if (!g_target_sp->ResolveLoadAddress(pc, addr) &&
-      !g_target_sp->ResolveFileAddress(pc, addr))
+      !g_target_sp->ResolveFileAddress(pc, addr)) {
+    SetLastError(llvm::formatv("0x{0:x} is not in any loaded module", pc)
+                     .str());
     return -2;
+  }
 
   SymbolContext sc;
   addr.CalculateSymbolContext(&sc);
@@ -258,27 +302,41 @@ int32_t wasm_dbg_format_value(const char *expr, char *out_buf,
     WASM_EXPORT("wasm_dbg_format_value");
 int32_t wasm_dbg_format_value(const char *expr, char *out_buf,
                               uint32_t out_buf_size) {
+  ClearLastError();
   ProcessWasmMemory *wasm_process = GetWasmProcess();
-  if (!wasm_process)
+  if (!wasm_process) {
+    SetLastError("wasm_dbg_create_target() was not called (or failed)");
     return -1;
+  }
   ThreadSP thread_sp = wasm_process->GetThreadList().GetThreadAtIndex(0);
-  if (!thread_sp)
+  if (!thread_sp) {
+    SetLastError("no thread (this should be unreachable -- "
+                "ProcessWasmMemory always reports exactly one)");
     return -1;
+  }
   StackFrameSP frame_sp = thread_sp->GetStackFrameAtIndex(0);
-  if (!frame_sp)
+  if (!frame_sp) {
+    SetLastError("no frame -- has wasm_dbg_set_stop() been called yet?");
     return -1;
+  }
 
   VariableSP var_sp;
   Status error;
   ValueObjectSP val_sp = frame_sp->GetValueForVariableExpressionPath(
       expr, eNoDynamicValues,
       StackFrame::eExpressionPathOptionCheckPtrVsMember, var_sp, error);
-  if (!val_sp)
+  if (!val_sp) {
+    if (error.Fail())
+      SetLastError(error);
+    else
+      SetLastError(llvm::formatv("\"{0}\" did not resolve to a value", expr)
+                       .str());
     return -2;
+  }
 
   StreamString stream;
   if (llvm::Error err = val_sp->Dump(stream)) {
-    llvm::consumeError(std::move(err));
+    SetLastError(llvm::toString(std::move(err)));
     return -3;
   }
   return CopyToBuffer(stream.GetString(), out_buf, out_buf_size);

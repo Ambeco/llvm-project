@@ -1,17 +1,19 @@
 // Proves lldb-wasm-reactor.wasm (see documents/design.md's "Debugging
 // design" section and lldb/tools/lldb-wasm-reactor/WasmDebugReactor.cpp)
-// actually works end-to-end against a real compiled program: instantiate
-// it, create a target from a real `-O0 -g` wasm binary, and resolve a
-// known function's address to its source file:line.
+// actually works end-to-end against a real compiled program:
+// instantiate it, create a target from a real `-O0 -g` wasm binary,
+// resolve a known function's address to its source file:line, and format
+// a local variable's value at a synthetic stop.
 //
-// Deliberately scoped to the *static* half of the design -- symbol
-// resolution off DWARF alone, no live process. `wasm_dbg_format_value`
-// (value formatting) needs an actual paused target feeding real memory
-// through the read_memory callback, which needs the not-yet-designed
-// compile-time-instrumentation hook on the *other* side of the JS host to
-// produce a real stop; this test's `read_memory`/`write_memory` imports
-// intentionally throw if ever called, so a bug that reaches them fails
-// loudly here instead of silently returning zero bytes.
+// The variable-formatting half doesn't run the compiled program for
+// real -- the compile-time-instrumentation hook that would produce a
+// real stop is a separate, not-yet-designed piece (see
+// documents/remaining_work.md). Instead this builds a synthetic memory
+// image and frame-base value by hand, matching exactly what DWARF says
+// local `c`'s address should be (frame_base + its DW_OP_fbreg offset),
+// and serves reads from it through the real read_memory callback --
+// exercising the real DW_OP_fbreg/DW_OP_WASM_location decoding and real
+// DataFormatters pretty-printing, just not real execution.
 //
 // The target test program is compiled fresh each run by the host's own
 // wasi-sdk clang (not clang.wasm) -- this test exercises lldb-wasm-reactor,
@@ -67,8 +69,22 @@ const wasmModule = await WebAssembly.compile(bytes);
 
 const wasi = new WASI({ version: 'preview1', args: ['lldb-wasm-reactor'], env: {}, preopens });
 
+// Backs read_memory once the format_value test below installs a synthetic
+// memory image; null until then, so a call before that (or an address
+// outside the image) fails loudly instead of silently returning garbage.
+let syntheticMemory = null; // { base: number, bytes: Uint8Array }
+
 const wasmDbgImports = {
-  read_memory() { throw new Error('unexpected read_memory call in this smoketest'); },
+  read_memory(addr, bufPtr, size) {
+    addr = Number(addr);
+    if (!syntheticMemory)
+      throw new Error(`unexpected read_memory(0x${addr.toString(16)}, size=${size}) -- no synthetic memory installed`);
+    const offset = addr - syntheticMemory.base;
+    if (offset < 0 || offset + size > syntheticMemory.bytes.length)
+      throw new Error(`read_memory(0x${addr.toString(16)}, size=${size}) outside synthetic memory range`);
+    mem8().set(syntheticMemory.bytes.subarray(offset, offset + size), bufPtr);
+    return size;
+  },
   write_memory() { throw new Error('unexpected write_memory call in this smoketest'); },
 };
 const importObjectBase = { ...wasi.getImportObject(), wasm_dbg: wasmDbgImports };
@@ -105,6 +121,24 @@ function allocCString(str) {
   return ptr;
 }
 
+/// Writes `values` as a native-endian uint32 array into a freshly
+/// wasm_dbg_alloc'd buffer; caller must wasm_dbg_free() the returned
+/// pointer.
+function allocUint32Array(values) {
+  const ptr = exp.wasm_dbg_alloc(values.length * 4);
+  if (!ptr) throw new Error('wasm_dbg_alloc for uint32 array failed');
+  new Uint32Array(memory.buffer, ptr, values.length).set(values);
+  return ptr;
+}
+
+/// Same as `allocUint32Array`, but for a uint64 (BigInt) array.
+function allocUint64Array(values) {
+  const ptr = exp.wasm_dbg_alloc(values.length * 8);
+  if (!ptr) throw new Error('wasm_dbg_alloc for uint64 array failed');
+  new BigUint64Array(memory.buffer, ptr, values.length).set(values);
+  return ptr;
+}
+
 /// Reads a NUL-terminated string out of guest memory at `ptr`.
 function readCString(ptr, maxLen) {
   const bytes = mem8();
@@ -125,8 +159,21 @@ function callWithOutBuf(fn, ...args) {
   try {
     const len = fn(...args, outPtr, bufSize);
     if (len < 0)
-      throw new Error(`call failed, returned ${len}`);
+      throw new Error(`call failed, returned ${len}: ${getLastError()}`);
     return readCString(outPtr, Math.min(len, bufSize - 1));
+  } finally {
+    exp.wasm_dbg_free(outPtr);
+  }
+}
+
+/// Reads wasm_dbg_get_last_error()'s detail for the most recent failed call.
+function getLastError() {
+  const bufSize = 4096;
+  const outPtr = exp.wasm_dbg_alloc(bufSize);
+  if (!outPtr) return '<wasm_dbg_alloc failed while reading last error>';
+  try {
+    const len = exp.wasm_dbg_get_last_error(outPtr, bufSize);
+    return len > 0 ? readCString(outPtr, Math.min(len, bufSize - 1)) : '<no detail>';
   } finally {
     exp.wasm_dbg_free(outPtr);
   }
@@ -144,7 +191,7 @@ if (ok) {
   console.error('wasm_dbg_create_target("/work/add.wasm")...');
   const createRc = exp.wasm_dbg_create_target(targetPathPtr);
   exp.wasm_dbg_free(targetPathPtr);
-  console.error(`  -> ${createRc}`);
+  console.error(`  -> ${createRc}${createRc !== 0 ? ` (${getLastError()})` : ''}`);
   ok &&= createRc === 0;
 }
 
@@ -184,6 +231,76 @@ if (ok) {
   // Expect "add.c:1" (add()'s opening brace line) or at least the function
   // name if line-table resolution didn't land exactly on the entry byte.
   ok &&= resolved.includes('add.c') || resolved.includes('add');
+}
+
+// --- wasm_dbg_format_value: real DW_OP_fbreg + memory-read + DataFormatters
+// decoding, against a synthetic (not actually executed) memory image and
+// frame-base value -- see the file header for why this doesn't run the
+// compiled program for real.
+let cOffset;
+if (ok) {
+  const llvmDwarfdump = path.join(path.dirname(wasiSdkClang), 'llvm-dwarfdump.exe');
+  const { stdout } = await execFileAsync(llvmDwarfdump, ['--debug-info', targetPath]);
+  const fnChunk = stdout.split('DW_TAG_subprogram').find((c) => /DW_AT_name\s*\("add"\)/.test(c));
+  // Within add()'s own chunk, find local `c`'s own DW_TAG_variable entry --
+  // split further, the same way the low_pc lookup above had to, since a's
+  // and b's own DW_TAG_formal_parameter entries (each with their own
+  // DW_OP_fbreg offset) precede it, and a regex spanning entries risks
+  // pairing one entry's offset with a different entry's name (confirmed
+  // empirically: this pulled "a"'s +12 instead of "c"'s own offset on the
+  // first attempt).
+  const chunk = fnChunk && fnChunk.split(/DW_TAG_(?:formal_parameter|variable)/)
+    .find((c) => /DW_AT_name\s*\("c"\)/.test(c));
+  const match = chunk && chunk.match(/DW_AT_location\s*\(DW_OP_fbreg \+(\d+)\)/);
+  if (!match) {
+    console.error('could not find DW_OP_fbreg offset for local "c":', chunk);
+    ok = false;
+  } else {
+    cOffset = parseInt(match[1], 10);
+    console.error(`local "c" is at DW_OP_fbreg +${cOffset}`);
+  }
+}
+
+if (ok) {
+  // An arbitrary base address for the synthetic frame; a real frame-base
+  // value is just some address in linear memory, so any value works as
+  // long as read_memory serves consistent bytes relative to it.
+  const frameBase = 0x10000;
+  // Big enough to cover a full MemoryCache cache-line read (LLDB reads in
+  // fixed-size chunks around the requested address, not just the exact
+  // bytes asked for -- confirmed empirically, a real 512-byte L2 cache
+  // line request for a single 4-byte int).
+  const imageSize = 4096;
+  const image = new Uint8Array(imageSize);
+  new DataView(image.buffer).setInt32(cOffset, 3, /*littleEndian=*/true); // c = 1 + 2
+  syntheticMemory = { base: frameBase, bytes: image };
+
+  // eWasmTagLocal (see Utility/WasmVirtualRegisters.h) local index 2 is
+  // whichever synthetic wasm local this compile happened to assign
+  // DW_AT_frame_base to -- confirmed to be local 2 for this exact source
+  // (see documents/design.md's frame-base note); a real embedder reads
+  // this off DW_OP_WASM_location itself rather than hardcoding it.
+  // A few bytes past add()'s very first instruction -- past its prologue,
+  // comfortably inside the range DWARF says the function (and so `c`'s
+  // lexical scope) covers, in case variable resolution requires that
+  // rather than just address-range membership.
+  const stopPc = addAddr + 5;
+  const localIndices = allocUint32Array([2]);
+  const localValues = allocUint64Array([BigInt(frameBase)]);
+  console.error(`wasm_dbg_set_stop(pc=0x${stopPc.toString(16)}, local[2]=0x${frameBase.toString(16)})...`);
+  exp.wasm_dbg_set_stop(BigInt(stopPc), localIndices, localValues, 1);
+  exp.wasm_dbg_free(localIndices);
+  exp.wasm_dbg_free(localValues);
+
+  console.error('wasm_dbg_format_value("c")...');
+  const exprPtr = allocCString('c');
+  const formatted = callWithOutBuf(exp.wasm_dbg_format_value, exprPtr);
+  exp.wasm_dbg_free(exprPtr);
+  console.error(`  -> "${formatted}"`);
+  // Real ValueObject::Dump() output includes the name/type, not just the
+  // bare value (e.g. "(int) c = 3") -- check for the value landing
+  // somewhere in it rather than assuming the exact format.
+  ok &&= /\b3\b/.test(formatted);
 }
 
 await rm(workDir, { recursive: true, force: true });

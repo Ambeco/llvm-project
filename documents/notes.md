@@ -486,3 +486,155 @@ have different, both good, answers:
   LLVM source question at all — good candidate for its own session, and
   doesn't depend on any further `lldb.wasm` work to be worth starting.
 
+
+## lldb-wasm-reactor implementation trail (2026-09-07 to 2026-09-09)
+
+`ProcessWasmMemory`, `PlatformWasi`, and `lldb-wasm-reactor` (see
+`documents/design.md`'s "Debugging design") were built and verified in this
+stretch. Kept here as the detailed record of what was found/fixed along the
+way; `documents/remaining_work.md` only tracks what's still open.
+
+- **`ProcessWasmMemory`**: done as a first pass —
+  `lldb/source/Plugins/Process/wasm-memory/` (`ProcessWasmMemory`,
+  `ThreadWasmMemory`, `RegisterContextWasmMemory`), wired into
+  `Process/CMakeLists.txt`. `DoReadMemory`/`DoWriteMemory` forward to
+  installed `std::function` callbacks; a single `ThreadWasmMemory`/frame
+  reports the PC and answers `eWasmTagLocal` Wasm-virtual-register reads
+  (see `Utility/WasmVirtualRegisters.h`) from a small map the embedder sets
+  via `SetStopState()` at each reported stop — covers real `-O0 -g`
+  codegen's only actual use of `DW_OP_WASM_location`
+  (`DW_AT_frame_base`; see `documents/design.md`). Everything else
+  (`Global`/`OperandStack` tags, all real control — launch/attach/
+  resume/step) stays a loud "not supported" stub via `Process`'s own
+  defaults. **Done (2026-09-07): builds clean.** An incremental
+  `ninja -C build-lldb lldb` picked up the new plugin automatically
+  (`add_lldb_library(... PLUGIN ...)` self-registers it into
+  `${LLDB_ALL_PLUGINS}`) and linked a working `bin/lldb.wasm` with no
+  further changes needed. **Not yet exercised against a real target** —
+  nothing has called `ProcessWasmMemory::Initialize()` or attached it to
+  an actual `Target` yet; that needs the wrapper API below to have
+  something to call it from.
+- **Wrapper API and reactor-module build**: done as a first pass —
+  `lldb/tools/lldb-wasm-reactor/WasmDebugReactor.cpp`, a new
+  `add_lldb_tool_subdirectory` under `lldb/tools/`, built with
+  `-mexec-model=reactor` (no `main` required) when the host triple starts
+  with `wasm32-`. Four exported functions (`wasm_dbg_init`,
+  `wasm_dbg_create_target`, `wasm_dbg_set_stop`, `wasm_dbg_resolve_pc`,
+  `wasm_dbg_format_value`), two imported ones (`read_memory`/
+  `write_memory`, under module name `wasm_dbg`) for the JS host to supply.
+  Uses `SBDebugger::Initialize()` (so `SystemInitializerFull` still runs --
+  simpler than a from-scratch minimal initializer, and the user confirmed
+  binary size is a deferred concern, not a blocker) plus the internal
+  `Debugger`/`TargetList`/`Target` API directly for target/process
+  creation, since `SBTarget`'s constructor-from-`TargetSP` is `protected`
+  and there is no public SB entry point for "attach this specific,
+  already-registered `Process` plugin, no launch." Value formatting goes
+  through `StackFrame::GetValueForVariableExpressionPath` (handles
+  `x`/`x->y.z`/`arr[3]`, not arbitrary expressions -- no Clang JIT
+  expression parser wired in yet) and `ValueObject::Dump` (real
+  `DataFormatters` pretty-printing). **Done (2026-09-07): builds clean.**
+  `ninja -C build-lldb lldb-wasm-reactor` (after two small fixes found by
+  actually building it: `-mexec-model=reactor` is link-only, not a compile
+  flag; `Plugins/Process/wasm-memory/...` needs `lldb/source` on the
+  include path, same as `lldb-server`'s own `Plugins/Process/*` includes)
+  produced a real `bin/lldb-wasm-reactor.wasm` — confirmed with
+  `llvm-nm`/`llvm-objdump`: `_initialize` exported (the reactor-model entry
+  point, not `_start`), all five `wasm_dbg_*` functions exported, both
+  `wasm_dbg_host_read_memory`/`write_memory` present as unresolved imports
+  for a JS host to supply, and `lldb_initialize_ProcessWasmMemory` present
+  in the plugin-init list.
+  **Update (2026-09-07): exercised end-to-end against a real compiled
+  program** via a new smoketest, `ai-notes/run_lldb_wasm_reactor_smoketest.mjs`
+  (Node, following this project's usual `ai-notes/*.mjs` pattern; the
+  target program is compiled fresh each run by the host's own wasi-sdk
+  clang, not clang.wasm, since the point is exercising the reactor, not
+  this project's own compiler). Found and fixed two real bugs along the
+  way, neither previously visible because Stage A's smoke tests never
+  exercised `TargetList::CreateTarget` (only `--version`/`--help`):
+  - **No `Platform` ever became the WASI host platform**, so
+    `Platform::GetHostPlatform()` returned null and
+    `TargetList::CreateTargetInternal`'s `platform_sp->IsHost()` crashed on
+    a null vtable (`Debugger`'s constructor only `assert()`s this is
+    non-null, which compiles out in this `-DNDEBUG` build). Every existing
+    per-OS `Platform` plugin's host self-registration is gated on
+    `#if defined(__linux__)`/`_WIN32`/etc., none of which is ever defined
+    compiling *for* WASI. Fixed with a new, deliberately minimal
+    `PlatformWasi` (`lldb/source/Plugins/Platform/WASI/`, modeled on
+    `PlatformFreeBSD`'s shape) that self-registers as host under
+    `#if defined(__wasi__)` — not to be confused with
+    `Plugins/Platform/WebAssembly`'s `PlatformWasm`, which represents a
+    wasm program as a debug *target*, an unrelated concept.
+  - **Confirmed with the fix above, then found, root-caused, and fixed two
+    more issues — both in this project's own `ai-notes/wasi_thread_hook.mjs`
+    test harness, not in LLDB, LLVM, wasi-threads, or the reactor-module
+    entry point itself (see `documents/design.md`'s multithreading note).**
+    `Target::SetExecutableModule` → `ModulesDidLoad` →
+    `ModuleList::PreloadSymbols(/*parallelize=*/true)` (the default;
+    `target.parallel-module-load` defaults on) constructs an
+    `llvm::ThreadPoolTaskGroup(Debugger::GetThreadPool())`, spawning one
+    real worker thread via `wasi.thread-spawn`. Diagnosing why
+    `task_group.wait()` never returned took an extra step: `postMessage`
+    from a spawned `worker_threads.Worker` back to its parent is delivered
+    through the parent's own event loop, which never runs again once the
+    parent is itself blocked synchronously inside `task_group.wait()`'s
+    native call — so the worker's own diagnostic messages were invisible
+    regardless of whether it succeeded or failed. Switching to a direct
+    synchronous file write (a real syscall on the worker's own OS thread,
+    independent of the parent's event loop) revealed both real causes,
+    fixed in order:
+    1. The spawned worker's own `WebAssembly.instantiate()` threw
+       `TypeError: Import #1 "wasm_dbg": module is not an object or
+       function`, caught and silently swallowed by
+       `wasi_thread_worker.mjs`'s own `catch` block — it only ever
+       forwarded the generic WASI/`env.memory`/`thread-spawn` imports into
+       a spawned thread's own re-instantiation of the module, never an
+       embedder-specific custom import module (`wasm_dbg`, holding
+       `read_memory`/`write_memory` — see `lldb/tools/lldb-wasm-reactor`).
+       Exactly the user's hypothesis (2026-09-09): "not starting, due to
+       missing a JavaScript extension method." **Fixed**:
+       `instantiateThreaded`/`makeThreadSpawn` now accept an
+       `extraImportsModule` (a file URL) plus cloneable
+       `extraImportsConfig`, threaded through `workerData` into the
+       spawned worker, which dynamically `import()`s it and calls its
+       `buildImports(config, { memory })` to *reconstruct* equivalent
+       import functions from scratch — a JS function can't cross the
+       `workerData` structured-clone boundary, so the worker can't just
+       receive the same closures the main instance uses.
+       `ai-notes/lldb_wasm_reactor_dbg_imports.mjs` is the smoketest's own
+       (throwing-stub) instance of one. A generalizable extension, also a
+       requirement on any *real* multithreaded host for this reactor, not
+       just this test harness — worth a line in
+       `documents/js-host-contract.md` once one exists.
+    2. With that fixed, instantiation succeeded but `_initialize()`
+       (called by `wasi.initialize()`) then trapped with `RuntimeError:
+       unreachable`. Root cause: `_initialize` is a *reactor's* one-time,
+       main-instance-only setup entry point (runs global ctors via
+       `__wasm_call_ctors`); calling it again in a spawned thread's own
+       fresh instance, sharing already-initialized linear memory with the
+       main instance, hits wasi-libc's own double-init guard. A
+       command-style module (`clang.wasm`/`lld.wasm`) has no `_initialize`
+       export at all, so calling `wasi.initialize()` for *its* spawned
+       threads was always harmless by accident (nothing to call), not by
+       design — this had simply never been exercised with a reactor module
+       before. **Fixed**: confirmed directly
+       (`node -e "console.log(WASI.prototype.initialize.toString())"`)
+       that `wasi.initialize()` is just `finalizeBindings()` (the actual
+       memory-binding step node:wasi needs) plus that conditional
+       `_initialize()` call; `wasi_thread_worker.mjs` now calls
+       `wasi.finalizeBindings()` directly instead, skipping `_initialize`
+       entirely for spawned threads.
+    With both fixed, plus a `Target::ResolveFileAddress` fallback added to
+    `wasm_dbg_resolve_pc` (nothing had loaded the module into the
+    `SectionLoadHistory` `ResolveLoadAddress` needs, since `ProcessWasmMemory`
+    is never actually launched/attached to in the usual sense — a wasm
+    module's file and "loaded" addresses coincide anyway, so this is a
+    correct, permanent fallback, not a workaround), **the smoketest passes
+    end to end**: real multithreaded DWARF symbol preloading completes,
+    `wasm_dbg_create_target` returns success, and
+    `wasm_dbg_resolve_pc(add()'s address)` correctly returns `"add.c:1"`.
+  Still not yet designed, independent of the above: surfacing real
+  `Status` error text back through the plain `int32_t` return codes
+  (today's codes carry no detail); whether `wasm_dbg_format_value` needs a
+  real expression evaluator (arithmetic, casts, calls) badly enough to
+  wire in `ExpressionParser/Clang` (not yet exercised by the smoketest,
+  which only calls `wasm_dbg_resolve_pc` so far).

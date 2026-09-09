@@ -9,6 +9,8 @@
 #include "ProcessWasmMemory.h"
 #include "ThreadWasmMemory.h"
 
+#include "lldb/Core/Module.h"
+#include "lldb/Core/ModuleList.h"
 #include "lldb/Core/PluginManager.h"
 #include "lldb/Target/JITLoaderList.h"
 #include "lldb/Target/Target.h"
@@ -88,6 +90,29 @@ void ProcessWasmMemory::SetMemoryCallbacks(ReadMemoryCallback read_cb,
 
 void ProcessWasmMemory::CompleteAttach() {
   SetID(1);
+
+  // Nothing here ever goes through the normal Process::Attach/Launch path
+  // a real DynamicLoader plugin's DidAttach()/DidLaunch() would fire from
+  // (see documents/design.md) -- so without this, nothing ever populates
+  // Target::SetSectionLoadAddress, and generic LLDB machinery that expects
+  // it (StackFrame construction resolving its own function/block, not just
+  // this wrapper's own explicit ResolveFileAddress fallback in
+  // wasm_dbg_resolve_pc) silently fails to find anything. A wasm module
+  // has no relocation to speak of, so -- exactly like
+  // Plugins/DynamicLoader/Static's own LoadAllImagesAtFileAddresses() --
+  // loading every section at its own file address (slide 0) is always
+  // correct, not just a placeholder.
+  ModuleList loaded_modules;
+  for (const ModuleSP &module_sp : GetTarget().GetImages().Modules()) {
+    bool changed = false;
+    if (module_sp)
+      module_sp->SetLoadAddress(GetTarget(), 0, /*value_is_offset=*/true,
+                                changed);
+    if (changed)
+      loaded_modules.AppendIfNeeded(module_sp);
+  }
+  GetTarget().ModulesDidLoad(loaded_modules);
+
   SetPrivateState(lldb::eStateStopped);
   UpdateThreadListIfNeeded();
 }
