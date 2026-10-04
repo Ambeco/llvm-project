@@ -234,9 +234,12 @@ GDB-remote/CDP approaches. Open implementation items:
   `local_indices`/`local_values` parameters exist for this: the JS host
   reads `instance.exports.__stack_pointer.value` itself and passes it in
   as the one `eWasmTagLocal` entry, no compiler/instrumentation change
-  needed. Not yet threaded through an actual "Debug" build's link flags
-  (`build.bat`/a future dedicated Debug-build script) or exercised
-  end-to-end.
+  needed. `ai-notes/run_lldb_wasm_reactor_smoketest.mjs` now links its
+  target with the flag and asserts the global export (passes), but it
+  still feeds synthetic frame bases; the real consumer is the JS
+  host/extension's Debug-build link line (not in this repo), which must
+  pass the flag and feed the global's value to `wasm_dbg_set_stop`, and
+  has not been exercised end-to-end.
 - **Instrumentation overhead**: not yet measured in practice.
 - Binary size (`lldb.wasm` is ~96 MiB today) is a known, deliberately
   deferred concern — see "Alternatives considered" in `documents/design.md`

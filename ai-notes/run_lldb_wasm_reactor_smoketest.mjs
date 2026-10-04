@@ -64,7 +64,18 @@ const srcPath = path.join(workDir, 'add.c');
 const targetPath = path.join(workDir, 'add.wasm');
 await writeFile(srcPath, addC);
 console.error(`Compiling ${srcPath} -> ${targetPath}...`);
-await execFileAsync(wasiSdkClang, ['-O0', '-g', '-o', targetPath, srcPath]);
+// -Wl,--export=__stack_pointer is part of the "Debug" build's link line: the
+// JS host reads it off instance.exports as the frame-base local's value.
+await execFileAsync(wasiSdkClang, ['-O0', '-g', '-Wl,--export=__stack_pointer', '-o', targetPath, srcPath]);
+{
+  const targetModule = new WebAssembly.Module(await readFile(targetPath));
+  const spExport = WebAssembly.Module.exports(targetModule).find((e) => e.name === '__stack_pointer');
+  if (!spExport || spExport.kind !== 'global') {
+    throw new Error(`"Debug" build link line did not export __stack_pointer as a global (got ${JSON.stringify(spExport)}); ` +
+      'did you mean to pass -Wl,--export=__stack_pointer?');
+  }
+  console.error('add.wasm exports __stack_pointer as a global: OK');
+}
 
 const { stdout: dwarfDump } = await execFileAsync(llvmDwarfdump, ['--debug-info', targetPath]);
 
