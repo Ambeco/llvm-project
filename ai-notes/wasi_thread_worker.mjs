@@ -13,6 +13,7 @@
 // matters for a real compiler like clang.wasm, unlike this repo's minimal
 // standalone pthread-mutex test program.
 import { readFile } from 'node:fs/promises';
+import { writeSync } from 'node:fs';
 import { WASI } from 'node:wasi';
 import { workerData, parentPort } from 'node:worker_threads';
 import { makeThreadSpawn, makeFakeInstance } from './wasi_thread_hook.mjs';
@@ -78,5 +79,10 @@ try {
   instance.exports.wasi_thread_start(tid, startArg);
   parentPort.postMessage({ log: 'finished' });
 } catch (e) {
+  // Synchronous too: postMessage is never delivered while the parent is
+  // blocked inside a wasm call (see the comment above extraImportsModule).
+  writeSync(2, `[thread ${tid}] trapped: ${e}
+${e?.stack ?? ''}
+`);
   parentPort.postMessage({ log: `trapped: ${e}` });
 }

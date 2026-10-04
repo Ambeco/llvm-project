@@ -94,6 +94,14 @@ function getLowPc(fnName) {
   return parseInt(match[1], 16);
 }
 
+/// The wasm local index `fnName`'s `DW_AT_frame_base` (`DW_OP_WASM_location
+/// 0x0 <index>`, tag 0 = local) refers to.
+function getFrameBaseLocal(fnName) {
+  const match = findFunctionChunk(fnName).match(/DW_AT_frame_base\s*\(DW_OP_WASM_location 0x0 0x([0-9a-f]+)/);
+  if (!match) throw new Error(`could not find a local-based DW_AT_frame_base for "${fnName}"`);
+  return parseInt(match[1], 16);
+}
+
 /// `varName`'s `DW_OP_fbreg` offset within `fnName` -- the offset from
 /// that frame's own frame-base value to the variable's real address.
 /// Splits `fnName`'s chunk further, by variable/parameter entry, for the
@@ -275,16 +283,9 @@ if (ok) {
 // scope -- covers); frame 1 is caller(), "stopped" at the point it called
 // add() from.
 //
-// KNOWN FAILING as of 2026-09-09 (see documents/remaining_work.md): this
-// is expected to fail resolving anything in frame 1 (caller(), the third
-// DWARF-covered function in the module) -- a real, separate bug in
-// address/symbol resolution for the third-and-later function in a
-// multi-function wasm module, confirmed unrelated to the
-// ProcessWasmMemory/UnwindWasmMemory work this test otherwise exercises
-// (even a bare wasm_dbg_resolve_pc() call on one of caller()'s own
-// addresses, bypassing StackFrame/Unwind entirely, resolves to the wrong
-// function). Wrapped in try/catch so that known, already-understood
-// failure is reported cleanly rather than crashing the whole script.
+// PCs throughout are DWARF code addresses (relative to the code section,
+// as llvm-dwarfdump prints them), not module offsets: see
+// ProcessWasmMemory::CompleteAttach.
 try {
   const cOffset = getFbregOffset('add', 'c');
   const xOffset = getFbregOffset('caller', 'x');
@@ -312,15 +313,13 @@ try {
   syntheticMemoryRegions.push({ base: addFrameBase, bytes: addImage });
   syntheticMemoryRegions.push({ base: callerFrameBase, bytes: callerImage });
 
-  // eWasmTagLocal (see Utility/WasmVirtualRegisters.h) local index 2 is
-  // whichever synthetic wasm local this compile happened to assign
-  // DW_AT_frame_base to -- confirmed to be local 2 for both functions in
-  // this exact source (see documents/design.md's frame-base note); a real
-  // embedder reads this off each frame's own DW_OP_WASM_location itself
-  // rather than hardcoding it.
+  // eWasmTagLocal (see Utility/WasmVirtualRegisters.h): each function's
+  // DW_AT_frame_base names its own synthetic wasm local, and it differs per
+  // function (add() and caller() get different ones), so read it off each
+  // function's own DW_OP_WASM_location rather than hardcoding it.
   const framePcs = [addAddr + 5, callerAddr + 5];
   const localFrameIndices = [0, 1]; // both frames' frame-base local
-  const localWasmIndices = [2, 2];
+  const localWasmIndices = [getFrameBaseLocal('add'), getFrameBaseLocal('caller')];
   const localValues = [BigInt(addFrameBase), BigInt(callerFrameBase)];
 
   const framePcsPtr = allocUint64Array(framePcs.map(BigInt));
@@ -360,7 +359,7 @@ try {
   console.error(`  -> "${formattedX}"`);
   ok &&= /\b1\b/.test(formattedX);
 } catch (e) {
-  console.error(`Backtrace/frame-1 section failed (expected -- see the KNOWN FAILING note above): ${e.message}`);
+  console.error(`Backtrace/frame-1 section failed: ${e.message}`);
   ok = false;
 }
 

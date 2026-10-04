@@ -12,6 +12,7 @@
 #include "lldb/Core/Module.h"
 #include "lldb/Core/ModuleList.h"
 #include "lldb/Core/PluginManager.h"
+#include "lldb/Core/Section.h"
 #include "lldb/Target/JITLoaderList.h"
 #include "lldb/Target/Target.h"
 
@@ -108,6 +109,22 @@ void ProcessWasmMemory::CompleteAttach() {
     if (module_sp)
       module_sp->SetLoadAddress(GetTarget(), 0, /*value_is_offset=*/true,
                                 changed);
+    // ObjectFileWasm::SetLoadAddress loads the code section at its module
+    // (file) offset, i.e. it expects PCs to be offsets from the start of the
+    // module. Every PC this plugin and the reactor API deal in is instead a
+    // DWARF code address (relative to the code section, same as
+    // llvm-dwarfdump prints), so load the code section at its own file
+    // address. Otherwise any PC at or above the code section's file offset
+    // is mis-resolved by that offset (e.g. into another CU), while PCs below
+    // it only work through the reactor's ResolveFileAddress fallback.
+    if (module_sp)
+      if (SectionList *sections = module_sp->GetSectionList())
+        for (size_t i = 0, n = sections->GetSize(); i < n; ++i) {
+          SectionSP section_sp = sections->GetSectionAtIndex(i);
+          if (section_sp && section_sp->GetType() == eSectionTypeCode)
+            GetTarget().SetSectionLoadAddress(section_sp,
+                                              section_sp->GetFileAddress());
+        }
     if (changed)
       loaded_modules.AppendIfNeeded(module_sp);
   }

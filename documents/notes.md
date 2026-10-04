@@ -638,3 +638,10 @@ way; `documents/remaining_work.md` only tracks what's still open.
   real expression evaluator (arithmetic, casts, calls) badly enough to
   wire in `ExpressionParser/Clang` (not yet exercised by the smoketest,
   which only calls `wasm_dbg_resolve_pc` so far).
+
+### Multi-frame backtrace "address-range indexing bug" (2026-10-04): two causes, neither in DWARF indexing
+
+Frame 1 of a backtrace resolved to the wrong CU (`crt1-command.c:43`), and the third function's PCs seemed unresolvable. DWARF/aranges/line tables were never at fault (native lldb resolved the same module fine; aranges tracing showed correct tables). Causes:
+- `ObjectFileWasm::SetLoadAddress` loads the code section at its *module file offset* (0x85 in the test module), so `ResolveLoadAddress` treats PCs as module offsets, but the reactor API's PCs are DWARF code addresses. PCs below 0x85 only worked via the reactor's `ResolveFileAddress` fallback; PCs at/above it were shifted by 0x85. Fixed in `ProcessWasmMemory::CompleteAttach` (load code section at its file address). If a host ever feeds V8-style module offsets instead, this convention must change.
+- The smoketest hardcoded local 2 as every frame's frame-base local; it differs per function (`add` 2, `caller` 1, `main` 0). The test now reads it per function from `DW_AT_frame_base`.
+- Harness gotcha: running the reactor smoketest without `--experimental-wasm-type-reflection` makes every worker die in `installSpawnHook` (`WebAssembly.Function` missing) and `create_target` hangs forever with flat CPU. `wasi_thread_worker.mjs` now also writes the failure synchronously to stderr.
