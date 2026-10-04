@@ -63,9 +63,11 @@ provide functionality no WASI host does by default:
     Worker's, to invoke the cleanup entry point
     (`llvm::sys::RunInterruptHandlers()` / `CleanupOnSignal()`) to remove any
     temp files the compile registered before it died.
-- **Never call `CrashRecoveryContext::Enable()`** (directly or by flipping
-  `-DCLANG_SPAWN_CC1=OFF`) without also implementing real crash recovery --
-  it's wired to fail loudly specifically because there's no way to honor it.
+- **Crash recovery does not exist.** `CrashRecoveryContext::Enable()` is a
+  no-op on WASI, so with `-DCLANG_SPAWN_CC1=OFF` (the single-process build,
+  `clang.wasm` from `build-single-threaded.bat`) a cc1 crash traps the whole
+  instance. The host must report that trap itself, and must run cleanup
+  (see above) since the module cannot.
 - (Optional) provide a `$COLUMNS` environment variable if terminal-width-
   aware output formatting matters; there's no `ioctl`/`TIOCGWINSZ` to query
   it from.

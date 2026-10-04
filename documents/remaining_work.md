@@ -124,6 +124,32 @@ Confirms the original "presumably fine" assumption; downgrading from
 assumption to verified. No action needed — `wasi_threaded_io` doesn't
 need to cover this path either.
 
+## Exports needed by the vscwClang extension (requested 2026-10-03)
+
+**Status:** single-process `clang.wasm`/`lld.wasm` done and verified (`run_clang_nospawn_smoketest.mjs`: SMOKETEST PASSED on a stock node:wasi host). Still to do: build the threaded `build.bat` (needed by the package script), run `ai-notes/package_release.mjs <tag>`, re-run the smoke test against the packaged tree, report the tree size.
+
+The `vsclang` extension (`C:\Users\mooin\Dropbox\Code\Github\vsclang\vsclang`) ships these as Marketplace tooling extensions and runs them on VS Code's `wasm-wasi-core`, which cannot install our spawn hook (it never exposes the `WebAssembly.Instance`). So its V1 needs a no-spawn, single-process, single-thread toolchain. Every item below blocks that project's Milestone 1.
+
+1. **Single-process, single-thread `clang.wasm` and `lld.wasm`** (plain `wasm32-unknown-wasip1`, no `-pthread`, no imported/shared memory, no host JS):
+   - Build clang with `-DCLANG_SPAWN_CC1=OFF`, so the driver runs cc1 in-process. Make `CrashRecoveryContext::Enable()` a graceful no-op on WASI (today it is a `report_fatal_error` stub that this path would hit; see `threaded-file-io-rpc-plan.md`, "The flag that looks like an escape hatch"). A crash then kills the instance and the host reports it.
+   - Acceptance: with only a stock WASI host, `clang --target=wasm32-wasip1 -c a.cpp -o a.o` works, and `lld.wasm` (as `wasm-ld`) links the `.o` files into a runnable `.wasm`. The extension runs compile and link as separate invocations, so compile+link in one driver call (two jobs) need not work.
+   - Publish with names distinct from the threaded pair, e.g. `clang.wasm`/`lld.wasm` (single-thread) and `clang-threads.wasm`/`lld-threads.wasm`, so the V2 host's binaries can't be confused with V1's.
+   - Also publish the current `lldb.wasm`/`lldb-wasm-reactor.wasm` as before (needed later, Milestone 5).
+2. **A sysroot directory tree** (a packaging script run after the build; plain files, not a wasm module and not self-mounting; the host mounts it read-only):
+   ```
+   sysroot/
+     include/                       wasi-libc, libc++, libc++abi headers
+     lib/wasm32-wasip1/             libc.a, libc++.a, libc++abi.a, crt1*.o, ...
+     lib/wasm32-wasip1-threads/     optional: only if threaded user programs are offered
+   resource/lib/clang/24/           clang resource dir from build/lib/clang/24:
+                                    headers, lib/wasm32-wasip1/libclang_rt.builtins.a,
+                                    and libclang_rt.wasi_threaded_io (include regardless)
+   ```
+   - Source: libc/libc++ pieces from wasi-sdk's `share/wasi-sysroot` (421 MB; keep only the wasip1 and wasip1-threads dirs plus `include/`); resource dir from this build. The resource dir must come from the same clang build as the published `clang.wasm`.
+   - The extension passes `--sysroot=/sysroot -resource-dir=<mount>/lib/clang/24`; confirm those flags work against the tree (smoke test: reuse `run_clang_link_smoketest.mjs` with the packaged tree as the preopens).
+   - Report the tree's total size; the extension needs it for the Marketplace size check.
+3. **Versioning**: sysroot and binaries are tagged together (same release tag), with a short `MANIFEST` listing file hashes. The extension takes the exact files; Marketplace signing covers integrity, so the PGP signature is no longer required by it.
+
 ## The real browser-based JS host (separate project, not started)
 
 Everything under `ai-notes/*.mjs` is a Node reference implementation

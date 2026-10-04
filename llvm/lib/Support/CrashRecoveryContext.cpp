@@ -29,7 +29,7 @@ using namespace llvm;
 // fine here: as explained where installExceptionOrSignalHandlers() is
 // defined below, CrashRecoveryContext::Enable() -- the only thing that ever
 // lets gCrashRecoveryEnabled become true, which is in turn the only thing
-// that ever lets ValidJumpBuffer become true -- fails loudly on WASI, so the
+// that ever lets ValidJumpBuffer become true -- is a no-op on WASI, so the
 // actual jmp_buf/longjmp use below is unreachable at runtime. We still need
 // something that type-checks to get this file to compile, so provide a
 // placeholder type and a longjmp that fails loudly if it's ever somehow
@@ -172,6 +172,11 @@ CrashRecoveryContext *CrashRecoveryContext::GetCurrent() {
 }
 
 void CrashRecoveryContext::Enable(bool NeedsPOSIXUtilitySignalHandling) {
+#if defined(__wasi__)
+  // Intentionally leaves gCrashRecoveryEnabled false: see the __wasi__ block
+  // above installExceptionOrSignalHandlers().
+  return;
+#endif
   std::lock_guard<std::mutex> L(getCrashRecoveryContextMutex());
   // FIXME: Shouldn't this be a refcount or something?
   if (gCrashRecoveryEnabled)
@@ -181,6 +186,9 @@ void CrashRecoveryContext::Enable(bool NeedsPOSIXUtilitySignalHandling) {
 }
 
 void CrashRecoveryContext::Disable() {
+#if defined(__wasi__)
+  return;
+#endif
   std::lock_guard<std::mutex> L(getCrashRecoveryContextMutex());
   if (!gCrashRecoveryEnabled)
     return;
@@ -370,20 +378,15 @@ static void uninstallExceptionOrSignalHandlers() {
 // WASI has no signal delivery at all -- there is no OS process to deliver a
 // signal into, and a real fault (e.g. an out-of-bounds memory access) is
 // reported as an uncatchable WebAssembly trap that tears down the whole
-// module instance rather than invoking a handler. So unlike the other
-// platforms in this file, there is no way to implement RunSafely's actual
-// contract (catch a crash, unwind, let the caller keep running) here at all.
+// module instance rather than invoking a handler. So RunSafely's contract
+// (catch a crash, unwind, let the caller keep running) cannot be implemented.
 //
-// Rather than silently compiling to a no-op that would look like recovery is
-// happening when it isn't, fail loudly the moment anyone actually tries to
-// turn crash recovery on, so a caller that genuinely depends on it finds out
-// immediately instead of finding out later via an unexplained trap. Callers
-// that don't need recovery (i.e. that never call
-// CrashRecoveryContext::Enable(), which is how clang's driver is configured
-// via -DCLANG_SPAWN_CC1=ON) never reach this code: RunSafely() only takes the
-// setjmp/signal-handling path when gCrashRecoveryEnabled is true, and it
-// falls back to simply calling Fn() directly otherwise -- exactly the
-// upstream-sanctioned behavior for "crash recovery disabled".
+// Enable()/Disable() are therefore silent no-ops that leave
+// gCrashRecoveryEnabled false, so RunSafely() just calls Fn() directly (the
+// upstream "recovery disabled" path), and a crash kills the instance for the
+// host to report. This lets clang's driver run cc1 in-process
+// (-DCLANG_SPAWN_CC1=OFF) on a plain WASI host. The functions below are
+// unreachable and fail loudly if that ever changes.
 static void
 installExceptionOrSignalHandlers(bool NeedsPOSIXUtilitySignalHandling) {
   report_fatal_error("CrashRecoveryContext::Enable() is not supported when "

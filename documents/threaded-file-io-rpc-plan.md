@@ -107,7 +107,7 @@ loudly* if nothing installs the hook before something tries to use it.
 `-fintegrated-cc1` asks the driver to skip the "subprocess" path above
 entirely and run `cc1` in the same process -- which sounds like it should
 make a compile work with *no* spawn-hook JS at all. It doesn't, on this
-fork, for two independent reasons:
+fork, for one reason (it used to be two):
 
 1. **It's silently overridden back off for any multi-job invocation.**
    `Driver.cpp`'s `BuildJobs()` forces `J.InProcess = false` for every job
@@ -116,27 +116,14 @@ fork, for two independent reasons:
    `-fintegrated-cc1` has no effect on it regardless of build
    configuration. It could only matter for a single-job invocation, e.g.
    a bare `-c` compile with no link step.
-2. **Even then, it hits a different fatal stub.** `driver.cpp` calls
-   `llvm::CrashRecoveryContext::Enable()` unconditionally whenever
-   `UseNewCC1Process` is false (i.e. whenever `-fintegrated-cc1` actually
-   takes effect) -- and this fork's `CrashRecoveryContext::Enable()` is
-   itself a `report_fatal_error` stub on WASI (see the "WASI: fail loudly
-   on signal/subprocess/crash-recovery gaps we can't fill" commit): real
-   signal-based crash recovery is structurally impossible on this target
-   (a trap terminates the whole instance uncatchably; there's no signal
-   handler to install), and this fork deliberately chose to fail loudly
-   rather than silently degrade, on the explicit assumption that
-   `CLANG_SPAWN_CC1=ON` makes this path dead code in normal use.
-
-Net effect: **there is currently no way to get a real compile out of
-either build configuration with fully zero custom JS.** The zero-JS
-claim is real and worth keeping as a design goal for *instantiation and
-non-compiling invocations*, but a true zero-JS *compile* would require
-revisiting the `CrashRecoveryContext::Enable()` design choice (making it
-a graceful no-op instead of fatal, accepting reduced crash-recovery
-robustness) and building without `CLANG_SPAWN_CC1` -- not attempted, and
-not obviously a good trade, since it would mean giving up the
-process-boundary crash detection `CLANG_SPAWN_CC1=ON` currently buys.
+Net effect: **`build-single-threaded.bat` now builds with
+`-DCLANG_SPAWN_CC1=OFF`, so a single-job driver call (`clang -c a.cpp -o
+a.o`) runs cc1 in-process and needs zero custom JS** on a stock WASI host,
+as does `lld.wasm` run as `wasm-ld` on `.o` files. A compile+link driver
+call is two jobs, so the driver still spawns them and needs the spawn hook;
+run compile and link as separate invocations instead. The cost is giving up
+the process-boundary crash isolation `CLANG_SPAWN_CC1=ON` buys. The threaded
+`build.bat` keeps `ON`. Check with `ai-notes/run_clang_nospawn_smoketest.mjs`.
 
 ### Other flags that fail loudly rather than silently doing the wrong thing
 

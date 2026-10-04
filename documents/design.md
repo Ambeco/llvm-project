@@ -133,9 +133,12 @@ from this branch as redundant; not something to redo.)
 
 - `llvm/lib/Support/CrashRecoveryContext.cpp`: WASI has no signal delivery
   and no working `setjmp`/`longjmp`, so real crash recovery is impossible
-  in a single module instance; `Enable()` now fails loudly instead of
-  silently pretending to work. The build relies on `-DCLANG_SPAWN_CC1=ON`
-  (see `build.bat`) so `Enable()` is never actually called by the driver.
+  in a single module instance; `Enable()`/`Disable()` are silent no-ops
+  that leave crash recovery off (`RunSafely` just calls the function), so a
+  crash traps the whole instance and the host reports it. This is what lets
+  the single-process build (`-DCLANG_SPAWN_CC1=OFF`,
+  `build-single-threaded.bat`) run cc1 in-process on a stock WASI host;
+  `build.bat` keeps `-DCLANG_SPAWN_CC1=ON` for process-boundary isolation.
 - `llvm/lib/Support/Unix/Signals.inc`: WASI can't install real signal
   handlers, so handler registration (crash backtraces, Ctrl-C,
   cleanup-on-signal) becomes a silent no-op — nothing depends on it
@@ -441,11 +444,8 @@ Web extension (see the CDP/GDB-remote unreachability finding under
   (`report_fatal_error`) rather than silently no-op'ing for these. Nothing
   in a normal `-c`/`-o` compile-and-link needs them; would need wire-format
   and shim extension if something does.
-- **`CrashRecoveryContext::Enable()` and socket operations
-  (`ListeningSocket`/`raw_socket_stream`) are hard stubs.** Deliberate: the
-  driver's `CLANG_SPAWN_CC1=ON` setting means `CrashRecoveryContext::Enable()`
-  is never actually called in practice, so this is dead code, not a real
-  gap. Sockets were never expected to work in a browser-hosted compiler.
+- **Socket operations (`ListeningSocket`/`raw_socket_stream`) are hard
+  stubs.** Sockets were never expected to work in a browser-hosted compiler.
 - **`clangd` is untouched and expected to be harder.** Persistent
   background indexing threads are a different shape of problem than a
   one-shot spawn-and-wait like `cc1`; `clang-tools-extra` isn't even
