@@ -30,6 +30,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { argv as processArgv } from 'node:process';
 import { instantiateThreaded, makeFakeInstance } from './wasi_thread_hook.mjs';
+import { scanGuardSites, ShadowStack, captureWasmFrames, mergeFrames } from './sancov_host.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -140,9 +141,10 @@ for (const [dwarfName, objName] of [['add', 'add'], ['caller', 'caller'], ['main
 }
 console.error(`objdump file offset - DWARF address = 0x${addrDelta.toString(16)} (the <CODE> section start; sanity-checked against add/caller/main)`);
 
-// guard address -> { pc (DWARF code address of the hook call), fn }, from
-// each `<guard address>; call <hookImportIndex>` sequence.
-const guardSites = new Map();
+// Oracle: guard address -> { pc (DWARF code address of the hook call), fn },
+// from llvm-objdump. The real host can't shell out, so it uses sancov_host.mjs's
+// scanGuardSites() on the raw bytes instead; the two must agree exactly.
+const oracleGuardSites = new Map();
 {
   const lines = objDump.split('\n');
   const insn = /^\s*([0-9a-f]+):\s+(?:[0-9a-f]{2} )+\s*(\S+)\s*(.*)$/;
@@ -161,19 +163,19 @@ const guardSites = new Map();
     const pc = parseInt(call[1], 16) - addrDelta;
     const fn = subprogramForPc(pc);
     if (!fn) throw new Error(`guard call at DWARF address 0x${pc.toString(16)} is in no DW_TAG_subprogram`);
-    guardSites.set(guard, { pc, fn: fn.name });
+    oracleGuardSites.set(guard, { pc, fn: fn.name });
   }
 }
+
+const scan = scanGuardSites(targetBytes);
+const guardSites = new Map([...scan.guardSites].map(([g, s]) => [g, { pc: s.pc, fn: subprogramForPc(s.pc).name, funcIndex: s.funcIndex }]));
+const guardOrdinal = scan.ordinals; // 0-based ordinal of each guard within its function, in code order
 console.error(`guard sites: ${[...guardSites].map(([g, s]) => `${g}->${s.fn}@0x${s.pc.toString(16)}`).join(', ')}`);
-// 1-based ordinal of each guard within its function, in code order.
-const guardOrdinal = new Map();
 {
-  const perFn = new Map();
-  for (const [g, s] of [...guardSites].sort((a, b) => a[1].pc - b[1].pc)) {
-    const n = perFn.get(s.fn) ?? 0;
-    guardOrdinal.set(g, n);
-    perFn.set(s.fn, n + 1);
-  }
+  const same = guardSites.size === oracleGuardSites.size &&
+    [...oracleGuardSites].every(([g, o]) => guardSites.get(g)?.pc === o.pc && guardSites.get(g)?.fn === o.fn);
+  if (!same) throw new Error(`scanGuardSites() disagrees with llvm-objdump: ${JSON.stringify([...guardSites])} vs ${JSON.stringify([...oracleGuardSites])}`);
+  console.error(`  ok   scanGuardSites() matches the llvm-objdump oracle (${guardSites.size} guards)`);
 }
 
 // --- Load the reactor (same setup as run_lldb_wasm_reactor_smoketest.mjs).
@@ -270,20 +272,17 @@ for (const [g, s] of guardSites) {
 }
 
 // --- Shadow call stack, built from the hook alone (documents/design.md).
-const shadowStack = []; // innermost last: { fn, pc, sp }
-function onHook(sp, guard) {
-  const site = guardSites.get(guard);
-  if (!site) throw new Error(`hook fired for unknown guard address ${guard}; known: ${[...guardSites.keys()].join(', ')}`);
-  while (shadowStack.length && shadowStack.at(-1).sp < sp) shadowStack.pop(); // returned
-  const top = shadowStack.at(-1);
-  if (top && top.sp === sp) top.pc = site.pc; // same frame, new block
-  else shadowStack.push({ fn: site.fn, pc: site.pc, sp }); // deeper call (or first frame)
-}
+const shadowStack = new ShadowStack(scan.guardSites);
 
-/// Feeds the current shadow stack to wasm_dbg_set_stop, exactly as a real
-/// host would: one frame-base local per frame, valued with that frame's SP.
+/// Feeds the current stack to wasm_dbg_set_stop, exactly as a real host
+/// would: PCs from the engine's stack trace (true call sites, not each
+/// caller's last block entry), one frame-base local per frame valued with
+/// that frame's SP from the shadow stack. Frames without a shadow entry (no
+/// frame base) are left out.
 function setStopFromShadowStack() {
-  const frames = [...shadowStack].reverse(); // innermost first
+  const trueFrames = captureWasmFrames(scan.module.codeStart);
+  const frames = mergeFrames(trueFrames, shadowStack).filter((f) => f.sp !== null)
+    .map((f) => ({ ...f, fn: subprogramForPc(f.pc).name }));
   const pcs = allocTyped(BigUint64Array, frames.map((f) => BigInt(f.pc)));
   const idx = allocTyped(Uint32Array, frames.map((_, i) => i));
   const wasmIdx = allocTyped(Uint32Array, frames.map((f) => {
@@ -297,6 +296,7 @@ function setStopFromShadowStack() {
 }
 
 const lineOf = (btLine) => Number(btLine.match(/prog\.c:(\d+)/)?.[1]);
+const lineOfText = (text) => progC.split(String.fromCharCode(10)).findIndex((l) => l.includes(text)) + 1;
 const inFn = (btLine, fn) => { const l = lineOf(btLine), [a, b] = sourceSpan(fn); return l >= a && l <= b; };
 
 // Stops: (function, 0-based block ordinal) -> assertions run inside the hook.
@@ -308,6 +308,9 @@ const stops = [
     check(bt.length === 3, 'backtrace has 3 frames (add, caller, main)');
     check(inFn(bt[0], 'add') && inFn(bt[1], 'caller') && inFn(bt[2], 'main'),
       'frames resolve into add(), caller(), main() source lines respectively');
+    // Outer frames carry their true call-site line (engine stack trace), not their last block entry.
+    check(lineOf(bt[1]) === lineOfText('int y = add('), `frame 1 is on the call line ${lineOfText('int y = add(')} (got ${lineOf(bt[1])})`);
+    check(lineOf(bt[2]) === lineOfText('return caller(1)'), `frame 2 is on the call line ${lineOfText('return caller(1)')} (got ${lineOf(bt[2])})`);
     for (const [frame, expr, re] of [
       [0, 'a', /\(int\) a = 1\b/], [0, 'b', /\(int\) b = 10\b/], [0, 'c', /\(int\) c = 11\b/],
       [1, 'x', /\(int\) x = 1\b/], [1, 'p.y', /\(int\) y = 2\b/], [1, 'p', /x = 1[^]*y = 2/],
@@ -343,10 +346,9 @@ targetInstance = new WebAssembly.Instance(targetModule, {
       try {
         hookFires++;
         // The real hook->LLDB input: the live exported global.
-        onHook(Number(targetInstance.exports.__stack_pointer.value), guardPtr);
+        const top = shadowStack.onHook(Number(targetInstance.exports.__stack_pointer.value), guardPtr);
         for (const stop of pending) {
-          const top = shadowStack.at(-1);
-          if (top.fn === stop.fn && guardOrdinal.get(guardPtr) === stop.ordinal) {
+          if (guardSites.get(guardPtr).fn === stop.fn && guardOrdinal.get(guardPtr) === stop.ordinal) {
             pending.delete(stop);
             console.error(`stop at ${stop.fn}() block #${stop.ordinal} (pc 0x${top.pc.toString(16)}, sp ${top.sp}):`);
             setStopFromShadowStack();
