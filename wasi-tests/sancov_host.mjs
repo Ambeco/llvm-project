@@ -190,12 +190,18 @@ export function scanGuardSites(bytes, hookImport = { module: 'env', name: '__san
 export class ShadowStack {
   constructor(guardSites) { this.guardSites = guardSites; this.entries = []; }
 
+  /// Pops frames that have returned, given the live `__stack_pointer`. Call it from
+  /// guard-less hooks (trace-loads/stores), where a callee may have just returned.
+  sync(sp) {
+    while (this.entries.length && this.entries.at(-1).sp < sp) this.entries.pop();
+  }
+
   /// Feed one hook firing: the live `__stack_pointer` value and the guard argument.
   onHook(sp, guard) {
     const site = this.guardSites.get(guard);
     if (!site) throw new Error(`hook fired for unknown guard address ${guard}; known: ${[...this.guardSites.keys()].join(', ')}`);
     const e = this.entries;
-    while (e.length && e.at(-1).sp < sp) e.pop(); // returned
+    this.sync(sp); // returned
     const top = e.at(-1);
     if (top && top.sp === sp) top.pc = site.pc; // same frame, new block
     else e.push({ funcIndex: site.funcIndex, pc: site.pc, sp }); // deeper call, or first frame

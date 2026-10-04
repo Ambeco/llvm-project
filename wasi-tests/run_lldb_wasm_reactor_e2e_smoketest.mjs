@@ -9,6 +9,9 @@
 // built exactly as documents/design.md describes (SP comparison between
 // consecutive hook firings).
 //
+// The last section builds a second, straight-line target with
+// trace-loads/trace-stores hooks to stop mid-function (statement granularity).
+//
 // Two findings this encodes (see documents/remaining_work.md "Hook
 // granularity"):
 //  - On wasm, -fsanitize-coverage=pc-table is empty (__sanitizer_cov_pcs_init
@@ -107,7 +110,7 @@ const { stdout: objDump } = await execFileAsync(llvmObjdump, ['-d', targetPath],
 
 // Split per DW_TAG_subprogram first, not one regex across the dump -- see
 // run_lldb_wasm_reactor_smoketest.mjs's findFunctionChunk for why.
-const subprograms = dwarfDump.split('DW_TAG_subprogram').slice(1).map((chunk) => {
+const parseSubprograms = (dump) => dump.split('DW_TAG_subprogram').slice(1).map((chunk) => {
   const name = chunk.match(/DW_AT_name\s*\("([^"]+)"\)/)?.[1];
   const low = chunk.match(/DW_AT_low_pc\s*\(0x([0-9a-f]+)\)/);
   const high = chunk.match(/DW_AT_high_pc\s*\(0x([0-9a-f]+)\)/);
@@ -115,6 +118,7 @@ const subprograms = dwarfDump.split('DW_TAG_subprogram').slice(1).map((chunk) =>
   return { name, low: low && parseInt(low[1], 16), high: high && parseInt(high[1], 16),
     frameBaseLocal: fb && parseInt(fb[1], 16) };
 }).filter((s) => s.name && s.low !== null && s.high !== null);
+let subprograms = parseSubprograms(dwarfDump);
 
 const subprogram = (name) => {
   const s = subprograms.find((x) => x.name === name);
@@ -167,7 +171,7 @@ const oracleGuardSites = new Map();
   }
 }
 
-const scan = scanGuardSites(targetBytes);
+let scan = scanGuardSites(targetBytes);
 const guardSites = new Map([...scan.guardSites].map(([g, s]) => [g, { pc: s.pc, fn: subprogramForPc(s.pc).name, funcIndex: s.funcIndex }]));
 const guardOrdinal = scan.ordinals; // 0-based ordinal of each guard within its function, in code order
 console.error(`guard sites: ${[...guardSites].map(([g, s]) => `${g}->${s.fn}@0x${s.pc.toString(16)}`).join(', ')}`);
@@ -272,7 +276,7 @@ for (const [g, s] of guardSites) {
 }
 
 // --- Shadow call stack, built from the hook alone (documents/design.md).
-const shadowStack = new ShadowStack(scan.guardSites);
+let shadowStack = new ShadowStack(scan.guardSites);
 
 /// Feeds the current stack to wasm_dbg_set_stop, exactly as a real host
 /// would: PCs from the engine's stack trace (true call sites, not each
@@ -295,7 +299,7 @@ function setStopFromShadowStack() {
   for (const p of [pcs, idx, wasmIdx, vals]) exp.wasm_dbg_free(p);
 }
 
-const lineOf = (btLine) => Number(btLine.match(/prog\.c:(\d+)/)?.[1]);
+const lineOf = (btLine) => Number(btLine.match(/prog2?\.c:(\d+)/)?.[1]);
 const lineOfText = (text) => progC.split(String.fromCharCode(10)).findIndex((l) => l.includes(text)) + 1;
 const inFn = (btLine, fn) => { const l = lineOf(btLine), [a, b] = sourceSpan(fn); return l >= a && l <= b; };
 
@@ -364,6 +368,104 @@ const exitCode = targetWasi.start(targetInstance);
 if (hookError) { console.error(`hook failed: ${hookError.stack}`); ok = false; }
 check(exitCode === 11, `target ran to completion with exit code ${exitCode} (expected caller(1) == 11)`);
 check(hookFires > 0 && pending.size === 0, `${hookFires} hook firings; ${pending.size} stops never reached`);
+
+// --- Statement granularity: -fsanitize-coverage=trace-loads,trace-stores.
+// A straight-line function has exactly one guard (at entry, before any local is
+// written), so guards alone can never stop "after c is assigned". The
+// per-memory-access hooks have no guard argument, but the engine's stack trace
+// names their call site, and at -O0 nearly every statement touches the frame.
+console.error('--- Fine-grained hooks (trace-pc-guard + trace-loads + trace-stores), straight-line target');
+const prog2C = `int add(int a, int b) {
+  int c = a + b;
+  int d = c * 2;
+  return d - b;
+}
+
+int main(void) {
+  return add(1, 10);
+}
+`;
+const prog2Path = path.join(workDir, 'prog2.c');
+const target2Path = path.join(workDir, 'prog2.wasm');
+await writeFile(prog2Path, prog2C);
+await execFileAsync(wasiSdkClang, ['-O0', '-g', '-fsanitize-coverage=trace-pc-guard,trace-loads,trace-stores',
+  '-Wl,--export=__stack_pointer', '-Wl,--allow-undefined', '-o', target2Path, prog2Path]);
+const target2Bytes = await readFile(target2Path);
+const target2Module = new WebAssembly.Module(target2Bytes);
+subprograms = parseSubprograms((await execFileAsync(llvmDwarfdump, ['--debug-info', target2Path])).stdout);
+scan = scanGuardSites(target2Bytes);
+shadowStack = new ShadowStack(scan.guardSites);
+const addFuncIndex = [...scan.guardSites.values()].find((s) => subprogramForPc(s.pc).name === 'add').funcIndex;
+const addGuards = [...scan.guardSites.values()].filter((s) => s.funcIndex === addFuncIndex).length;
+check(addGuards === 1, `straight-line add() has ${addGuards} guard (expected exactly 1: guards alone cannot stop mid-function)`);
+
+{
+  const p = allocCString('/work/prog2.wasm');
+  const rc = exp.wasm_dbg_create_target(p);
+  exp.wasm_dbg_free(p);
+  if (rc !== 0) throw new Error(`wasm_dbg_create_target(prog2) failed: ${getLastError()}`);
+}
+const line2Of = (text) => prog2C.split(String.fromCharCode(10)).findIndex((l) => l.includes(text)) + 1;
+const lineCache = new Map();
+const lineAtPc = (pc) => {
+  if (!lineCache.has(pc)) lineCache.set(pc, Number(callWithOutBuf(exp.wasm_dbg_resolve_pc, BigInt(pc)).match(/prog2\.c:(\d+)/)?.[1]));
+  return lineCache.get(pc);
+};
+const fineStops = [
+  { line: line2Of('int d = c * 2'), run() {
+    // c was stored by the previous statement; d is not yet written.
+    const c = formatValue(0, 'c');
+    check(/\(int\) c = 11\b/.test(c), `mid-function, after "c = a + b": frame 0 "c" -> "${c}"`);
+  } },
+  { line: line2Of('return d - b'), run() {
+    const d = formatValue(0, 'd');
+    check(/\(int\) d = 22\b/.test(d), `mid-function, after "d = c * 2": frame 0 "d" -> "${d}"`);
+    const c = formatValue(0, 'c');
+    check(/\(int\) c = 11\b/.test(c), `frame 0 "c" -> "${c}"`);
+  } },
+];
+const pending2 = new Set(fineStops);
+let fineHookError = null;
+let fineFires = 0;
+let target2Instance = null;
+targetInstance = null; // read_memory now serves target 2
+const target2Wasi = new WASI({ version: 'preview1', args: ['prog2'], env: {} });
+const fineHook = () => {
+  if (fineHookError) return;
+  try {
+    fineFires++;
+    shadowStack.sync(Number(target2Instance.exports.__stack_pointer.value));
+    const frames = captureWasmFrames(scan.module.codeStart);
+    const line = lineAtPc(frames[0].pc);
+    for (const stop of pending2) {
+      if (line === stop.line && shadowStack.entries.at(-1)?.funcIndex === addFuncIndex) {
+        pending2.delete(stop);
+        console.error(`stop at prog2.c:${line} (pc 0x${frames[0].pc.toString(16)}):`);
+        setStopFromShadowStack();
+        const bt = callWithOutBuf(exp.wasm_dbg_get_backtrace).split('\n');
+        check(lineOf(bt[0]) === stop.line, `frame 0 is exactly on line ${stop.line} (got ${lineOf(bt[0])})`);
+        check(lineOf(bt[1]) === line2Of('return add('), `frame 1 is on the call line ${line2Of('return add(')} (got ${lineOf(bt[1])})`);
+        stop.run();
+      }
+    }
+  } catch (e) { fineHookError = e; }
+};
+const env2 = {
+  __sanitizer_cov_trace_pc_guard_init() {},
+  __sanitizer_cov_pcs_init() {},
+  __sanitizer_cov_trace_pc_guard(guardPtr) {
+    if (fineHookError) return;
+    try { shadowStack.onHook(Number(target2Instance.exports.__stack_pointer.value), guardPtr); }
+    catch (e) { fineHookError = e; }
+  },
+};
+for (const imp of WebAssembly.Module.imports(target2Module))
+  if (imp.module === 'env' && /^__sanitizer_cov_(load|store)\d+$/.test(imp.name)) env2[imp.name] = fineHook;
+targetInstance = target2Instance = new WebAssembly.Instance(target2Module, { ...target2Wasi.getImportObject(), env: env2 });
+const exit2 = target2Wasi.start(target2Instance);
+if (fineHookError) { console.error(`fine hook failed: ${fineHookError.stack}`); ok = false; }
+check(exit2 === 12, `prog2 ran to completion with exit code ${exit2} (expected add(1, 10) == 12)`);
+check(pending2.size === 0, `${fineFires} fine hook firings; ${pending2.size} stops never reached`);
 
 await rm(workDir, { recursive: true, force: true });
 console.error(ok ? 'SMOKETEST PASSED' : 'SMOKETEST FAILED');
