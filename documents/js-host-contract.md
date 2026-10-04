@@ -32,15 +32,15 @@ provide functionality no WASI host does by default:
      slot (`table.set(newIndex, wrapped)`).
   3. Call `instance.exports.__wasi_shim_set_spawn_hook(newIndex)`.
 
-  **Implemented** as a proof of concept in `ai-notes/wasi_spawn_shim.mjs`
-  (`installSpawnHook()`) + `ai-notes/wasi_spawn_worker.mjs`, using Node
+  **Implemented** as a proof of concept in `wasi-tests/wasi_spawn_shim.mjs`
+  (`installSpawnHook()`) + `wasi-tests/wasi_spawn_worker.mjs`, using Node
   `worker_threads` + `Atomics.wait` to block the calling instance
   synchronously while a second wasm instance (in its own Worker) runs the
   child to completion -- resolving, per spawn request, to either the
   *same* wasm module (`cc1`, which lives inside `clang.wasm` itself) or a
   genuinely different one (`wasm-ld`), by resolving `argv[0]` against the
   preopen map (see `resolveGuestPath()` in the shim). Verified end to end
-  by `ai-notes/run_clang_link_smoketest.mjs`: compiles, links, and *runs* a
+  by `wasi-tests/run_clang_link_smoketest.mjs`: compiles, links, and *runs* a
   real "Hello, world!" through this exact path. A real extension should
   follow the same shape with a browser Worker instead: decode the wire
   format documented next to `CurrentSpawnHook` in `Unix/Program.inc`,
@@ -78,8 +78,8 @@ provide functionality no WASI host does by default:
   no wasm-side changes at all -- just run N Workers, each doing its own
   `WebAssembly.instantiate` + `installSpawnHook` + `wasi.start()`, same
   shape as the single-file case just repeated. **Implemented** as a proof
-  of concept in `ai-notes/wasi_driver_worker.mjs` +
-  `ai-notes/run_clang_parallel_smoketest.mjs`: compiling 8 files
+  of concept in `wasi-tests/wasi_driver_worker.mjs` +
+  `wasi-tests/run_clang_parallel_smoketest.mjs`: compiling 8 files
   concurrently this way took ~156ms wall-clock vs. ~89ms for 1 file --
   nowhere near the ~712ms sequential compilation would take, confirming
   real concurrency. This is a *different* mechanism from clang.wasm's own
@@ -96,7 +96,7 @@ provide functionality no WASI host does by default:
   above *and* separately implements the `wasi-threads` ABI: construct a
   shared `WebAssembly.Memory` matching the module's declared min/max
   limits (`WebAssembly.Module.imports()` doesn't expose these -- parse the
-  raw import section by hand, see `ai-notes/wasi_thread_hook.mjs`'s
+  raw import section by hand, see `wasi-tests/wasi_thread_hook.mjs`'s
   `readImportedMemoryLimits()`), supply it as `env.memory` to every
   instance (including the first/main one -- the module no longer owns its
   memory at all), and implement `wasi.thread-spawn(start_arg) -> tid`: on
@@ -108,9 +108,9 @@ provide functionality no WASI host does by default:
   Mutex/condvar/join synchronization needs *no* additional host code at
   all -- it's wasm's own `memory.atomic.wait32`/`notify` instructions
   operating on the shared memory, handled entirely by the engine.
-  **Implemented** in `ai-notes/wasi_thread_hook.mjs` +
-  `ai-notes/wasi_thread_worker.mjs`; verified end to end both standalone
-  (`ai-notes/run_wasi_threads_prototype.mjs`: 4 real pthreads, a
+  **Implemented** in `wasi-tests/wasi_thread_hook.mjs` +
+  `wasi-tests/wasi_thread_worker.mjs`; verified end to end both standalone
+  (`wasi-tests/run_wasi_threads_prototype.mjs`: 4 real pthreads, a
   mutex-protected shared counter, exactly correct after concurrent
   increments) and wired into the real `clang.wasm`/`lld.wasm` build (all
   four smoke tests pass). One real host-side gotcha:
@@ -144,7 +144,7 @@ provide functionality no WASI host does by default:
   program *clang.wasm compiles* can itself use real threads is a
   completely independent question -- inherited, unmodified mainline clang
   WebAssembly driver support, unrelated to whether clang.wasm itself runs
-  threaded. **Verified working**: `ai-notes/run_clang_threaded_output_smoketest.mjs`
+  threaded. **Verified working**: `wasi-tests/run_clang_threaded_output_smoketest.mjs`
   has clang.wasm compile+link a real 4-pthread program
   (`--target=wasm32-wasip1-threads -pthread`, plus explicit
   `-Wl,--import-memory -Wl,--max-memory=` -- not auto-added by `-pthread`,

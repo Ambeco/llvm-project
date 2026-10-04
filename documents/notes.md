@@ -45,7 +45,7 @@ resource dir by hand.
 hard-requires `instance.exports.memory` and throws otherwise -- it does
 not support a module whose memory is *imported*, which every wasi-threads
 module's must be. Worked around with `makeFakeInstance()` (see
-`ai-notes/wasi_thread_hook.mjs`): a plain object duck-typing an `Instance`
+`wasi-tests/wasi_thread_hook.mjs`): a plain object duck-typing an `Instance`
 (node:wasi only ever reads `.exports` off whatever it's given), with
 `memory` added and -- for anything that isn't the main/command instance --
 `_start` removed so `wasi.initialize()` doesn't refuse it. Not yet verified
@@ -129,7 +129,7 @@ Three genuinely separate pieces of work, very different risk profiles:
    LIBXML2/TREESITTER/PROTOCOL_SERVERS=OFF`, `LLVM_ENABLE_PROJECTS=
    "clang;lld;lldb"`, everything else inherited from `build.bat`'s
    toolchain block. Confirmed working end-to-end against the Node
-   reference host (`ai-notes/run_clang_smoketest.mjs build-lldb/bin/
+   reference host (`wasi-tests/run_clang_smoketest.mjs build-lldb/bin/
    lldb.wasm --version` actually prints `lldb version 24.0.0git ...`).
    liblldb now builds STATIC (CMake's own SHARED-not-supported check
    fails outright on `Generic`/wasm32, same fix shape as libclang's
@@ -153,7 +153,7 @@ Three genuinely separate pieces of work, very different risk profiles:
    cause found by instrumenting `Driver.cpp`/`MainLoopPosix::Interrupt`
    with temporary debug prints (removed again after) and confirmed with
    a standalone `pipe()`/`fcntl()`/`write()` repro compiled and run
-   through `ai-notes/run_clang_link_smoketest.mjs`'s pipeline: **`pipe()`
+   through `wasi-tests/run_clang_link_smoketest.mjs`'s pipeline: **`pipe()`
    itself fails outright** (`errno=Not supported`) in this Node/
    wasi-threads environment, and a `write()` to the resulting invalid fd
    fails too. `MainLoopPosix`'s interrupt-pipe mechanism (used to wake a
@@ -172,7 +172,7 @@ Three genuinely separate pieces of work, very different risk profiles:
    itself (out of scope, and `signal_thread` had nothing left to do on
    this target anyway once `RegisterSignal` always fails). Verified:
    `--version`, `--help`, and an unknown-flag error all now exit cleanly
-   under `ai-notes/run_clang_smoketest.mjs`. `pipe()` failing at all on
+   under `wasi-tests/run_clang_smoketest.mjs`. `pipe()` failing at all on
    this environment may be worth its own investigation later if anything
    else in this project ever needs it (nothing does today).
    Binary size is also a real concern:
@@ -544,8 +544,8 @@ way; `documents/remaining_work.md` only tracks what's still open.
   for a JS host to supply, and `lldb_initialize_ProcessWasmMemory` present
   in the plugin-init list.
   **Update (2026-09-07): exercised end-to-end against a real compiled
-  program** via a new smoketest, `ai-notes/run_lldb_wasm_reactor_smoketest.mjs`
-  (Node, following this project's usual `ai-notes/*.mjs` pattern; the
+  program** via a new smoketest, `wasi-tests/run_lldb_wasm_reactor_smoketest.mjs`
+  (Node, following this project's usual `wasi-tests/*.mjs` pattern; the
   target program is compiled fresh each run by the host's own wasi-sdk
   clang, not clang.wasm, since the point is exercising the reactor, not
   this project's own compiler). Found and fixed two real bugs along the
@@ -565,7 +565,7 @@ way; `documents/remaining_work.md` only tracks what's still open.
     `Plugins/Platform/WebAssembly`'s `PlatformWasm`, which represents a
     wasm program as a debug *target*, an unrelated concept.
   - **Confirmed with the fix above, then found, root-caused, and fixed two
-    more issues — both in this project's own `ai-notes/wasi_thread_hook.mjs`
+    more issues — both in this project's own `wasi-tests/wasi_thread_hook.mjs`
     test harness, not in LLDB, LLVM, wasi-threads, or the reactor-module
     entry point itself (see `documents/design.md`'s multithreading note).**
     `Target::SetExecutableModule` → `ModulesDidLoad` →
@@ -600,7 +600,7 @@ way; `documents/remaining_work.md` only tracks what's still open.
        import functions from scratch — a JS function can't cross the
        `workerData` structured-clone boundary, so the worker can't just
        receive the same closures the main instance uses.
-       `ai-notes/lldb_wasm_reactor_dbg_imports.mjs` is the smoketest's own
+       `wasi-tests/lldb_wasm_reactor_dbg_imports.mjs` is the smoketest's own
        (throwing-stub) instance of one. A generalizable extension, also a
        requirement on any *real* multithreaded host for this reactor, not
        just this test harness — worth a line in
@@ -648,4 +648,4 @@ Frame 1 of a backtrace resolved to the wrong CU (`crt1-command.c:43`), and the t
 
 ### Stale memory cache across stops (2026-10-04)
 
-`ProcessWasmMemory::SetStopState` didn't clear `Process::m_memory_cache`, so a second stop re-reading a stack region cached at the first stop showed old values (e.g. `y = 0` instead of 11). Invisible to the synthetic smoketest (static memory); caught by `ai-notes/run_lldb_wasm_reactor_e2e_smoketest.mjs`. This process never resumes, so nothing else invalidates the cache.
+`ProcessWasmMemory::SetStopState` didn't clear `Process::m_memory_cache`, so a second stop re-reading a stack region cached at the first stop showed old values (e.g. `y = 0` instead of 11). Invisible to the synthetic smoketest (static memory); caught by `wasi-tests/run_lldb_wasm_reactor_e2e_smoketest.mjs`. This process never resumes, so nothing else invalidates the cache.

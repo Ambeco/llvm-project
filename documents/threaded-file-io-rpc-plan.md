@@ -77,7 +77,7 @@ and (f) call that exported function to install it. **`documents/js-host-contract
 is the canonical, exact recipe for d/e/f** (precise
 API calls, parameter types, the Node flag needed) -- verified this
 session to still match current source and the current
-`ai-notes/wasi_spawn_shim.mjs`; refer to that doc rather than this
+`wasi-tests/wasi_spawn_shim.mjs`; refer to that doc rather than this
 one if the two ever seem to disagree, and update both if the mechanism
 changes. The point being made here is narrower and doesn't need
 restating there: **this exact same requirement applies to both build
@@ -87,11 +87,11 @@ loudly rather than silently doing nothing.**
 or every real compile (and every combined compile+link invocation) on
 **either** build configuration fails loudly the moment it tries to spawn
 `cc1`. This is orthogonal to, and much smaller than, the real-threading
-hosting `ai-notes/wasi_thread_hook.mjs` implements -- no shared
+hosting `wasi-tests/wasi_thread_hook.mjs` implements -- no shared
 module-wide memory, no `wasi.thread-spawn`, no per-thread Workers running
 the *same* live instance. The reference implementation is
-`ai-notes/wasi_spawn_shim.mjs` (steps d/f) +
-`ai-notes/wasi_spawn_worker.mjs` (step e, the actual per-"process"
+`wasi-tests/wasi_spawn_shim.mjs` (steps d/f) +
+`wasi-tests/wasi_spawn_worker.mjs` (step e, the actual per-"process"
 Worker). `llvm/lib/Support/Unix/Program.inc`'s own commit message
 describes the mechanism directly: *"a host that wants real subprocess
 support can, after instantiation, grow the module's exported
@@ -123,7 +123,7 @@ as does `lld.wasm` run as `wasm-ld` on `.o` files. A compile+link driver
 call is two jobs, so the driver still spawns them and needs the spawn hook;
 run compile and link as separate invocations instead. The cost is giving up
 the process-boundary crash isolation `CLANG_SPAWN_CC1=ON` buys. The threaded
-`build.bat` keeps `ON`. Check with `ai-notes/run_clang_nospawn_smoketest.mjs`.
+`build.bat` keeps `ON`. Check with `wasi-tests/run_clang_nospawn_smoketest.mjs`.
 
 ### Other flags that fail loudly rather than silently doing the wrong thing
 
@@ -136,8 +136,8 @@ clang's crash-reproducer regeneration path (triggered automatically on a
 `cc1` crash, or explicitly via `-fcrash-diagnostics`-family flags) needs
 I/O redirection to capture the reproducer subprocess's output, so a
 smoketest deliberately passes `-fno-crash-diagnostics` to avoid
-exercising it (see `ai-notes/run_clang_threaded_io_smoketest.mjs` and
-`ai-notes/run_clang_tls_repro.mjs`). Extending the spawn-hook wire format
+exercising it (see `wasi-tests/run_clang_threaded_io_smoketest.mjs` and
+`wasi-tests/run_clang_tls_repro.mjs`). Extending the spawn-hook wire format
 to cover these is possible but deliberately deferred -- nothing in a
 normal `-c`/`-o` compile invocation needs them.
 
@@ -191,7 +191,7 @@ the override function preceded both outputs when run under Node's WASI
 host).
 
 **Verified** the same way as the superseded design was (see that
-section for exact methodology): `ai-notes/hello_threads_io.c`'s Case A
+section for exact methodology): `wasi-tests/hello_threads_io.c`'s Case A
 and Case B both produce correct output (58 bytes, matching a no-shim
 baseline) via both host-side file inspection and the program's own
 in-process `fopen`/`fread` check -- full parity with the previous
@@ -334,10 +334,10 @@ the program under test happening to reference the name itself.
 
 ## Background / confirmed problem
 
-`ai-notes/run_clang_threaded_io_smoketest.mjs` confirmed a real gap: our
+`wasi-tests/run_clang_threaded_io_smoketest.mjs` confirmed a real gap: our
 wasi-threads hosting model gives each spawned thread its own independent
 `node:wasi` instance with its own private fd table (see
-`ai-notes/wasi_thread_worker.mjs`). A real pthread program's normal
+`wasi-tests/wasi_thread_worker.mjs`). A real pthread program's normal
 pattern -- main thread opens one fd, shares the plain `int` with worker
 threads, each thread `pwrite()`s using that same fd number -- fails with
 `EBADF`, since the fd number is meaningless in a worker's own table.
@@ -431,7 +431,7 @@ in place, for the reasoning trail.
    which doesn't yet link this shim in (needs step 6). Verified instead
    by compiling `hello_threads_io.c` directly with the wasi-sdk clang
    plus this shim and the link flags above, then running the result
-   through `ai-notes/wasi_thread_hook.mjs`'s harness -- host-side file
+   through `wasi-tests/wasi_thread_hook.mjs`'s harness -- host-side file
    inspection confirms correct, non-corrupted interleaved output for
    Case A. Updating the smoketest script itself to build this way (or
    adding a new one) and wiring it into whatever this repo uses for
@@ -468,7 +468,7 @@ in place, for the reasoning trail.
 
    **Verified against a real, from-scratch rebuild of `clang.wasm`/`lld.wasm`**
    (not just the shim linked in by hand, as every previous verification
-   in this doc was): ran the actual `ai-notes/run_clang_threaded_io_smoketest.mjs`
+   in this doc was): ran the actual `wasi-tests/run_clang_threaded_io_smoketest.mjs`
    (updated to no longer pass `-Wl,--import-memory` by hand, proving the
    driver now supplies it) driving clang.wasm itself to compile
    `hello_threads_io.c` with a plain `--target=wasm32-wasip1-threads

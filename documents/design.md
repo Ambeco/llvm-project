@@ -28,7 +28,7 @@ of `llvm-project`'s real `main`:
   JS host to do anything useful, or reflects a project-specific policy
   choice rather than a universal fix: the loud-failure-on-missing-
   functionality stance for `CrashRecoveryContext`/`Signals.inc`/
-  `Watchdog.inc`/`raw_socket_stream.cpp`, all `ai-notes/` documentation and
+  `Watchdog.inc`/`raw_socket_stream.cpp`, all `wasi-tests/` documentation and
   reference JS host scripts, `build.bat`, and the real spawn-hook
   implementation. This is what actually gets built and tested.
 
@@ -125,7 +125,7 @@ from this branch as redundant; not something to redo.)
   `--export-table`/`--growable-table`; see `documents/notes.md`), write
   its own function into the new slot, and call the exported
   `__wasi_shim_set_spawn_hook()` to install it — entirely optional,
-  entirely post-instantiation. See `ai-notes/wasi_spawn_shim.mjs` for a
+  entirely post-instantiation. See `wasi-tests/wasi_spawn_shim.mjs` for a
   reference host doing exactly this, and `documents/js-host-contract.md`
   for what a real host provides.
 
@@ -179,7 +179,7 @@ being required to provide it just to load the module. This is why the
 mechanism lives on `upstream-fixes`: it needs no host cooperation to exist,
 only to be useful.
 
-The reference host implementation (`ai-notes/wasi_spawn_shim.mjs` +
+The reference host implementation (`wasi-tests/wasi_spawn_shim.mjs` +
 `wasi_spawn_worker.mjs`) spawns each child as a Node `worker_threads`
 Worker, blocking the caller synchronously via `Atomics.wait` (mirroring
 real fork/exec-and-wait semantics) until the child's exit code is
@@ -215,7 +215,7 @@ surface this depends on.
   fully isolated (fresh linear memory) the moment it's instantiated, so
   running N independent Workers, each doing its own instantiate +
   install-spawn-hook + `wasi.start()`, gives real concurrent compilation
-  for free. Implemented in `ai-notes/wasi_driver_worker.mjs`; measured
+  for free. Implemented in `wasi-tests/wasi_driver_worker.mjs`; measured
   genuinely sub-linear scaling (not just "not slower").
 - **In-module threading** (`LLVM_ENABLE_THREADS=ON` — parallelizing work
   *within* a single compile/link, e.g. LLD's parallel section writing, or
@@ -232,13 +232,13 @@ A user's own `-pthread`-targeted program, compiled by our `clang.wasm`, is
 governed entirely by mainline, unmodified upstream Clang/WASM support — it
 doesn't depend on anything this project changed, and was verified
 separately from clang.wasm's own internal threading (see
-`ai-notes/run_clang_threaded_output_smoketest.mjs`). Don't conflate "does
+`wasi-tests/run_clang_threaded_output_smoketest.mjs`). Don't conflate "does
 clang.wasm run threaded" with "do programs clang.wasm compiles support
 threading" — they're independent questions, both now answered yes.
 
 ### Reference JS host is Node, not the real target
 
-Everything under `ai-notes/*.mjs` is a Node-based reference implementation
+Everything under `wasi-tests/*.mjs` is a Node-based reference implementation
 proving the *contract* works end-to-end (real compile, real link, real
 run, real multithreading) — it is explicitly not the real browser host. A
 real implementation needs, at minimum: a real browser `Worker` instead of

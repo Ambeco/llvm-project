@@ -7,7 +7,7 @@
 // cases apart.
 //
 // Usage:
-//   node --experimental-wasm-type-reflection --experimental-wasi-unstable-preview1 ai-notes/run_clang_link_smoketest.mjs [path-to-clang-wasm] [path-to-wasi-sysroot]
+//   node --experimental-wasm-type-reflection --experimental-wasi-unstable-preview1 wasi-tests/run_clang_link_smoketest.mjs [path-to-clang-wasm] [path-to-wasi-sysroot]
 import { writeFile, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { WASI } from 'node:wasi';
 import { tmpdir } from 'node:os';

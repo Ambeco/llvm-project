@@ -24,7 +24,7 @@
 //
 // Usage:
 //   node --experimental-wasm-type-reflection --experimental-wasi-unstable-preview1 \
-//     ai-notes/run_lldb_wasm_reactor_smoketest.mjs [path-to-lldb-wasm-reactor.wasm] [path-to-wasi-sdk-clang]
+//     wasi-tests/run_lldb_wasm_reactor_smoketest.mjs [path-to-lldb-wasm-reactor.wasm] [path-to-wasi-sdk-clang]
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { writeFile, mkdtemp, readFile, rm } from 'node:fs/promises';

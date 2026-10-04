@@ -9,7 +9,7 @@
 // specifically use it" (see ai-notes/wip.md).
 //
 // Usage:
-//   node --experimental-wasi-unstable-preview1 ai-notes/run_wasi_threads_prototype.mjs <path-to-pthread-test.wasm>
+//   node --experimental-wasi-unstable-preview1 wasi-tests/run_wasi_threads_prototype.mjs <path-to-pthread-test.wasm>
 import { WASI } from 'node:wasi';
 import { argv as processArgv } from 'node:process';
 import { readImportedMemoryLimits, makeThreadSpawn, makeFakeInstance, loadModule } from './wasi_thread_hook.mjs';

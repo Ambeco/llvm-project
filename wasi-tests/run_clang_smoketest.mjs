@@ -4,11 +4,11 @@
 // the JS-side Worker executor that real compilation (cc1 invocation) needs.
 //
 // Usage:
-//   node --experimental-wasm-type-reflection --experimental-wasi-unstable-preview1 ai-notes/run_clang_smoketest.mjs <path-to-clang-wasm> [clang args...]
+//   node --experimental-wasm-type-reflection --experimental-wasi-unstable-preview1 wasi-tests/run_clang_smoketest.mjs <path-to-clang-wasm> [clang args...]
 //
 // Examples:
-//   node --experimental-wasm-type-reflection --experimental-wasi-unstable-preview1 ai-notes/run_clang_smoketest.mjs build/bin/clang.wasm --version
-//   node --experimental-wasm-type-reflection --experimental-wasi-unstable-preview1 ai-notes/run_clang_smoketest.mjs build/bin/clang.wasm -c foo.c -o foo.o
+//   node --experimental-wasm-type-reflection --experimental-wasi-unstable-preview1 wasi-tests/run_clang_smoketest.mjs build/bin/clang.wasm --version
+//   node --experimental-wasm-type-reflection --experimental-wasi-unstable-preview1 wasi-tests/run_clang_smoketest.mjs build/bin/clang.wasm -c foo.c -o foo.o
 //
 // The second example is expected to fail loudly with a report_fatal_error
 // from llvm::sys::ExecuteAndWait (see README.md's "JS Framework" section) --

@@ -1,7 +1,7 @@
 // Tests the one thing run_clang_threaded_output_smoketest.mjs deliberately
 // didn't: a *user's own compiled program* doing concurrent file I/O across
 // its own threads. Two cases, compiled into one C program
-// (ai-notes/../ scratch file written below):
+// (wasi-tests/../ scratch file written below):
 //
 //   Case A: main thread opens ONE fd, shares it (a plain int) with worker
 //   threads -- completely normal in a real process, since all pthreads
@@ -18,7 +18,7 @@
 // assume an answer -- see ai-notes/wip.md for the result.
 //
 // Usage:
-//   node --experimental-wasm-type-reflection --experimental-wasi-unstable-preview1 ai-notes/run_clang_threaded_io_smoketest.mjs [path-to-clang-wasm] [path-to-wasi-sysroot]
+//   node --experimental-wasm-type-reflection --experimental-wasi-unstable-preview1 wasi-tests/run_clang_threaded_io_smoketest.mjs [path-to-clang-wasm] [path-to-wasi-sysroot]
 import { writeFile, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { WASI } from 'node:wasi';
 import { tmpdir } from 'node:os';

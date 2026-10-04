@@ -10,7 +10,7 @@
 // The threaded build's resource dir is used because it is the only one that
 // has both libclang_rt.builtins.a variants and libclang_rt.wasi_threaded_io.
 //
-// Usage: node ai-notes/package_release.mjs <tag> [out-dir] [path-to-wasi-sysroot]
+// Usage: node wasi-tests/package_release.mjs <tag> [out-dir] [path-to-wasi-sysroot]
 import { createHash } from 'node:crypto';
 import { cp, mkdir, readdir, readFile, rm, stat, writeFile, copyFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -20,7 +20,7 @@ import { findResourceDir } from './wasi_spawn_shim.mjs';
 const repoRoot = path.resolve(import.meta.dirname, '..');
 const tag = argv[2];
 if (!tag)
-  throw new Error('usage: node ai-notes/package_release.mjs <tag> [out-dir] [wasi-sysroot]\n' +
+  throw new Error('usage: node wasi-tests/package_release.mjs <tag> [out-dir] [wasi-sysroot]\n' +
     'did you forget the release tag (e.g. v0.1.0)? Binaries and sysroot are tagged together.');
 const outDir = path.resolve(argv[3] ?? path.join(repoRoot, 'release', tag));
 const sysrootSrc = argv[4] ??

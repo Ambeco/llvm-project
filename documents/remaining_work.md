@@ -126,7 +126,7 @@ need to cover this path either.
 
 ## Exports needed by the vscwClang extension (requested 2026-10-03)
 
-**Status:** done and verified except lldb files. `ai-notes/package_release.mjs <tag>` produced a tree incl. lldb.wasm-family files (see MANIFEST for sizes) and `run_clang_nospawn_smoketest.mjs <release-dir>` printed SMOKETEST PASSED against it. Open: the extension's host needs working `readdir` (or must pass libc++ `-isystem` paths itself).
+**Status:** done and verified except lldb files. `wasi-tests/package_release.mjs <tag>` produced a tree incl. lldb.wasm-family files (see MANIFEST for sizes) and `run_clang_nospawn_smoketest.mjs <release-dir>` printed SMOKETEST PASSED against it. Open: the extension's host needs working `readdir` (or must pass libc++ `-isystem` paths itself).
 
 The `vsclang` extension (`C:\Users\mooin\Dropbox\Code\Github\vsclang\vsclang`) ships these as Marketplace tooling extensions and runs them on VS Code's `wasm-wasi-core`, which cannot install our spawn hook (it never exposes the `WebAssembly.Instance`). So its V1 needs a no-spawn, single-process, single-thread toolchain. Every item below blocks that project's Milestone 1.
 
@@ -152,7 +152,7 @@ The `vsclang` extension (`C:\Users\mooin\Dropbox\Code\Github\vsclang\vsclang`) s
 
 ## The real browser-based JS host (separate project, not started)
 
-Everything under `ai-notes/*.mjs` is a Node reference implementation
+Everything under `wasi-tests/*.mjs` is a Node reference implementation
 proving the contract works — real compile, link, run, threading — not the
 real target. A real implementation, likely in its own separate repo (not
 a branch here), needs:
@@ -189,7 +189,7 @@ GDB-remote/CDP approaches. Open implementation items:
   `tools/lldb-wasm-reactor/WasmDebugReactor.cpp` (the exported
   `wasm_dbg_init`/`create_target`/`set_stop`/`resolve_pc`/`format_value`/
   `alloc`/`free`/`get_last_error` API, plus imported
-  `read_memory`/`write_memory`). `ai-notes/run_lldb_wasm_reactor_smoketest.mjs`
+  `read_memory`/`write_memory`). `wasi-tests/run_lldb_wasm_reactor_smoketest.mjs`
   exercises all of it against a real wasi-sdk-compiled program: real
   multithreaded DWARF symbol preloading, target creation,
   `resolve_pc` → `"add.c:1"`, and `format_value("c")` → `"(int) c = 3"` via
@@ -242,7 +242,7 @@ GDB-remote/CDP approaches. Open implementation items:
   reads `instance.exports.__stack_pointer.value` itself and passes it in
   as the one `eWasmTagLocal` entry, no compiler/instrumentation change
   needed. Verified end-to-end (2026-10-04) by
-  `ai-notes/run_lldb_wasm_reactor_e2e_smoketest.mjs`: a real
+  `wasi-tests/run_lldb_wasm_reactor_e2e_smoketest.mjs`: a real
   `-O0 -g -fsanitize-coverage=trace-pc-guard -Wl,--export=__stack_pointer`
   program runs, and inside the live hook the real `__stack_pointer` value
   and an SP-comparison shadow stack feed `wasm_dbg_set_stop`; backtrace and

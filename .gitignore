@@ -91,5 +91,5 @@ pythonenv*
 # automodapi puts generated documentation files here.
 /lldb/docs/python_api/
 
-# Packaged release trees (ai-notes/package_release.mjs)
+# Packaged release trees (wasi-tests/package_release.mjs)
 /release/

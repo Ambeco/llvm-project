@@ -4,7 +4,7 @@
 // separate instantiations, exactly how the vsclang extension runs them.
 //
 // Usage:
-//   node --experimental-wasi-unstable-preview1 ai-notes/run_clang_nospawn_smoketest.mjs [release-dir]
+//   node --experimental-wasi-unstable-preview1 wasi-tests/run_clang_nospawn_smoketest.mjs [release-dir]
 // release-dir is the output of package_release.mjs (default: assembled in
 // place from build-single-threaded/ and the wasi-sdk sysroot).
 import { writeFile, mkdtemp, readFile, readdir } from 'node:fs/promises';

@@ -81,7 +81,7 @@ export type MountPointDescriptor =
 ```
 
 This is the equivalent of our own `preopens` map in the Node reference
-host (`ai-notes/wasi_spawn_shim.mjs` et al.) -- each descriptor says what
+host (`wasi-tests/wasi_spawn_shim.mjs` et al.) -- each descriptor says what
 shows up at a given path inside the wasm process's view of the
 filesystem. `workspaceFolder` mounts the open VS Code workspace at
 `/workspace` (or `/workspaces/<name>` for multi-root); `vscodeFileSystem`
@@ -144,8 +144,8 @@ support]"):
 
 - **`createProcess`'s second overload takes `memory: WebAssembly.MemoryDescriptor | WebAssembly.Memory`** as a first-class, explicit parameter -- this is the real, public, intended way to run a threads-enabled module, not an internal detail.
 - `MemoryDescriptor.is()` (a runtime type guard in `api.ts`) validates `{ initial: number, maximum?: number, shared?: boolean }` -- standard `WebAssembly.MemoryDescriptor` shape, nothing project-specific.
-- `src/web/process.ts` detects whether a module needs this via `doesImportMemory()`, which just checks `WebAssembly.Module.imports()` for a `memory`-kind import named `"memory"` -- **it does not parse the module's actual min/max/shared limits from the import section**. That parsing is on the caller (see `ai-notes/wasi_thread_hook.mjs`'s `readImportedMemoryLimits()` in this repo -- reuse that logic, or hardcode known-correct values for a specific build).
-- `src/web/threadWorker.ts` receives a `memory` object via a `StartThreadMessage` (postMessage from whichever worker called `wasi.thread-spawn`), builds an import object with `env: { memory }`, instantiates the module, and calls `instance.exports.wasi_thread_start` directly -- **structurally identical** to this repo's own `ai-notes/wasi_thread_worker.mjs` prototype (worker-per-thread, shared `WebAssembly.Memory`, direct `wasi_thread_start` call rather than a normal `_start`).
+- `src/web/process.ts` detects whether a module needs this via `doesImportMemory()`, which just checks `WebAssembly.Module.imports()` for a `memory`-kind import named `"memory"` -- **it does not parse the module's actual min/max/shared limits from the import section**. That parsing is on the caller (see `wasi-tests/wasi_thread_hook.mjs`'s `readImportedMemoryLimits()` in this repo -- reuse that logic, or hardcode known-correct values for a specific build).
+- `src/web/threadWorker.ts` receives a `memory` object via a `StartThreadMessage` (postMessage from whichever worker called `wasi.thread-spawn`), builds an import object with `env: { memory }`, instantiates the module, and calls `instance.exports.wasi_thread_start` directly -- **structurally identical** to this repo's own `wasi-tests/wasi_thread_worker.mjs` prototype (worker-per-thread, shared `WebAssembly.Memory`, direct `wasi_thread_start` call rather than a normal `_start`).
 - Their internal WASI-host abstraction does `host.initialize(memory ?? instance)` -- a fallback that explicitly handles both an *imported* memory (thread) and a module's own *exported* memory (a normal, non-threaded process). This is exactly the case `node:wasi` in plain Node does **not** handle (confirmed empirically -- `wasi.start()` throws `"instance.exports.memory property must be a WebAssembly.Memory object"` for an imported-memory module). `wasm-wasi-core` was apparently built with this case in mind from the start, which is a good sign for actually integrating our `experiment-wasi-threads` work here.
 
 **Practical implication for us**: when actually wiring `clang.wasm`
@@ -226,7 +226,7 @@ overload -- the host won't infer it for us.
 
 | This repo (Node reference host) | `wasm-wasi-core` equivalent |
 |---|---|
-| `ai-notes/wasi_spawn_shim.mjs`'s `installSpawnHook` (our own optional table-hook design) | No equivalent -- this is our own `Program.inc` extension point, not a WASI-standard thing. Would still need to be wired up by hand inside a `wasm-wasi-core`-hosted process, same shape as the Node prototype. |
+| `wasi-tests/wasi_spawn_shim.mjs`'s `installSpawnHook` (our own optional table-hook design) | No equivalent -- this is our own `Program.inc` extension point, not a WASI-standard thing. Would still need to be wired up by hand inside a `wasm-wasi-core`-hosted process, same shape as the Node prototype. |
 | `preopens` map | `MountPointDescriptor[]` (`createRootFileSystem`/`ProcessOptions.mountPoints`) |
 | `wasi_spawn_worker.mjs` (Worker-per-spawned-process) | `Wasm.createProcess()` itself -- the host already does this internally |
 | `wasi_thread_hook.mjs`'s `readImportedMemoryLimits()` | Still needed -- the host's `doesImportMemory()` doesn't parse limits, only presence |

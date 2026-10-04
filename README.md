@@ -48,8 +48,8 @@ with `--experimental-wasm-type-reflection --experimental-wasi-unstable-preview1`
 - `lldb-wasm-reactor.wasm` is a reactor-style library (`wasm_dbg_*` exports), not a command; see
   `documents/design.md`'s debugging section. Known issue: the smoke test's frame-1 backtrace
   value formatting still fails.
-- `ai-notes/*.mjs` is a Node.js reference host and the project's smoke tests — the closest thing to a
-  runnable example today, e.g. `node --experimental-wasm-type-reflection --experimental-wasi-unstable-preview1 ai-notes/run_clang_link_smoketest.mjs`.
+- `wasi-tests/*.mjs` is a Node.js reference host and the project's smoke tests — the closest thing to a
+  runnable example today, e.g. `node --experimental-wasm-type-reflection --experimental-wasi-unstable-preview1 wasi-tests/run_clang_link_smoketest.mjs`.
 
 ## 3. Design overview
 
@@ -60,7 +60,7 @@ See `documents/design.md` for the full design: the `upstream-fixes`/`wasm-wasi` 
 - `build.bat` — the primary build: `clang.wasm`/`lld.wasm` against `wasm32-unknown-wasip1-threads`, with real `LLVM_ENABLE_THREADS=ON` multithreading. Compiled *output* programs still default to plain, non-threaded `wasm32-wasip1` unless the user passes `-pthread` themselves.
 - `build-lldb.bat` — builds `lldb.wasm` and `lldb-wasm-reactor.wasm` (`ninja`/`cmake --build` targets `lldb` and `lldb-wasm-reactor`) in `build-lldb/`.
 - `build-single-threaded.bat` — an alternate build targeting plain `wasm32-unknown-wasip1`: no threading, no multiprocessing, no custom JavaScript needed to instantiate and run it (beyond what any real compile needs regardless of threading — see `documents/js-host-contract.md`).
-- Everything under `ai-notes/*.mjs` is a Node.js reference host proving the resulting binaries actually work end-to-end (instantiate, compile, link, run, thread) — not the real browser target, but a regression check today.
+- Everything under `wasi-tests/*.mjs` is a Node.js reference host proving the resulting binaries actually work end-to-end (instantiate, compile, link, run, thread) — not the real browser target, but a regression check today.
 - `documents/js-host-contract.md` is the canonical spec for what any JavaScript host (Node reference or real browser extension) must provide to run these binaries.
 
 ## 4. Remaining work

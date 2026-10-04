@@ -51,7 +51,7 @@ alongside the existing `--experimental-wasi-unstable-preview1`).
 Previous milestone (2026-09-03, still true): full compile-and-link "Hello
 World" works end to end, and everything is rebased onto llvm-project's
 real, current `main` (LLVM 24.0.0git) instead of the stale `release/23.x`
-snapshot this whole effort started from. `ai-notes/run_clang_link_smoketest.mjs`
+snapshot this whole effort started from. `wasi-tests/run_clang_link_smoketest.mjs`
 compiles a `#include <stdio.h>` "Hello, world!" translation unit, links it
 with a real spawned `wasm-ld` into a genuine `hello.wasm`, then actually
 *runs* that binary and gets the correct output. See "Next milestone" for
@@ -103,7 +103,7 @@ repo):
   commits (loud-failure-on-missing-functionality for
   `CrashRecoveryContext`/`Signals.inc`/`Watchdog.inc`/`raw_socket_stream.cpp`),
   all README/ai-notes documentation, and the spawn-hook JS reference host
-  (`ai-notes/wasi_spawn_shim.mjs` + `wasi_spawn_worker.mjs`) that actually
+  (`wasi-tests/wasi_spawn_shim.mjs` + `wasi_spawn_worker.mjs`) that actually
   installs a real implementation into `upstream-fixes`'s extension point.
   This is what `build.bat` and the smoke tests actually run
   against.
@@ -162,20 +162,20 @@ build; don't `rm -rf build` unless a `CMakeCache.txt` entry looks stale (see
 
 **Verified working:**
 - `build/bin/clang.wasm --version` under `node:wasi`
-  (`ai-notes/run_clang_smoketest.mjs`) — driver logic runs end-to-end,
+  (`wasi-tests/run_clang_smoketest.mjs`) — driver logic runs end-to-end,
   correct output. Doesn't invoke `cc1`.
-- `ai-notes/run_clang_compile_smoketest.mjs` — real `-c hello.c -o hello.o`
+- `wasi-tests/run_clang_compile_smoketest.mjs` — real `-c hello.c -o hello.o`
   compile, spawning a real `cc1` child via the
-  `env.__wasi_shim_spawn_sync` import (`ai-notes/wasi_spawn_shim.mjs` +
-  `ai-notes/wasi_spawn_worker.mjs`, Node `worker_threads` + `Atomics.wait`).
+  `env.__wasi_shim_spawn_sync` import (`wasi-tests/wasi_spawn_shim.mjs` +
+  `wasi-tests/wasi_spawn_worker.mjs`, Node `worker_threads` + `Atomics.wait`).
   **PASSED.**
-- `ai-notes/run_clang_link_smoketest.mjs` — the same, minus `-c`: compiles,
+- `wasi-tests/run_clang_link_smoketest.mjs` — the same, minus `-c`: compiles,
   spawns a genuinely different wasm binary (`wasm-ld`, not `clang.wasm`)
   for the link step, produces a real linked `hello.wasm`, then runs it and
   checks the output. **PASSED.**
 
 (All three: `node --experimental-wasi-unstable-preview1
-ai-notes/<script>.mjs`.)
+wasi-tests/<script>.mjs`.)
 
 ### Getting lld/linking working (three build.bat additions, in order hit)
 
@@ -216,7 +216,7 @@ not through this suffix machinery, so they come out *without* the
 
 ### Guest-path resolution in the spawn shim (needed for a *different* spawned binary)
 
-The Node reference host (`ai-notes/wasi_spawn_shim.mjs`) originally always
+The Node reference host (`wasi-tests/wasi_spawn_shim.mjs`) originally always
 re-instantiated the *parent's own* wasm module for every spawn request.
 That happened to be correct for `cc1` (it lives inside `clang.wasm` itself;
 `argv[0]` comes through as `""`, since `getMainExecutable()` returns `""`
@@ -299,8 +299,8 @@ the source-level detail on each):
     (see `Unix/Program.inc` for the exact wire format); `Wait()` just
     returns what `Execute()` already computed, since the synchronous
     import call means there's no separate "spawned but not yet waited on"
-    state. Verified via the Node reference host in `ai-notes/wasi_spawn_shim.mjs`
-    + `ai-notes/wasi_spawn_worker.mjs` (`worker_threads` + `Atomics.wait` to
+    state. Verified via the Node reference host in `wasi-tests/wasi_spawn_shim.mjs`
+    + `wasi-tests/wasi_spawn_worker.mjs` (`worker_threads` + `Atomics.wait` to
     block synchronously — a real extension does the same shape with a
     browser Worker). One bug caught and fixed along the way: `Wait()`
     initially treated a non-null `ProcStat` pointer as "stats were
@@ -370,7 +370,7 @@ could cheaply recover any performance:
   memory) the moment it's instantiated. Just run N Workers, each doing its
   own instantiate + `installSpawnHook` + `wasi.start()` -- literally the
   existing single-file shape, repeated. Implemented in
-  `ai-notes/wasi_driver_worker.mjs` + `ai-notes/run_clang_parallel_smoketest.mjs`,
+  `wasi-tests/wasi_driver_worker.mjs` + `wasi-tests/run_clang_parallel_smoketest.mjs`,
   and it measurably works: 1 file ~89ms, 4 files ~131ms, 8 files ~156ms --
   nowhere near the ~356ms/~712ms linear scaling sequential compilation
   would show (also visible directly in the interleaved per-file `cc1`
@@ -400,7 +400,7 @@ on `wasm-wasi` directly. Findings, most important first:
   object to a Worker via `postMessage`/`workerData`, wasm's own
   `memory.atomic.wait32`/`notify` instructions for real mutex/join
   synchronization) is standard, spec'd, well-supported JS/wasm API --
-  nothing here needed a workaround. **Proof**: `ai-notes/run_wasi_threads_prototype.mjs`
+  nothing here needed a workaround. **Proof**: `wasi-tests/run_wasi_threads_prototype.mjs`
   runs a standalone 4-pthread mutex-counter test end to end via Node
   `worker_threads` and gets the exactly-correct answer (400000, not a
   race-corrupted number), which only happens if both real concurrent
@@ -430,7 +430,7 @@ on `wasm-wasi` directly. Findings, most important first:
   by construction can only have an *imported* one (so multiple instances
   can share it). Worked around by hand-rolling the small subset of
   `wasi_snapshot_preview1` actually needed
-  (`ai-notes/wasi_thread_syscalls.mjs`) instead of using `node:wasi` at
+  (`wasi-tests/wasi_thread_syscalls.mjs`) instead of using `node:wasi` at
   all for anything touching a threaded module. **A real host (e.g.
   `wasm-wasi-core` in VS Code for Web) needs to be checked for the same
   limitation** before assuming it'll "just work" there -- don't assume
@@ -491,7 +491,7 @@ on `wasm-wasi` directly. Findings, most important first:
   runs threaded -- it's inherited, unmodified mainline clang WebAssembly
   driver support that predates and doesn't depend on anything this session
   changed. Untested until the user asked the question directly; now
-  verified: `ai-notes/run_clang_threaded_output_smoketest.mjs` has
+  verified: `wasi-tests/run_clang_threaded_output_smoketest.mjs` has
   clang.wasm compile+link a real 4-pthread mutex-counter program, then
   runs the *output* through the same thread-hosting machinery.
   **PASSED** (`counter = 400000`, all 4 threads spawn/join correctly, and
@@ -579,7 +579,7 @@ entirely on the JS side, and moves outside this repo:
     session) -- worth a closer read later, but not urgent: our
     spawn-shim approach already works end-to-end (compile *and* link, see
     STATUS at top), so this would be a simplification, not a blocker.
-- The Node scripts in `ai-notes/` are a reference implementation proving
+- The Node scripts in `wasi-tests/` are a reference implementation proving
   the *contract* works (see README's "JS Framework" section), not the real
   thing. A real browser-based host needs to do differently: a real Worker
   instead of `worker_threads`, catching a *terminated* Worker and
@@ -596,7 +596,7 @@ entirely on the JS side, and moves outside this repo:
   `LLVM_ENABLE_PROJECTS`). Worth its own investigation pass later, not
   bolted onto this milestone.
 
-The Node scripts in `ai-notes/` are a reference implementation proving the
+The Node scripts in `wasi-tests/` are a reference implementation proving the
 *contract* works, not the real thing — see README's "JS Framework" section
 for what a real browser-based host needs to do differently (Worker instead
 of `worker_threads`, catching a *terminated* Worker and rendering its own
