@@ -215,11 +215,15 @@ export class ShadowStack {
 /// True wasm call stack from the engine's stack trace, innermost first: { funcIndex, pc }.
 ///
 /// `codeStart` is parseModule()'s codeStart. The innermost frame is the hook
-/// call site (the JS import frame itself has no wasm-function marker). Costs
-/// microseconds, so call it only when delivering a stop.
-export function captureWasmFrames(codeStart) {
+/// call site (the JS import frame itself has no wasm-function marker).
+/// `onlyInnermost` bounds the engine's stack walk to the innermost wasm frame,
+/// which assumes the hook function calls this directly (the walk counts JS
+/// frames, so a deeper wrapper would hide the wasm frame). A full walk costs
+/// tens of microseconds, the bounded one a few.
+export function captureWasmFrames(codeStart, onlyInnermost = false) {
+  const maxFrames = onlyInnermost ? 3 : Infinity; // this function, the hook, the wasm frame
   const saved = Error.stackTraceLimit;
-  Error.stackTraceLimit = Infinity;
+  Error.stackTraceLimit = maxFrames;
   const stack = new Error().stack;
   Error.stackTraceLimit = saved;
   return [...stack.matchAll(CALL_SITE)].map((m) => ({ funcIndex: Number(m[1]), pc: parseInt(m[2], 16) - codeStart }));
