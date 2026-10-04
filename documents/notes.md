@@ -649,3 +649,7 @@ Frame 1 of a backtrace resolved to the wrong CU (`crt1-command.c:43`), and the t
 ### Stale memory cache across stops (2026-10-04)
 
 `ProcessWasmMemory::SetStopState` didn't clear `Process::m_memory_cache`, so a second stop re-reading a stack region cached at the first stop showed old values (e.g. `y = 0` instead of 11). Invisible to the synthetic smoketest (static memory); caught by `wasi-tests/run_lldb_wasm_reactor_e2e_smoketest.mjs`. This process never resumes, so nothing else invalidates the cache.
+
+### Hook granularity measurements (2026-10-04)
+
+`wasi-tests/measure_hook_granularity.mjs`, Node 24/V8, -O0, fib(27)+sum(3M), 4.27M guard firings, uninstrumented 9.9 ms. Overhead vs uninstrumented: `trace-pc-guard` + empty hook 3.9x (7 ns/hook); guard + real shadow-stack hook 30x (66 ns/hook, mostly the `__stack_pointer.value` read); `inline-8bit-counters` 1.05x; `trace-pc` empty hook 4.4x; guard+loads+stores empty hooks 31x (37.8M firings, 8 ns each); a 1-frame stack capture per load/store hook ~10 us (full stack ~29 us). Granularity on the 22-line benchmark: 12 stoppable lines, 16 is_stmt rows; guards reach 7 of the 12 lines, loads/stores reach 11 (the remaining line never fires a hook; not investigated). V8's `new Error().stack` gives true call-site PCs for every wasm frame (`wasm-function[N]:0x<file offset>`; DWARF address = offset - code section payload start). `-fpass-plugin` is accepted but wasi-sdk's `clang.exe` has no PE exports, so a plugin pass can't link on Windows; a custom per-row pass was not built.

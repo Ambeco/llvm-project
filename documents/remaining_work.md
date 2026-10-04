@@ -219,18 +219,18 @@ GDB-remote/CDP approaches. Open implementation items:
     unusual codegen shape. Deprioritized (2026-09-09): low user impact
     even if hit (one variable fails to display, not a crash).
 
-- **Hook granularity** (the one open design choice in the instrumentation
-  scheme itself): `-fsanitize-coverage=trace-pc-guard`/`inline-8bit-counters`
-  vs. a custom LLVM pass emitting one hook per DWARF line-table row —
-  whichever turns out to give clean line-stepping without excessive
-  overhead. Not yet measured.
-  Measured so far (e2e smoketest): `trace-pc-guard` fires per *basic
-  block*, not per statement (a straight-line function gets one guard at
-  entry, so locals aren't yet written when it fires); `pc-table` is empty on
-  wasm and the hook gets only a guard address, so the host needs a static
-  guard->PC map (scan the linked binary for `i32.const <guard>; call <hook>`);
-  and a caller frame's PC is its last hook firing, not its call site, so
-  outer-frame lines are approximate (variables still resolve).
+- **Hook granularity: implement the armed-block filter** (decision and
+  measurements are in `documents/design.md` / `notes.md`). The e2e test
+  stops mid-function using `trace-pc-guard` + `trace-loads,trace-stores` +
+  the engine stack trace, but its fine hook captures a stack on *every*
+  access (~10 us each). The real host should capture only while stepping or
+  when the current block holds an armed line, and return immediately
+  otherwise (~8 ns); not built or measured. Also open: the real hook's
+  `Atomics.wait` pause cost; checking `captureWasmFrames()`'s stack-trace
+  regex against SpiderMonkey and JavaScriptCore (only V8 is verified);
+  some lines (1 of 12 in the benchmark) can't be stopped on with this scheme (a
+  custom per-row LLVM pass in this fork's tree would, at the cost of
+  rebuilding `clang.wasm`; deferred as a separate piece of work).
 - **The "Debug" build needs `-Wl,--export=__stack_pointer` on its link
   line.** Resolved a real gap here without any compiler change: see
   `documents/design.md`'s frame-base note. Verified directly (`wasi-sdk`

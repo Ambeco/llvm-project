@@ -18,9 +18,9 @@
 //    gets begin==end), and trace-pc-guard passes only a guard address, never
 //    a PC. So the guard->PC map is derived statically from the linked binary
 //    (each `i32.const <guard>; call <hook>` pair in `llvm-objdump -d`).
-//  - Hooks fire per basic block, not per statement, and a caller frame's PC
-//    is its *last hook firing*, not its call site: outer frames resolve to
-//    the line of the caller's most recent block entry, not the call line.
+//  - Hooks fire per basic block, not per statement, and a hook-derived
+//    caller PC is its last block entry, not its call site, so outer-frame PCs
+//    come from the engine's stack trace instead (sancov_host.mjs).
 //
 // Usage:
 //   node --experimental-wasm-type-reflection --experimental-wasi-unstable-preview1 \

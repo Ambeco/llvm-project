@@ -360,6 +360,35 @@ Web extension (see the CDP/GDB-remote unreachability finding under
   for outer frames is currently blocked by an unrelated, newly found bug
   in symbol resolution for the third-and-later function in a wasm module
   — see `documents/remaining_work.md`.
+- **Hook granularity and call-site PCs: `trace-pc-guard` is the default
+  hook; per-access hooks and the engine's stack trace add statement
+  granularity and true call sites on demand.** `trace-pc-guard` fires once
+  per basic block (a straight-line function gets one guard, at entry,
+  before its locals are written), passes only a guard address (the
+  `pc-table` is empty on wasm), and costs ~7 ns per firing with an empty
+  hook. Three host-side pieces, all in `wasi-tests/sancov_host.mjs` (no
+  `node:` imports, no `llvm-objdump`, so it loads in the real extension
+  host): `scanGuardSites()` decodes the wasm bytes for the static
+  guard -> DWARF-PC map; `ShadowStack` rebuilds the call stack from
+  `__stack_pointer`; `captureWasmFrames()` reads the *true* wasm call
+  stack, with a call-site PC per frame, from the engine's own stack trace
+  (`wasm-function[N]:0x<module offset>`; subtract the code section start for a
+  DWARF address). Capturing only when a stop is delivered gives outer
+  frames their real call line instead of each caller's last block entry.
+  For stops *within* a block, add `-fsanitize-coverage=trace-loads,trace-stores`:
+  at `-O0` almost every statement touches the frame, and each access calls a
+  hook whose own call site, identified via the stack trace, names the line.
+  That stack capture costs ~10 us per hook, versus ~8 ns for a hook that
+  returns immediately, so a host should capture only while stepping or while
+  the current guard's block contains an armed breakpoint/step-target line,
+  and return at once everywhere else (this filter is the design, not yet
+  measured). A line with no instrumented memory access gets no per-access hook
+  (11 of the benchmark's 12 lines were reached), so it is not stoppable this way.
+  Exercised by `wasi-tests/run_lldb_wasm_reactor_e2e_smoketest.mjs` (stops
+  mid-function in a straight-line `add()`, exact frame-0/frame-1 lines) and
+  measured by `wasi-tests/measure_hook_granularity.mjs`. The stack-trace text
+  is engine-specific: V8 and SpiderMonkey both contain `wasm-function[N]:0x...`
+  (the regex accepts both); JavaScriptCore is unverified.
 - **Build shape: keep the existing full `lldb.wasm` static-link config,
   add a thin C wrapper (`lldb/tools/lldb-wasm-reactor`) and export it as a
   WASI reactor module** (`-mexec-model=reactor`: no `main`, entered via
@@ -542,3 +571,26 @@ from `upstream-fixes` yet.
   built-in DWARF DevTools support as an immediate fallback debugging path,
   since that targets a real top-level tab's own DevTools, not a nested
   iframe.
+
+### Hook granularity: a custom LLVM pass emitting one hook per DWARF line-table row
+- Pros: exact statement granularity with an explicit hook id (no stack capture); roughly 2.3x the guard
+  count on the benchmark (16 is_stmt rows vs 7 guards; an estimate, the pass was not built).
+- Cons: `-fpass-plugin` is accepted by wasi-sdk's `clang.exe` but that binary exports no symbols
+  (empty PE export directory), so a plugin cannot link against LLVM on Windows; the only route is
+  a pass in this fork's tree, shipped by rebuilding `clang.wasm`, i.e. a larger delta from mainline.
+  Trace-loads/stores plus the stack trace reach the same lines with no compiler change.
+
+### Hook granularity: `-fsanitize-coverage=trace-pc`
+- Pros: simplest flag; one call per block, ~8 ns with an empty hook.
+- Cons: the hook receives no argument at all (on other targets it uses the return address, which wasm
+  lacks), so every firing needs a stack capture to say where it is: strictly worse than
+  `trace-pc-guard`, which carries the guard id for free.
+
+### Hook granularity: `-fsanitize-coverage=inline-8bit-counters`
+- Pros: no call at all; ~5% overhead on the benchmark.
+- Cons: counters cannot pause execution, so it cannot drive stepping. Useful only as an overhead floor.
+
+### Hook granularity: capture the engine stack trace on every hook
+- Pros: true PCs and the whole backtrace with no guard map or shadow stack, and leaf functions are visible.
+- Cons: ~10 us (innermost frame only) to ~29 us (full stack) per hook, about 1000x an empty hook, and
+  the stack carries no `__stack_pointer`, so frame bases still need the shadow stack.
