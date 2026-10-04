@@ -126,7 +126,7 @@ need to cover this path either.
 
 ## Exports needed by the vscwClang extension (requested 2026-10-03)
 
-**Status:** single-process `clang.wasm`/`lld.wasm` done and verified (`run_clang_nospawn_smoketest.mjs`: SMOKETEST PASSED on a stock node:wasi host). Still to do: build the threaded `build.bat` (needed by the package script), run `ai-notes/package_release.mjs <tag>`, re-run the smoke test against the packaged tree, report the tree size.
+**Status:** done and verified except lldb files. `ai-notes/package_release.mjs <tag>` produced a 518 MiB tree (bin 347, sysroot 182, resource 9; lldb files skipped, build-lldb not built here) and `run_clang_nospawn_smoketest.mjs <release-dir>` printed SMOKETEST PASSED against it. Open: re-run the package script with `build-lldb.bat` output present; the extension's host needs working `readdir` (or must pass libc++ `-isystem` paths itself).
 
 The `vsclang` extension (`C:\Users\mooin\Dropbox\Code\Github\vsclang\vsclang`) ships these as Marketplace tooling extensions and runs them on VS Code's `wasm-wasi-core`, which cannot install our spawn hook (it never exposes the `WebAssembly.Instance`). So its V1 needs a no-spawn, single-process, single-thread toolchain. Every item below blocks that project's Milestone 1.
 
