@@ -645,3 +645,7 @@ Frame 1 of a backtrace resolved to the wrong CU (`crt1-command.c:43`), and the t
 - `ObjectFileWasm::SetLoadAddress` loads the code section at its *module file offset* (0x85 in the test module), so `ResolveLoadAddress` treats PCs as module offsets, but the reactor API's PCs are DWARF code addresses. PCs below 0x85 only worked via the reactor's `ResolveFileAddress` fallback; PCs at/above it were shifted by 0x85. Fixed in `ProcessWasmMemory::CompleteAttach` (load code section at its file address). If a host ever feeds V8-style module offsets instead, this convention must change.
 - The smoketest hardcoded local 2 as every frame's frame-base local; it differs per function (`add` 2, `caller` 1, `main` 0). The test now reads it per function from `DW_AT_frame_base`.
 - Harness gotcha: running the reactor smoketest without `--experimental-wasm-type-reflection` makes every worker die in `installSpawnHook` (`WebAssembly.Function` missing) and `create_target` hangs forever with flat CPU. `wasi_thread_worker.mjs` now also writes the failure synchronously to stderr.
+
+### Stale memory cache across stops (2026-10-04)
+
+`ProcessWasmMemory::SetStopState` didn't clear `Process::m_memory_cache`, so a second stop re-reading a stack region cached at the first stop showed old values (e.g. `y = 0` instead of 11). Invisible to the synthetic smoketest (static memory); caught by `ai-notes/run_lldb_wasm_reactor_e2e_smoketest.mjs`. This process never resumes, so nothing else invalidates the cache.

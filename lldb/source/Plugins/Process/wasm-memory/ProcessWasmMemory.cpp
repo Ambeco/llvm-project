@@ -166,6 +166,9 @@ size_t ProcessWasmMemory::DoWriteMemory(lldb::addr_t addr, const void *buf,
 
 void ProcessWasmMemory::SetStopState(std::vector<WasmFrame> frames) {
   m_frames = std::move(frames);
+  // The program ran between stops, so every previously cached memory line is
+  // stale; nothing else invalidates it since this process never resumes.
+  m_memory_cache.Clear();
 }
 
 lldb::addr_t ProcessWasmMemory::GetFramePC(size_t frame_idx) const {

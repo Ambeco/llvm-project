@@ -224,6 +224,13 @@ GDB-remote/CDP approaches. Open implementation items:
   vs. a custom LLVM pass emitting one hook per DWARF line-table row —
   whichever turns out to give clean line-stepping without excessive
   overhead. Not yet measured.
+  Measured so far (e2e smoketest): `trace-pc-guard` fires per *basic
+  block*, not per statement (a straight-line function gets one guard at
+  entry, so locals aren't yet written when it fires); `pc-table` is empty on
+  wasm and the hook gets only a guard address, so the host needs a static
+  guard->PC map (scan the linked binary for `i32.const <guard>; call <hook>`);
+  and a caller frame's PC is its last hook firing, not its call site, so
+  outer-frame lines are approximate (variables still resolve).
 - **The "Debug" build needs `-Wl,--export=__stack_pointer` on its link
   line.** Resolved a real gap here without any compiler change: see
   `documents/design.md`'s frame-base note. Verified directly (`wasi-sdk`
@@ -234,12 +241,15 @@ GDB-remote/CDP approaches. Open implementation items:
   `local_indices`/`local_values` parameters exist for this: the JS host
   reads `instance.exports.__stack_pointer.value` itself and passes it in
   as the one `eWasmTagLocal` entry, no compiler/instrumentation change
-  needed. `ai-notes/run_lldb_wasm_reactor_smoketest.mjs` now links its
-  target with the flag and asserts the global export (passes), but it
-  still feeds synthetic frame bases; the real consumer is the JS
-  host/extension's Debug-build link line (not in this repo), which must
-  pass the flag and feed the global's value to `wasm_dbg_set_stop`, and
-  has not been exercised end-to-end.
+  needed. Verified end-to-end (2026-10-04) by
+  `ai-notes/run_lldb_wasm_reactor_e2e_smoketest.mjs`: a real
+  `-O0 -g -fsanitize-coverage=trace-pc-guard -Wl,--export=__stack_pointer`
+  program runs, and inside the live hook the real `__stack_pointer` value
+  and an SP-comparison shadow stack feed `wasm_dbg_set_stop`; backtrace and
+  `format_value` (ints, struct, caller-frame locals, post-return pop) match
+  what the program computed. The real consumer (the JS host/extension's
+  Debug-build link line, not in this repo) must still pass the flag and
+  replicate that hook logic.
 - **Instrumentation overhead**: not yet measured in practice.
 - Binary size (`lldb.wasm` is ~96 MiB today) is a known, deliberately
   deferred concern — see "Alternatives considered" in `documents/design.md`
