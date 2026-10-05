@@ -27,6 +27,8 @@ const sysrootSrc = argv[4] ??
   'C:/Users/mooin/AppData/Local/wasi-sdk/wasi-sdk-34.0-x86_64-windows/share/wasi-sysroot';
 
 const SLICES = ['wasm32-wasip1', 'wasm32-wasip1-threads'];
+// The host supplies one shared memory to every Worker instance, so it must be imported.
+const THREAD_LINK = ['--import-memory', '--shared-memory', '--max-memory=2147483648'];
 const TRIPLE = { 'wasm32-wasip1': 'wasm32-unknown-wasip1', 'wasm32-wasip1-threads': 'wasm32-unknown-wasip1-threads' };
 
 async function exists(p) {
@@ -94,9 +96,10 @@ const compileFlags = {
   compile: Object.fromEntries(SLICES.map((slice) => [slice, [
     `--target=${TRIPLE[slice]}`, '--sysroot=${SYSROOT}', '-resource-dir=${RESOURCE}',
     `-isystem\${SYSROOT}/include/${slice}/noeh/c++/v1`, '-isystem${SYSROOT}/include/c++/v1',
-    '-fno-exceptions']])),
+    '-fno-exceptions', ...(slice.endsWith('-threads') ? ['-pthread'] : [])]])),
   link: Object.fromEntries(SLICES.map((slice) => [slice, [
     `\${SYSROOT}/lib/${slice}/crt1.o`, `-L\${SYSROOT}/lib/${slice}/noeh`, `-L\${SYSROOT}/lib/${slice}`,
+    ...(slice.endsWith('-threads') ? THREAD_LINK : []),
     '-lc++', '-lc++abi', '-lc', `\${RESOURCE}/lib/${TRIPLE[slice]}/libclang_rt.builtins.a`]])),
 };
 await writeFile(path.join(outDir, 'compile-flags.json'), JSON.stringify(compileFlags, null, 2) + '\n');
