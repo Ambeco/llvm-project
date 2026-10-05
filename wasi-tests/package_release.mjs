@@ -27,6 +27,7 @@ const sysrootSrc = argv[4] ??
   'C:/Users/mooin/AppData/Local/wasi-sdk/wasi-sdk-34.0-x86_64-windows/share/wasi-sysroot';
 
 const SLICES = ['wasm32-wasip1', 'wasm32-wasip1-threads'];
+const TRIPLE = { 'wasm32-wasip1': 'wasm32-unknown-wasip1', 'wasm32-wasip1-threads': 'wasm32-unknown-wasip1-threads' };
 
 async function exists(p) {
   try { await stat(p); return true; } catch { return false; }
@@ -83,6 +84,22 @@ await cp(path.join(sysrootSrc, 'include', 'c++'), path.join(outDir, 'sysroot', '
 const resSrc = await findResourceDir(path.join(repoRoot, 'build', 'lib', 'clang'));
 const ver = path.basename(resSrc);
 await cp(resSrc, path.join(outDir, 'resource', 'lib', 'clang', ver), { recursive: true });
+
+// Flags a host passes so clang.wasm needn't list directories (readdir) to find
+// libc++ headers. ${SYSROOT}/${RESOURCE} are the guest mount paths. Exceptions
+// are off because only the noeh libc++ slice is exercised by the smoke test.
+const compileFlags = {
+  note: 'Substitute ${SYSROOT} and ${RESOURCE} with the guest paths the release sysroot/ and resource/lib/clang/<ver> dirs are mounted at. Required on hosts whose preopens cannot readdir.',
+  clangResourceVersion: ver,
+  compile: Object.fromEntries(SLICES.map((slice) => [slice, [
+    `--target=${TRIPLE[slice]}`, '--sysroot=${SYSROOT}', '-resource-dir=${RESOURCE}',
+    `-isystem\${SYSROOT}/include/${slice}/noeh/c++/v1`, '-isystem${SYSROOT}/include/c++/v1',
+    '-fno-exceptions']])),
+  link: Object.fromEntries(SLICES.map((slice) => [slice, [
+    `\${SYSROOT}/lib/${slice}/crt1.o`, `-L\${SYSROOT}/lib/${slice}/noeh`, `-L\${SYSROOT}/lib/${slice}`,
+    '-lc++', '-lc++abi', '-lc', `\${RESOURCE}/lib/${TRIPLE[slice]}/libclang_rt.builtins.a`]])),
+};
+await writeFile(path.join(outDir, 'compile-flags.json'), JSON.stringify(compileFlags, null, 2) + '\n');
 
 const lines = [`tag ${tag}`, `clang-resource-version ${ver}`];
 let total = 0;

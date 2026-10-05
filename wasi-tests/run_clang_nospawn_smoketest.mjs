@@ -46,15 +46,21 @@ async function runTool(wasmFile, args) {
 
 const sys = '/sysroot/lib/wasm32-wasip1';
 // node:wasi on Windows can't list directories (opendir -> ENOSYS), so the
-// driver's libc++ include-path auto-detection finds nothing here; pass the
-// paths explicitly. A host with working readdir doesn't need these.
-const inc = '/sysroot/include/wasm32-wasip1/noeh/c++/v1';
-const rc = await runTool('clang.wasm', ['clang++', '--target=wasm32-wasip1', '--sysroot=/sysroot',
-  '-resource-dir=/resource', `-isystem${inc}`, '-isystem/sysroot/include/c++/v1', '-fno-exceptions', '-fno-crash-diagnostics', '-c', '/work/hello.cpp', '-o', '/work/hello.o']);
+// driver's libc++ include-path auto-detection finds nothing here. With a
+// release dir we use the packaged compile-flags.json (the documented flags the
+// extension must pass); without one, the equivalent hardcoded set.
+const subst = (a) => a.replaceAll('${SYSROOT}', '/sysroot').replaceAll('${RESOURCE}', '/resource');
+const flags = releaseDir ? JSON.parse(await readFile(path.join(releaseDir, 'compile-flags.json'), 'utf8')) : null;
+const compileFlags = flags ? flags.compile['wasm32-wasip1'].map(subst)
+  : ['--target=wasm32-wasip1', '--sysroot=/sysroot', '-resource-dir=/resource',
+    '-isystem/sysroot/include/wasm32-wasip1/noeh/c++/v1', '-isystem/sysroot/include/c++/v1', '-fno-exceptions'];
+const linkFlags = flags ? flags.link['wasm32-wasip1'].map(subst)
+  : [`${sys}/crt1.o`, `-L${sys}/noeh`, `-L${sys}`, '-lc++', '-lc++abi', '-lc',
+    '/resource/lib/wasm32-unknown-wasip1/libclang_rt.builtins.a'];
+const rc = await runTool('clang.wasm', ['clang++', ...compileFlags, '-fno-crash-diagnostics', '-c', '/work/hello.cpp', '-o', '/work/hello.o']);
 let ok = rc === 0;
 if (ok) {
-  const lrc = await runTool('lld.wasm', ['wasm-ld', `${sys}/crt1.o`, '/work/hello.o', `-L${sys}/noeh`, `-L${sys}`,
-    '-lc++', '-lc++abi', '-lc', `/resource/lib/wasm32-unknown-wasip1/libclang_rt.builtins.a`, '-o', '/work/hello.wasm']);
+  const lrc = await runTool('lld.wasm', ['wasm-ld', ...linkFlags.slice(0, 1), '/work/hello.o', ...linkFlags.slice(1), '-o', '/work/hello.wasm']);
   ok = lrc === 0;
 }
 if (ok) {
