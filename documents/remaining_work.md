@@ -362,59 +362,35 @@ here beyond this record.
   orthogonal to `-ldl` (which only satisfies clang.wasm's own build-time
   symbol references — plugin loading is already off via
   `LLVM_ENABLE_PLUGINS=OFF`).
-- **`clangd` / static analysis support** (the user's actual interest, not
-  sanitizers — see above): scoped 2026-09-06 by reading
-  `clang-tools-extra/clangd`'s actual source, not just guessing from its
-  reputation as "harder." The earlier "persistent background indexing
-  threads are a different shape of problem" framing turns out to be less
-  scary than it sounds:
-  - `TUScheduler`/`BackgroundIndex` use plain `std::thread` worker pools
-    (`ThreadPool.runAsync(...)`, `index/Background.cpp`) — no different
-    in kind from the real wasi-threads support this project already has
-    working.
-  - Background indexing's on-disk cache
-    (`index/BackgroundIndexStorage.cpp`'s `storeShard`/`loadShard`) opens,
-    writes, and closes each shard file within one function call on the
-    worker thread that owns that task — the same "independent per-thread
-    open()" pattern already proven safe elsewhere in this project (see
-    the resolved ThinLTO item above), not the shared-fd pattern that
-    needed `wasi_threaded_io`.
-  - clangd doesn't spawn `cc1` as a subprocess to parse a TU the way the
-    driver does — it calls into Clang's own libraries in-process
-    (`ParsedAST`/`Sema` directly), so the existing `CLANG_SPAWN_CC1`
-    multi-instance spawn-hook machinery mostly isn't even in the
-    critical path here.
-  - No native OS-level directory-watching dependency
-    (`inotify`/`ReadDirectoryChangesW`/etc.) exists in clangd itself —
-    workspace file-change notification is the LSP *client*'s job
-    (`didChangeWatchedFiles`), which a browser host already does its own
-    way. One less WASI gap to worry about.
-  - `llvm::sys::SetInterruptFunction` (Ctrl-C handling,
-    `tool/ClangdMain.cpp`) degrades the same way this fork already made
-    all Unix signal registration degrade: a silent no-op, consistent with
-    `documents/design.md`'s existing `Unix/Signals.inc` handling, not a
-    new gap.
-  - The one real optional-feature gap: `--query-driver` (asking a *real*
-    system compiler for its default include paths, `CompileCommands.cpp`)
-    spawns a subprocess via `llvm::sys::ExecuteAndWait` — works only if a
-    JS host installs the spawn hook, same as any other subprocess spawn
-    in this project; harmless to leave unsupported since this project
-    only ever has one compiler (itself).
-  - **Actual remaining work, roughly in order:** (1) enable
-    `clang-tools-extra` in `LLVM_ENABLE_PROJECTS` and see what fails to
-    configure/compile for `wasm32-unknown-wasip1[-threads]` — untried,
-    likely surfaces its own set of small WASI gaps the way clang/lld did;
-    (2) binary size is a real open question — clangd statically linking
-    every clang-tidy check (`CLANGD_TIDY_CHECKS=ON` by default) onto an
-    already-large `clang.wasm` could be a lot to ship to a browser;
-    start with `-DCLANGD_TIDY_CHECKS=OFF` and grow from there if size
-    allows; (3) design how the JS host talks to it — clangd's LSP
-    transport is JSON-RPC over stdin/stdout, which needs the same kind of
-    host-side plumbing `documents/js-host-contract.md` already specifies
-    for a normal compile, but as a long-lived bidirectional stream rather
-    than a one-shot invocation — worth its own addition to that doc once
-    started. Not yet attempted; a real next investigation/build pass, not
-    just documentation.
+- **clangd, V1 (single-threaded) follow-ups.** `build-single-threaded.bat` now
+  builds `clangd.wasm` (`CLANGD_ALLOW_NO_THREADS=ON`), run as
+  `clangd -sync -background-index=false`; `wasi-tests/run_clangd_smoketest.mjs`
+  passes (initialize, diagnostics, hover, definition). Still to do:
+  - Test with real `#include`s (libc++/sysroot preopens, compile flags from
+    `compile-flags.json`) and a `compile_commands.json`; completion, rename,
+    formatting; measure memory and latency on a realistic file.
+  - Host contract: clangd needs a writable `/tmp` preopen (preamble PCHs are
+    temp files) and a long-lived bidirectional stdin/stdout stream; add both
+    to `documents/js-host-contract.md`. Node's stdin-from-a-file harness used
+    by the smoke test is not a real streaming host.
+  - Binary size: 57MB at `CLANGD_TIDY_CHECKS=OFF`; try wasm-opt/`-Oz`/strip.
+  - Add a `release/` entry for `clangd.wasm`.
+  - Upstream-able patches made so far: `set_thread_priority` stub in
+    `llvm/lib/Support/Threading.cpp`; `BroadcastThread` and
+    `abortAfterTimeout` inert without `LLVM_ENABLE_THREADS`; loud error for
+    `-background-index` without threads.
+- **clangd, V1.5 background indexing without threads (design pending, coordinate
+  with vscwClang).** clangd's background index is driven by the compilation
+  database, not an API we can feed, so batching inside one instance is not
+  possible. Preferred: a second `clangd.wasm`/`clangd-indexer` instance in a
+  separate Worker, run by the host on small file batches at idle time, writing
+  index shards to a shared preopen; the UI instance loads them via
+  `--index-file`/the shard dir. Open: how the UI instance picks up new shards
+  without a restart, and shard format compatibility. Fallback: dynamic
+  open-file index only.
+- **clangd, V2:** threaded build with real background indexing (`-j N`).
+- **clangd, V3:** static analysis / clang-tidy checks (`CLANGD_TIDY_CHECKS=ON`),
+  gated on binary-size budget.
 - Subprocess I/O redirection, timeouts, polling, and detached-process
   support in `Unix/Program.inc` — currently fail loudly rather than
   silently no-op'ing. Nothing in a normal compile/link needs these yet;

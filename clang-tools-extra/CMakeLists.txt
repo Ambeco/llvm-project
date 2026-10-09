@@ -39,9 +39,11 @@ if( CLANG_TOOLS_EXTRA_INCLUDE_DOCS )
   add_subdirectory(docs)
 endif()
 
-# clangd has its own CMake tree. It requires threads.
+# clangd has its own CMake tree. It requires threads, except that "clangd -sync"
+# runs everything on the calling thread (used for single-threaded WASI builds).
+option(CLANGD_ALLOW_NO_THREADS "Build clangd even if LLVM_ENABLE_THREADS is OFF (only usable with -sync)" OFF)
 CMAKE_DEPENDENT_OPTION(CLANG_ENABLE_CLANGD "Build clangd language server" ON
-                       "LLVM_ENABLE_THREADS" OFF)
+                       "LLVM_ENABLE_THREADS OR CLANGD_ALLOW_NO_THREADS" OFF)
 if (CLANG_ENABLE_CLANGD)
   add_subdirectory(clangd)
 endif()

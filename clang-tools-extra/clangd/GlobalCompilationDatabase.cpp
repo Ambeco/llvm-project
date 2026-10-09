@@ -25,6 +25,7 @@
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/TargetParser/Host.h"
@@ -533,10 +534,19 @@ class DirectoryBasedGlobalCompilationDatabase::BroadcastThread {
   void process(const CDBLookupResult &T);
 
 public:
+  // Without LLVM_ENABLE_THREADS no thread is started and broadcasts are dropped;
+  // their only consumer is background indexing, which needs threads too.
   BroadcastThread(DirectoryBasedGlobalCompilationDatabase &Parent)
-      : Parent(Parent), Thread([this] { run(); }) {}
+      : Parent(Parent) {
+#if LLVM_ENABLE_THREADS
+    Thread = std::thread([this] { run(); });
+#endif
+  }
 
   void enqueue(CDBLookupResult Lookup) {
+#if !LLVM_ENABLE_THREADS
+    return;
+#endif
     {
       assert(!Lookup.PI.SourceRoot.empty());
       std::lock_guard<std::mutex> Lock(Mu);
@@ -561,7 +571,8 @@ public:
       ShouldStop.store(true, std::memory_order_release);
     }
     CV.notify_all();
-    Thread.join();
+    if (Thread.joinable())
+      Thread.join();
   }
 };
 

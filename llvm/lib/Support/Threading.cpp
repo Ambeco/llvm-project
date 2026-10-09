@@ -40,6 +40,10 @@ void llvm::get_thread_name(SmallVectorImpl<char> &Name) { Name.clear(); }
 
 llvm::BitVector llvm::get_thread_affinity_mask() { return {}; }
 
+llvm::SetThreadPriorityResult llvm::set_thread_priority(ThreadPriority) {
+  return SetThreadPriorityResult::FAILURE;
+}
+
 unsigned llvm::ThreadPoolStrategy::compute_thread_count() const {
   // When threads are disabled, ensure clients will loop at least once.
   return 1;

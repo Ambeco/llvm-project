@@ -8,6 +8,7 @@
 
 #include "support/Shutdown.h"
 
+#include "llvm/Config/llvm-config.h"
 #include <atomic>
 #include <cstdlib>
 #include <thread>
@@ -16,11 +17,13 @@ namespace clang {
 namespace clangd {
 
 void abortAfterTimeout(std::chrono::seconds Timeout) {
+#if LLVM_ENABLE_THREADS
   // This is more portable than sys::WatchDog, and yields a stack trace.
   std::thread([Timeout] {
     std::this_thread::sleep_for(Timeout);
     std::abort();
   }).detach();
+#endif // Without threads there is nothing to run the watchdog on.
 }
 
 static std::atomic<bool> ShutdownRequested = {false};

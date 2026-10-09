@@ -34,6 +34,7 @@
 #include "clang/Format/Format.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/InitLLVM.h"
@@ -828,6 +829,15 @@ clangd accepts flags on the commandline, and in the CLANGD_FLAGS environment var
                     "specify -sync?";
     return 1;
   }
+
+#if !LLVM_ENABLE_THREADS
+  if (EnableBackgroundIndex) {
+    llvm::errs() << "Background indexing needs threads, but this clangd was "
+                    "built with LLVM_ENABLE_THREADS=OFF. Did you mean to pass "
+                    "-background-index=false (and -sync)?\n";
+    return 1;
+  }
+#endif
 
   if (Sync) {
     if (WorkerThreadsCount.getNumOccurrences())
