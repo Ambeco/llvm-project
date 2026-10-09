@@ -366,9 +366,12 @@ here beyond this record.
   builds `clangd.wasm` (`CLANGD_ALLOW_NO_THREADS=ON`), run as
   `clangd -sync -background-index=false`; `wasi-tests/run_clangd_smoketest.mjs`
   passes (initialize, diagnostics, hover, definition). Still to do:
-  - Test with real `#include`s (libc++/sysroot preopens, compile flags from
-    `compile-flags.json`) and a `compile_commands.json`; completion, rename,
-    formatting; measure memory and latency on a realistic file.
+  - `wasi-tests/run_clangd_tests.mjs` (56 LSP feature tests over
+    `wasi-tests/clangd_harness.mjs`) covers diagnostics, completion, hover,
+    navigation, rename, formatting, inlay hints, config files and sweeps with
+    real libc++ includes. Still untested: `.clangd` fragments beyond Add/Suppress,
+    `compile_commands.json` changes mid-session, header/PCH-heavy projects, and
+    memory/latency on a realistic file.
   - Host contract: clangd needs a writable `/tmp` preopen (preamble PCHs are
     temp files) and a long-lived bidirectional stdin/stdout stream; add both
     to `documents/js-host-contract.md`. Node's stdin-from-a-file harness used
@@ -399,6 +402,15 @@ here beyond this record.
     `$/clangd/indexFile` API over `BackgroundIndex::index` (persists shards,
     incremental), or `clangd-indexer` (whole project, loaded via `--index-file`
     after a restart; `DefaultThreadPool` is single-threaded without threads).
+- **Artifact size reduction (nice to have, not critical).** Look for easy wins on
+  `clang.wasm` (~114MB), `lld.wasm`, `clangd.wasm` (~57MB), `lldb.wasm` and the
+  release tree: `wasm-opt -Oz` / `--strip-debug` / name-section stripping,
+  `-Wl,--gc-sections` and `--strip-all` on the link, `-Oz` instead of
+  `MinSizeRel`'s `-Os`, trimming `LLVM_TARGETS_TO_BUILD` and unused clang
+  components (e.g. `CLANG_ENABLE_STATIC_ANALYZER`, ARCMT already off), sharing
+  code between the tools if the host ever supports dynamic linking, and
+  compressing for distribution (gzip/brotli ratios to report). Measure each
+  against the smoke tests before adopting.
 - **clangd, V2:** threaded build with real background indexing (`-j N`); this
   makes the sweep and the fallbacks above moot.
 - **clangd, V3:** static analysis / clang-tidy checks (`CLANGD_TIDY_CHECKS=ON`),
