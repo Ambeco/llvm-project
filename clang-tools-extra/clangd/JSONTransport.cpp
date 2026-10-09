@@ -276,9 +276,18 @@ bool JSONTransport::readStandardMessage(std::string &JSON) {
   JSON.resize(ContentLength);
   for (size_t Pos = 0, Read; Pos < ContentLength; Pos += Read) {
     // Handle EINTR which is sent when a debugger attaches on some platforms.
+#ifdef __wasi__
+    // Node's WASI fd_read loses bytes when a large fread gets a short read
+    // from a pipe (the rest lands in stdio's own buffer, not the destination),
+    // so go through the stdio buffer a byte at a time instead.
+    Read = 0;
+    for (int C; Pos + Read < ContentLength && (C = getc_unlocked(In)) != EOF;)
+      JSON[Pos + Read++] = static_cast<char>(C);
+#else
     Read = retryAfterSignalUnlessShutdown(0, [&]{
       return std::fread(&JSON[Pos], 1, ContentLength - Pos, In);
     });
+#endif
     if (Read == 0) {
       elog("Input was aborted. Read only {0} bytes of expected {1}.", Pos,
            ContentLength);
@@ -287,7 +296,6 @@ bool JSONTransport::readStandardMessage(std::string &JSON) {
     InMirror << llvm::StringRef(&JSON[Pos], Read);
     clearerr(In); // If we're done, the error was transient. If we're not done,
                   // either it was transient or we'll see it again on retry.
-    Pos += Read;
   }
   return true;
 }

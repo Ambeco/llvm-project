@@ -362,26 +362,33 @@ here beyond this record.
   orthogonal to `-ldl` (which only satisfies clang.wasm's own build-time
   symbol references — plugin loading is already off via
   `LLVM_ENABLE_PLUGINS=OFF`).
-- **clangd, V1 (single-threaded) follow-ups.** `build-single-threaded.bat` now
-  builds `clangd.wasm` (`CLANGD_ALLOW_NO_THREADS=ON`), run as
-  `clangd -sync -background-index=false`; `wasi-tests/run_clangd_smoketest.mjs`
-  passes (initialize, diagnostics, hover, definition). Still to do:
-  - `wasi-tests/run_clangd_tests.mjs` (56 LSP feature tests over
-    `wasi-tests/clangd_harness.mjs`) covers diagnostics, completion, hover,
-    navigation, rename, formatting, inlay hints, config files and sweeps with
-    real libc++ includes. Still untested: `.clangd` fragments beyond Add/Suppress,
-    `compile_commands.json` changes mid-session, header/PCH-heavy projects, and
-    memory/latency on a realistic file.
-  - Host contract: clangd needs a writable `/tmp` preopen (preamble PCHs are
-    temp files) and a long-lived bidirectional stdin/stdout stream; add both
-    to `documents/js-host-contract.md`. Node's stdin-from-a-file harness used
-    by the smoke test is not a real streaming host.
-  - Binary size: 57MB at `CLANGD_TIDY_CHECKS=OFF`; try wasm-opt/`-Oz`/strip.
-  - Add a `release/` entry for `clangd.wasm`.
-  - Upstream-able patches made so far: `set_thread_priority` stub in
-    `llvm/lib/Support/Threading.cpp`; `BroadcastThread` and
-    `abortAfterTimeout` inert without `LLVM_ENABLE_THREADS`; loud error for
-    `-background-index` without threads.
+- **clangd, V1 (single-threaded) follow-ups.** `build-single-threaded.bat` builds
+  `clangd.wasm` (`CLANGD_ALLOW_NO_THREADS=ON`), run as
+  `clangd -sync -background-index=false`. Tests: `wasi-tests/run_clangd_tests.mjs`
+  (file-fed sessions over `clangd_harness.mjs`: diagnostics, completion, hover,
+  navigation, rename, formatting, inlay hints, config, sweeps, C, wasm targets),
+  `run_clangd_stream_tests.mjs` (real pipes via `clangd_stream_harness.mjs`:
+  split frames, pipelining, call/type hierarchy, applyEdit, mid-session
+  config/flag/header changes, stdin EOF), `run_clangd_sweep_smoketest.mjs`. The
+  host contract is in `documents/js-host-contract.md`. Still to do:
+  - Untested: ObjC/ObjC++, modules, multi-root workspaces, `-pch`/`-include`
+    flags, very large headers or deep template code, long-running sessions
+    (hours; memory growth), and `Index.External` config.
+  - Include-path completion returns nothing under `node:wasi` on Windows
+    (suspected directory-listing gap); recheck on the real host.
+  - Recheck on the real host (VS Code wasm-wasi-core): the stdin short-read
+    quirk, `/tmp` preopen, and `-use-dirty-headers` (recommended on).
+  - Sweep cost is ~1.5 s per file with `<vector><string><map>`; V1 does not
+    care, but measure before V2.
+  - Binary size: 57MB at `CLANGD_TIDY_CHECKS=OFF`; see the size item below.
+  - Add a `release/` entry for `clangd.wasm` (and its `compile-flags.json`
+    consumers) when the binaries are next published.
+  - Upstream-able generic fixes made: `set_thread_priority` stub in
+    `llvm/lib/Support/Threading.cpp` (declared, never defined without threads);
+    `JSONTransport` body-read loop advanced `Pos` twice per partial read;
+    `runAsync` (std::async) now deferred without threads, `BroadcastThread` and
+    `abortAfterTimeout` inert; `-background-index` without threads is a clear
+    error. WASI-specific: `getc_unlocked` body read in `JSONTransport.cpp`.
 - **clangd, V1: project-wide index via a "sweep" (plugin side).** Single-threaded
   clangd can't run its background indexer, but `wasi-tests/run_clangd_sweep_smoketest.mjs`
   shows that `didOpen` then `didClose` of a file leaves its symbols in the

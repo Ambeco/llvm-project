@@ -158,3 +158,48 @@ provide functionality no WASI host does by default:
   does no file I/O at all, so it sidestepped the question. Fixed via
   `compiler-rt/lib/wasi_threaded_io`, linked automatically by the driver
   into every `-pthread` WASI-threads output binary.
+
+## clangd.wasm (single-threaded build)
+
+`build-single-threaded/bin/clangd.wasm` is a plain WASI command (no
+imports beyond `wasi_snapshot_preview1`, no threads, no spawn hook). Run it as
+`clangd -sync -background-index=false` plus the arguments below; verified by
+`wasi-tests/run_clangd_tests.mjs` (file-fed sessions) and
+`wasi-tests/run_clangd_stream_tests.mjs` (real pipes).
+
+- **Transport:** LSP JSON-RPC over fd 0 / fd 1, `Content-Length` framing. The
+  host must keep both open for the whole session (a long-lived stream, unlike
+  a one-shot compile). Closing stdin ends clangd (exit code 1 unless
+  `shutdown` + `exit` came first). Server-to-client requests such as
+  `workspace/applyEdit` must be answered.
+- **Preopens:** the workspace (any path; project files are addressed by the
+  `file://` URIs the client sends), the sysroot and clang resource dir
+  (read-only is fine), and a **writable `/tmp`** -- preamble PCHs are temp
+  files, and without it every preamble build fails with "Could not create
+  temporary file for PCH". Pass the resource dir explicitly
+  (`--resource-dir=...` or `-resource-dir=` in the compile flags);
+  auto-detection fails and logs an error.
+- **Compile flags:** from `compile_commands.json` (`-compile-commands-dir=`),
+  or injected by the client via `workspace/didChangeConfiguration` with
+  `compilationDatabaseChanges` (no file needed; this is the intended
+  vscwClang path). Use the flags in `compile-flags.json` (explicit libc++
+  `-isystem`s; `node:wasi` on Windows cannot list directories, so include-path
+  auto-detection finds nothing).
+- **Reloads:** clangd re-stats `compile_commands.json` at most every 5 s
+  (`RevalidateAfter`); `didChangeWatchedFiles` does not bypass that. Edited
+  headers on disk are picked up on the next `didChange` of a file that
+  includes them. By default headers are read from disk, not from unsaved
+  editor buffers; pass `-use-dirty-headers` to use open buffers.
+- **No background index:** `-background-index` is a startup error in this
+  build. Project-wide symbols come from the dynamic index of files the client
+  has opened, and `didOpen` followed by `didClose` leaves a file's symbols in
+  it (the "sweep"; ~1.5 s per file with a few std headers). Nothing persists.
+- **Include-path completion** (`#include "ut|`) returned nothing under
+  `node:wasi` on Windows, probably the same missing directory listing; recheck
+  on the real host.
+- **Stdin quirk:** Node's `node:wasi` `fd_read` on a Windows pipe corrupts a
+  large buffered `fread` when the pipe delivers a short read (the bytes land in
+  stdio's buffer, not the destination). clangd's transport reads message
+  bodies with `getc_unlocked` under `__wasi__` to avoid it; a host with a
+  sound `fd_read` is unaffected either way.
+

@@ -386,6 +386,189 @@ test('stress: many rapid edits end in the latest state', async () => {
   check((diagsFor(s, 'a.cpp') ?? ['x']).length === 0, `final diagnostics should be clean: ${JSON.stringify(diagsFor(s, 'a.cpp'))}`);
 });
 
+// ---- batch 2: language features, paths, overlays, index-backed completion ----
+test('overlay: headers come from disk by default, from unsaved buffers with -use-dirty-headers', async () => {
+  const src = '#include "api.h"\nint main() { return from_unsaved_buffer(); }\n';
+  const run = (args) => session({
+    files: { 'a.cpp': src, 'api.h': '// disk version has no declaration\n' },
+    compile: [{ file: 'a.cpp', flags: cppFlags }], args,
+    steps: [open('api.h', 'int from_unsaved_buffer();\n'), open('a.cpp', src)],
+  });
+  const byDefault = await run([]), dirty = await run(['-use-dirty-headers']);
+  check(errorsOf(diagsFor(byDefault, 'a.cpp')).length === 1, 'default should read the header from disk');
+  check(errorsOf(diagsFor(dirty, 'a.cpp')).length === 0, JSON.stringify(diagsFor(dirty, 'a.cpp')));
+});
+test('paths: spaces and non-ASCII in file names', async () => {
+  for (const name of ['my file.cpp', 'café.cpp']) {
+    const s = await one(name, 'int main() { return nope; }\n', []);
+    check(errorsOf(diagsFor(s, name)).length === 1, `${name}: ${JSON.stringify(diagsFor(s, name))}`);
+  }
+});
+test('paths: relative include from a nested directory + definition into it', async () => {
+  const src = '#include "../inc/deep.h"\nint main() { return deep_fn(); }\n';
+  const s = await one('src/deep/a.cpp', src, [req('d', 'textDocument/definition', td('src/deep/a.cpp', { position: at(src, 'deep_fn', 1) }))], { files: { 'src/inc/deep.h': 'inline int deep_fn() { return 7; }\n' } });
+  check(errorsOf(diagsFor(s, 'src/deep/a.cpp')).length === 0, JSON.stringify(diagsFor(s, 'src/deep/a.cpp')));
+  check(uris(s.res.d)[0] === uri('src/inc/deep.h'), JSON.stringify(s.res.d));
+});
+test('paths: definition through two levels of headers', async () => {
+  const s = await one('a.cpp', '#include "outer.h"\nint main() { return inner_fn(); }\n', [req('d', 'textDocument/definition', td('a.cpp', { position: at('#include "outer.h"\nint main() { return inner_fn(); }\n', 'inner_fn', 1) }))],
+    { files: { 'outer.h': '#include "inner.h"\n', 'inner.h': 'inline int inner_fn() { return 1; }\n' } });
+  check(uris(s.res.d)[0] === uri('inner.h'), JSON.stringify(s.res.d));
+});
+test('std: C++20 concepts compile with -std=c++20, fail with -std=c++17', async () => {
+  const src = 'template <typename T> concept Small = sizeof(T) <= 4;\ntemplate <Small T> T twice(T v) { return v + v; }\nint main() { return twice(2); }\n';
+  const ok = await one('a.cpp', src, [], { flags: ['-std=c++20'] });
+  const bad = await one('a.cpp', src, [], { flags: ['-std=c++17'] });
+  check(errorsOf(diagsFor(ok, 'a.cpp')).length === 0, JSON.stringify(diagsFor(ok, 'a.cpp')));
+  check(errorsOf(diagsFor(bad, 'a.cpp')).length > 0, 'expected errors under c++17');
+});
+test('std: <algorithm> ranges with -std=c++20', async () => {
+  const src = '#include <algorithm>\n#include <vector>\nint main() { std::vector<int> v{3, 1, 2}; std::ranges::sort(v); return v[0]; }\n';
+  const s = await one('a.cpp', src, [], { flags: ['-std=c++20'] });
+  check(errorsOf(diagsFor(s, 'a.cpp')).length === 0, JSON.stringify(diagsFor(s, 'a.cpp')));
+});
+test('std: <memory>, <functional>, <optional>, <variant>, <unordered_map> parse cleanly', async () => {
+  const src = '#include <memory>\n#include <functional>\n#include <optional>\n#include <variant>\n#include <unordered_map>\n#include <array>\n#include <tuple>\nint main() {\n  auto p = std::make_unique<int>(1);\n  std::function<int(int)> f = [](int x) { return x; };\n  std::optional<int> o = f(*p);\n  std::variant<int, double> v = 1.5;\n  std::unordered_map<int, std::array<int, 2>> m;\n  auto t = std::make_tuple(1, 2);\n  return o.value() + std::get<0>(t) + (int)m.size() + (int)v.index();\n}\n';
+  const s = await one('a.cpp', src, [], { flags: ['-std=c++17'] });
+  check(errorsOf(diagsFor(s, 'a.cpp')).length === 0, JSON.stringify(diagsFor(s, 'a.cpp')));
+});
+test('hover: macro expansion', async () => {
+  const src = '#define SQUARE(x) ((x) * (x))\nint main() { return SQUARE(3); }\n';
+  const s = await one('a.cpp', src, [req('h', 'textDocument/hover', td('a.cpp', { position: at(src, 'SQUARE(3)', 1) }))]);
+  check(/SQUARE/.test(hoverText(s.res.h)) && /\(3\) \* \(3\)|x\) \* \(x/.test(hoverText(s.res.h)), hoverText(s.res.h));
+});
+test('hover: template function instantiation', async () => {
+  const src = 'template <typename T> T identity(T v) { return v; }\nint main() { return identity<int>(4); }\n';
+  const s = await one('a.cpp', src, [req('h', 'textDocument/hover', td('a.cpp', { position: nth(src, 'identity', 1, 2) }))]);
+  check(/identity/.test(hoverText(s.res.h)) && /int/.test(hoverText(s.res.h)), hoverText(s.res.h));
+});
+test('hover: structured binding and lambda', async () => {
+  const src = '#include <utility>\nint main() {\n  std::pair<int, double> p{1, 2.0};\n  auto [first, second] = p;\n  auto fn = [first](int x) { return x + first; };\n  return fn((int)second);\n}\n';
+  const s = await one('a.cpp', src, [req('h1', 'textDocument/hover', td('a.cpp', { position: nth(src, 'first', 0, 1) })), req('h2', 'textDocument/hover', td('a.cpp', { position: nth(src, 'fn', 0, 1) }))]);
+  check(/first/.test(hoverText(s.res.h1)) && /int/.test(hoverText(s.res.h1)), hoverText(s.res.h1));
+  check(/fn/.test(hoverText(s.res.h2)), hoverText(s.res.h2));
+});
+test('completion: enum class members after "::"', async () => {
+  const src = 'enum class Color { Red, Green, Blue };\nint main() {\n  Color c = Color::\n}\n';
+  const s = await one('a.cpp', src, [req('c', 'textDocument/completion', td('a.cpp', { position: at(src, 'Color::\n', 7) }))]);
+  for (const m of ['Red', 'Green', 'Blue']) check(labels(s.res.c).includes(m), labels(s.res.c).join());
+});
+test('completion: snippet insert text when the client supports snippets', async () => {
+  const src = 'int compute(int alpha, int beta);\nint main() {\n  return comp\n}\n';
+  const s = await session({ files: { 'a.cpp': src }, compile: [{ file: 'a.cpp', flags: cppFlags }], caps: { textDocument: { completion: { completionItem: { snippetSupport: true } } } },
+    steps: [open('a.cpp', src), req('c', 'textDocument/completion', td('a.cpp', { position: at(src, 'comp\n', 4) }))] });
+  const item = (s.res.c?.items ?? []).find((i) => (i.filterText ?? i.label).trim() === 'compute');
+  check(item && item.insertTextFormat === 2 && /\$\{1:int alpha\}/.test(item.textEdit?.newText ?? item.insertText), JSON.stringify(item));
+});
+test('completion: cross-file symbol from a closed header offers an #include (sweep payoff)', async () => {
+  const hdr = '#pragma once\nint provided_by_closed_header(int);\n'; // include suggestions need a self-contained header
+  const main = 'int main() {\n  return provided_by\n}\n';
+  const s = await session({ files: { 'lib.h': hdr, 'main.cpp': main }, compile: [{ file: 'main.cpp', flags: cppFlags }, { file: 'lib.h', flags: cppFlags }],
+    steps: [open('lib.h', hdr), close('lib.h'), open('main.cpp', main), req('c', 'textDocument/completion', td('main.cpp', { position: at(main, 'provided_by', 11) }))] });
+  const item = (s.res.c?.items ?? []).find((i) => (i.filterText ?? i.label).trim().startsWith('provided_by_closed_header'));
+  check(item, `symbol not offered: ${labels(s.res.c).slice(0, 10)}`);
+  const extra = JSON.stringify(item.additionalTextEdits ?? []);
+  check(/lib\.h/.test(extra), `expected an include edit for lib.h: ${extra}`);
+});
+test('symbols: fuzzy workspace/symbol query', async () => {
+  const src = 'class FooBarBaz {};\nclass Unrelated {};\n';
+  const s = await one('a.cpp', src, [req('w', 'workspace/symbol', { query: 'fbb' })]);
+  check(s.res.w?.some((x) => x.name === 'FooBarBaz') && !s.res.w.some((x) => x.name === 'Unrelated'), JSON.stringify(s.res.w));
+});
+test('symbols: documentSymbol covers namespaces, enums and templates', async () => {
+  const src = 'namespace outer { namespace inner { enum E { A, B }; template <typename T> struct Box { T v; }; } }\n';
+  const s = await one('a.cpp', src, [req('ds', 'textDocument/documentSymbol', td('a.cpp'))]);
+  const flat = JSON.stringify(s.res.ds);
+  for (const n of ['outer', 'inner', 'E', 'Box']) check(flat.includes(`"name":"${n}"`), `missing ${n}: ${flat.slice(0, 300)}`);
+});
+test('extension: textDocument/symbolInfo names the symbol under the cursor', async () => {
+  const src = 'namespace ns { int target_symbol; }\n';
+  const s = await one('a.cpp', src, [req('si', 'textDocument/symbolInfo', td('a.cpp', { position: at(src, 'target_symbol', 2) }))]);
+  check(s.res.si?.[0]?.name === 'target_symbol' && s.res.si[0].containerName === 'ns::', JSON.stringify(s.res.si));
+});
+test('extension: textDocument/ast returns a tree for a range', async () => {
+  const src = 'int main() { return 1 + 2; }\n';
+  const s = await one('a.cpp', src, [req('ast', 'textDocument/ast', td('a.cpp', { range: { start: at(src, '1 + 2'), end: at(src, '1 + 2', 5) } }))]);
+  check(s.res.ast?.kind, JSON.stringify(s.res.ast)?.slice(0, 200));
+});
+test('diag: #pragma once in an edited header is not flagged', async () => {
+  const s = await one('a.h', '#pragma once\nint x;\n', []);
+  check(!(diagsFor(s, 'a.h') ?? []).some((d) => /pragma once/.test(d.message)), JSON.stringify(diagsFor(s, 'a.h')));
+});
+test('diag: include-cleaner flags an unused header, with a removal fix', async () => {
+  const src = '#include <vector>\nint main() { return 0; }\n';
+  const s = await one('a.cpp', src, []);
+  check(diagsFor(s, 'a.cpp').some((d) => d.code === 'unused-includes'), JSON.stringify(diagsFor(s, 'a.cpp')));
+});
+test('config: ClangTidy config is accepted but inert (tidy not linked in this build)', async () => {
+  const s = await one('a.cpp', 'int main() { int* p = 0; return nope; }\n', [], { files: { '.clangd': 'Diagnostics:\n  ClangTidy:\n    Add: [modernize-use-nullptr]\n' } });
+  const d = diagsFor(s, 'a.cpp');
+  check(errorsOf(d).length === 1, JSON.stringify(d));
+  check(!d.some((x) => x.source === 'clang-tidy'), 'tidy checks must not run (CLANGD_TIDY_CHECKS=OFF)');
+});
+test('config: Index.Background: Skip is accepted', async () => {
+  const s = await one('a.cpp', 'int x;\n', [], { files: { '.clangd': 'Index:\n  Background: Skip\n' } });
+  check(diagsFor(s, 'a.cpp').length === 0, JSON.stringify(diagsFor(s, 'a.cpp')));
+});
+test('config: invalid .clangd yaml is reported, not fatal', async () => {
+  const s = await one('a.cpp', 'int main() { return nope; }\n', [], { files: { '.clangd': 'CompileFlags: [this is: not valid\n' } });
+  check(errorsOf(diagsFor(s, 'a.cpp')).length === 1, 'normal diagnostics should survive a broken config');
+});
+test('sync: incremental didChange with a range edit', async () => {
+  const src = 'int main() { return 0 }\n';
+  const s = await one('a.cpp', src, [{ n: 'textDocument/didChange', p: { textDocument: { uri: uri('a.cpp'), version: 2 }, contentChanges: [{ range: { start: at(src, '}'), end: at(src, '}') }, text: '; ' }] } }]);
+  const all = allDiagsFor(s, 'a.cpp');
+  check(errorsOf(all[0]).length === 1 && errorsOf(all.at(-1)).length === 0, JSON.stringify(all));
+});
+test('sync: incremental edit after an emoji (UTF-16 columns)', async () => {
+  const src = 'const char* e = "😀"; int x = nope;\n';
+  const at0 = at(src, 'nope');
+  const s = await one('a.cpp', src, [{ n: 'textDocument/didChange', p: { textDocument: { uri: uri('a.cpp'), version: 2 }, contentChanges: [{ range: { start: at0, end: at(src, 'nope', 4) }, text: '0' }] } }]);
+  check(errorsOf(diagsFor(s, 'a.cpp')).length === 0, JSON.stringify(diagsFor(s, 'a.cpp')));
+});
+test('sync: CRLF line endings in the buffer', async () => {
+  const src = 'int a;\r\nint main() {\r\n  return nope;\r\n}\r\n';
+  const s = await one('a.cpp', src, []);
+  const d = errorsOf(diagsFor(s, 'a.cpp'));
+  check(d.length === 1 && d[0].range.start.line === 2, JSON.stringify(d));
+});
+test('c: C11 features and C-only diagnostics', async () => {
+  const src = '#include <stdint.h>\n_Static_assert(sizeof(int32_t) == 4, "int32");\nint main(void) { int n = 3; int vla[n]; return vla[0] + implicit_decl(1); }\n';
+  const s = await one('a.c', src, [], { languageId: 'c', flags: ['-std=c11'] });
+  const d = diagsFor(s, 'a.c');
+  check(d.some((x) => /implicit_decl/.test(x.message)), JSON.stringify(d));
+  check(!d.some((x) => /_Static_assert|int32/.test(x.message)), 'static assert should hold on wasm32');
+});
+test('wasm target: sizeof(void*) is 4, long is 4', async () => {
+  const s = await one('a.cpp', 'static_assert(sizeof(void*) == 4, "ptr");\nstatic_assert(sizeof(long) == 4, "long");\nstatic_assert(sizeof(long long) == 8, "ll");\n', []);
+  check(errorsOf(diagsFor(s, 'a.cpp')).length === 0, JSON.stringify(diagsFor(s, 'a.cpp')));
+});
+test('wasm target: -pthread threads triple parses', async () => {
+  const s = await one('a.cpp', '#include <thread>\n#include <mutex>\nint main() { std::mutex m; std::thread t([&] { std::lock_guard<std::mutex> g(m); }); t.join(); return 0; }\n', [],
+    { flags: ['--target=wasm32-wasip1-threads', '-pthread', '-isystem/sysroot/include/wasm32-wasip1-threads/noeh/c++/v1', '-isystem/sysroot/include/wasm32-wasip1-threads'] });
+  const e = errorsOf(diagsFor(s, 'a.cpp'));
+  check(e.length === 0, JSON.stringify(e));
+});
+test('scale: 150 files swept, all searchable, wasm memory reported', async () => {
+  const files = {}, steps = [], compile = [];
+  for (let i = 0; i < 150; i++) {
+    const t = `#include <vector>\n#include <string>\n#include <map>\nstd::map<std::string, std::vector<int>> table_${i};\nint memfn_${i}(int v) { return v + ${i}; }\n`;
+    files[`m${i}.cpp`] = t; compile.push({ file: `m${i}.cpp`, flags: cppFlags });
+    steps.push(open(`m${i}.cpp`, t), close(`m${i}.cpp`));
+  }
+  steps.push(req('w', 'workspace/symbol', { query: 'memfn_14' }));
+  const s = await session({ files, compile, steps });
+  check(s.exitCode === 0, `exit ${s.exitCode} ${s.trap ?? ''}`);
+  check((s.res.w ?? []).length >= 11, `expected memfn_14 + memfn_140..149, got ${(s.res.w ?? []).length}`);
+  console.log(`       wasm memory after sweeping 150 files: ${(s.memBytes / 1048576).toFixed(0)} MiB`);
+  check(s.memBytes < 2 * 1024 ** 3, `memory ${s.memBytes} exceeds the 2 GiB link-time maximum`);
+});
+test('known gap: include-path completion needs directory listing (node:wasi cannot opendir on Windows)', async () => {
+  const src = '#include "ut\nint main() {}\n';
+  const s = await one('a.cpp', src, [req('c', 'textDocument/completion', td('a.cpp', { position: at(src, 'ut\n', 2) }))], { files: { 'util.h': '// h\n' } });
+  console.log(`       (informational) include completion offered: ${JSON.stringify(labels(s.res.c))}`);
+});
+
 // ---- runner ----
 const filters = process.argv.slice(2);
 const selected = tests.filter((t) => !filters.length || filters.some((f) => t.name.includes(f)));

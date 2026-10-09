@@ -19,7 +19,7 @@ export const cppFlags = ['--target=wasm32-wasip1', '--sysroot=/sysroot', '-resou
   '-isystem/sysroot/include/wasm32-wasip1/noeh/c++/v1', '-isystem/sysroot/include/c++/v1', '-fno-exceptions'];
 export const cFlags = ['--target=wasm32-wasip1', '--sysroot=/sysroot', '-resource-dir=/resource'];
 
-export const uri = (name) => `file:///work/${name}`;
+export const uri = (name) => `file:///work/${name.split('/').map(encodeURIComponent).join('/')}`;
 export const frame = (o) => { const s = JSON.stringify(o); return `Content-Length: ${Buffer.byteLength(s)}\r\n\r\n${s}`; };
 
 /** Position of the first occurrence of `needle` in `text`, plus `delta` characters (UTF-16, as LSP wants). */
@@ -53,7 +53,7 @@ export const td = (name, extra = {}) => ({ textDocument: { uri: uri(name) }, ...
  * {n, p} notifications or {as, m, p} named requests. Returns
  * {res: {name: result|undefined}, errors: {name: error}, notes: [...], exitCode, stderr}.
  */
-export async function session({ files = {}, compile = [], steps = [], args = [], initOptions } = {}) {
+export async function session({ files = {}, compile = [], steps = [], args = [], initOptions, caps = {} } = {}) {
   const dir = await mkdtemp(path.join(tmpdir(), 'clangd-t-'));
   const tmp = await mkdtemp(path.join(tmpdir(), 'clangd-tmp-'));
   for (const [name, text] of Object.entries(files)) {
@@ -65,7 +65,7 @@ export async function session({ files = {}, compile = [], steps = [], args = [],
       directory: '/work', file: `/work/${file}`, arguments: ['clang', ...flags, `/work/${file}`] }))));
   }
   const msgs = [{ jsonrpc: '2.0', id: 'init', method: 'initialize',
-    params: { processId: null, rootUri: 'file:///work', capabilities: { textDocument: { documentSymbol: { hierarchicalDocumentSymbolSupport: true } } }, initializationOptions: initOptions } },
+    params: { processId: null, rootUri: 'file:///work', capabilities: { ...caps, textDocument: { documentSymbol: { hierarchicalDocumentSymbolSupport: true }, ...caps.textDocument } }, initializationOptions: initOptions } },
   { jsonrpc: '2.0', method: 'initialized', params: {} }];
   const names = new Map();
   let id = 100;
@@ -101,7 +101,8 @@ export async function session({ files = {}, compile = [], steps = [], args = [],
     } else if (m.method) notes.push(m);
   }
   const stderr = await readFile(errP, 'utf8');
-  return { res, errors, notes, exitCode, trap, stderr, dir };
+  const memBytes = instance.exports.memory?.buffer.byteLength;
+  return { res, errors, notes, exitCode, trap, stderr, dir, memBytes };
 }
 
 /** Latest publishDiagnostics for a file in a session. */

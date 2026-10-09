@@ -12,6 +12,7 @@
 #include "support/Context.h"
 #include "llvm/ADT/FunctionExtras.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Config/llvm-config.h"
 #include <atomic>
 #include <cassert>
 #include <condition_variable>
@@ -122,11 +123,18 @@ private:
 };
 
 /// Runs \p Action asynchronously with a new std::thread. The context will be
-/// propagated.
+/// propagated. Without LLVM_ENABLE_THREADS the action is deferred: it runs on
+/// the caller's thread at the first get()/wait(), so callers must not rely on
+/// wait_for() reporting readiness.
 template <typename T>
 std::future<T> runAsync(llvm::unique_function<T()> Action) {
+#if LLVM_ENABLE_THREADS
+  constexpr std::launch Policy = std::launch::async;
+#else
+  constexpr std::launch Policy = std::launch::deferred;
+#endif
   return std::async(
-      std::launch::async,
+      Policy,
       [](llvm::unique_function<T()> &&Action, Context Ctx) {
         WithContext WithCtx(std::move(Ctx));
         return Action();
