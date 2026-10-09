@@ -379,41 +379,28 @@ here beyond this record.
     `llvm/lib/Support/Threading.cpp`; `BroadcastThread` and
     `abortAfterTimeout` inert without `LLVM_ENABLE_THREADS`; loud error for
     `-background-index` without threads.
-- **clangd, V1.5: background indexing without threads (plan; not started).**
-  clangd's `BackgroundIndex` is queue/worker-thread driven and fed by the
-  compile-database broadcast; with threads off its constructor would hang
-  (`llvm::thread` runs inline). Chosen approach (A): a direct per-file API the
-  plugin calls while idle, so the host is the scheduler.
-  - `BackgroundIndex::index(CompileCommand)` (`index/Background.cpp`) is the
-    existing per-file unit (parse, write shard, update in-memory index, notify
-    rebuilder); `indexFileTask` wraps it with staleness checks and the CDB
-    command lookup. Make `BackgroundIndex` constructible without worker
-    threads, and expose the `indexFileTask` body synchronously.
-  - New custom LSP request `$/clangd/indexFile {uri}`: runs it inline, replies
-    when done. New request `$/clangd/loadIndexShards {uris[]}` at startup to
-    load existing shards so unchanged files aren't re-parsed (reuses the
-    existing shard-loading code). Needs no `BroadcastThread`.
-  - Plugin side (coordinate with vscwClang): chooses file list (from
-    `compile_commands.json` or a workspace scan), order (near open files
-    first), and only calls while idle. A call parses one TU and can't be
-    interrupted, so a heavy TU stalls the UI for its duration; the plugin
-    bounds this by call timing, not clangd.
-  - Needs a writable preopen for the shard directory; check the shard
-    storage's write-then-rename works on WASI.
-  - First step: prototype `indexFile` on a small project and confirm a
-    `BackgroundIndex` task runs inline.
-  - Option B (separate indexer instance in its own Worker, so UI never
-    stalls) builds on the same API; it additionally needs a UI-side
-    `$/clangd/reloadIndex` that rebuilds the in-memory index from the shard
-    directory (`--index-file` loads one monolithic file once, with no reload,
-    and the shard directory is only read by a live `BackgroundIndex`). Costs a
-    second copy of compiler memory in wasm and a shared directory preopen.
+- **clangd, V1: project-wide index via a "sweep" (plugin side).** Single-threaded
+  clangd can't run its background indexer, but `wasi-tests/run_clangd_sweep_smoketest.mjs`
+  shows that `didOpen` then `didClose` of a file leaves its symbols in the
+  dynamic index (workspace/symbol, cross-file definition and references all
+  resolve to the closed file). So the plugin (coordinate with vscwClang)
+  indexes a project by opening and closing each file while idle. Open items:
+  - Measure on a real project: per-file cost (each file also builds a
+    preamble), and whether index memory growth stays inside wasm32's limit.
+  - Plugin must suppress `publishDiagnostics` for swept files, not close a
+    file the user has open, pace opens while idle, order files near open ones
+    first, and re-sweep each session (nothing persists to disk).
   - Without any index, single-file features (diagnostics, hover, completion,
-    in-file navigation) work; cross-file references/rename, workspace symbols,
-    go-to-definition into closed `.cpp` files, and completion with
+    in-file navigation) still work; cross-file references/rename, workspace
+    symbols, go-to-definition into closed `.cpp` files, and completion with
     auto-`#include` of not-yet-included symbols are limited to open files and
     preambles.
-- **clangd, V2:** threaded build with real background indexing (`-j N`).
+  - Fallbacks if the sweep proves too slow or heavy, not planned: a per-file
+    `$/clangd/indexFile` API over `BackgroundIndex::index` (persists shards,
+    incremental), or `clangd-indexer` (whole project, loaded via `--index-file`
+    after a restart; `DefaultThreadPool` is single-threaded without threads).
+- **clangd, V2:** threaded build with real background indexing (`-j N`); this
+  makes the sweep and the fallbacks above moot.
 - **clangd, V3:** static analysis / clang-tidy checks (`CLANGD_TIDY_CHECKS=ON`),
   gated on binary-size budget.
 - Subprocess I/O redirection, timeouts, polling, and detached-process
