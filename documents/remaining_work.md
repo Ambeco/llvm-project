@@ -420,6 +420,16 @@ here beyond this record.
   against the smoke tests before adopting.
 - **clangd, V2:** threaded build with real background indexing (`-j N`); this
   makes the sweep and the fallbacks above moot.
+  `build-clangd-threads.bat` now builds it (`build-clangd-threads/bin/clangd.wasm`);
+  `CLANGD_THREADED=1` runs the harnesses against it. Verified: batch suite 86/86
+  with `CLANGD_SYNC=1`. Open: (1) with real async threads, ~40% of stream
+  sessions never exit -- clangd logs "LSP finished", `wasi.start` returns 0, yet
+  the runner's `process.exit` hangs (`reallyExit` too), so a spawned Worker is
+  probably not terminating; (2) the file-fed batch harness can't run async mode
+  (stdin EOF ends the session before async work finishes); (3) stream tests
+  `compile_commands.json rewritten`, `didChangeConfiguration injects compile
+  flags` and `header edited on disk` fail async (probably stale-then-fresh
+  diagnostics ordering, unconfirmed); (4) then switch to `-background-index`.
 - **clangd, V3:** static analysis / clang-tidy checks (`CLANGD_TIDY_CHECKS=ON`),
   gated on binary-size budget.
 - Subprocess I/O redirection, timeouts, polling, and detached-process
