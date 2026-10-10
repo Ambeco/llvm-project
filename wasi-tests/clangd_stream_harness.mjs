@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process';
 import { writeFile, mkdtemp, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { frame, wasmPath, cppFlags, uri } from './clangd_harness.mjs';
+import { frame, wasmPath, cppFlags, uri, threaded } from './clangd_harness.mjs';
 import { findResourceDir } from './wasi_spawn_shim.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
@@ -100,7 +100,7 @@ export async function start({ files = {}, compile = [], args = [] } = {}) {
   }
   await writeCompile(dir, compile);
   const cfg = { wasm: process.env.CLANGD_WASM ?? wasmPath,
-    args: ['-sync', '-background-index=false', '-log=verbose', ...(compile.length ? ['-compile-commands-dir=/work'] : []), ...args],
+    args: [...(threaded && process.env.CLANGD_SYNC !== '1' ? [] : ['-sync']), '-background-index=false', '-log=verbose', ...(compile.length ? ['-compile-commands-dir=/work'] : []), ...args],
     preopens: { '/work': dir, '/tmp': tmp, '/sysroot': sysrootPath, '/resource': resourceDir } };
   const child = spawn(process.execPath, ['--experimental-wasm-type-reflection', '--experimental-wasi-unstable-preview1', '--no-warnings', path.join(import.meta.dirname, 'clangd_stdio_runner.mjs')],
     { env: { ...process.env, CLANGD_RUN: JSON.stringify(cfg) }, stdio: ['pipe', 'pipe', 'pipe'] });
