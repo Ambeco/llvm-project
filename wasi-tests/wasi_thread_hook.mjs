@@ -132,7 +132,7 @@ export function makeFakeInstance(instance, memory, { forThread } = {}) {
 /// thread that silently died before ever entering wasm. See
 /// documents/remaining_work.md's 2026-09-09 entry for the full incident.
 export function makeThreadSpawn({ wasmPath, memory, preopens, tidCounter,
-                                 extraImportsModule, extraImportsConfig }) {
+                                 extraImportsModule, extraImportsConfig, workers }) {
   return function threadSpawn(startArg) {
     const tid = Atomics.add(tidCounter, 0, 1);
     const worker = new Worker(threadWorkerScript, {
@@ -145,6 +145,8 @@ export function makeThreadSpawn({ wasmPath, memory, preopens, tidCounter,
     worker.on('message', (msg) => {
       if (msg.log) console.error(`[thread ${tid}] ${msg.log}`);
     });
+    workers?.add(worker);
+    worker.on('exit', () => workers?.delete(worker));
     return tid;
   };
 }
@@ -164,10 +166,12 @@ export async function loadModule(wasmPath) {
 /// wasmPath/module is reused across many such calls (e.g. one per file in
 /// run_clang_parallel_smoketest.mjs).
 ///
-/// Returns `{ instance, memory }`; pass both to
+/// Returns `{ instance, memory, workers }`; pass `instance`/`memory` to
 /// `makeFakeInstance(instance, memory)` before `wasi.start()`/
 /// `wasi.initialize()`, and to `installSpawnHook(instance, { ..., memory })`
-/// if also installing the subprocess-spawn hook.
+/// if also installing the subprocess-spawn hook. Pass `workers` to
+/// `terminateWorkers()` after `wasi.start()` returns -- see that function's
+/// comment for why this is required, not optional, for a real thread pool.
 export async function instantiateThreaded(wasmModule, bytes, importObjectBase,
                                           { wasmPath, preopens, extraImportsModule, extraImportsConfig }) {
   const limits = readImportedMemoryLimits(bytes);
@@ -181,15 +185,33 @@ export async function instantiateThreaded(wasmModule, bytes, importObjectBase,
   const memory = new WebAssembly.Memory({ initial: min, maximum: max, shared: true });
   const tidCounter = new Int32Array(new SharedArrayBuffer(4));
   Atomics.store(tidCounter, 0, 1); // 0 is conventionally the main thread
+  const workers = new Set();
 
   const importObject = { ...importObjectBase };
   importObject.env = { ...importObjectBase.env, memory };
   importObject.wasi = {
     ...importObjectBase.wasi,
     'thread-spawn': makeThreadSpawn({ wasmPath, memory, preopens, tidCounter,
-                                     extraImportsModule, extraImportsConfig }),
+                                     extraImportsModule, extraImportsConfig, workers }),
   };
 
   const instance = await WebAssembly.instantiate(wasmModule, importObject);
-  return { instance, memory };
+  return { instance, memory, workers };
+}
+
+/// A real thread pool (clangd's, under wasi-threads) spawns worker threads
+/// that park forever in a condition-variable wait (compiled to a blocking
+/// `memory.atomic.wait32`) once idle, waiting for work that never again
+/// arrives once the main instance's `wasi.start()` has returned. Node's
+/// `worker_threads` Workers backing them never emit `exit` on their own in
+/// that state, and -- confirmed empirically -- `process.exit()`/
+/// `process.reallyExit()` on the main thread does NOT forcibly kill still-live
+/// Worker threads; it waits for them, so the process hangs forever. Call this
+/// (with the `workers` set `instantiateThreaded()` returned) right after
+/// `wasi.start()`/`wasi.initialize()` returns, before `process.exit()`.
+/// `Worker.terminate()` forcibly interrupts even a blocked `Atomics.wait`, and
+/// tears down any nested Workers it itself spawned (recursive thread-spawn),
+/// so only the top-level set needs to be tracked/terminated here.
+export async function terminateWorkers(workers) {
+  await Promise.all([...workers].map((w) => w.terminate()));
 }

@@ -422,14 +422,34 @@ here beyond this record.
   makes the sweep and the fallbacks above moot.
   `build-clangd-threads.bat` now builds it (`build-clangd-threads/bin/clangd.wasm`);
   `CLANGD_THREADED=1` runs the harnesses against it. Verified: batch suite 86/86
-  with `CLANGD_SYNC=1`. Open: (1) with real async threads, ~40% of stream
-  sessions never exit -- clangd logs "LSP finished", `wasi.start` returns 0, yet
-  the runner's `process.exit` hangs (`reallyExit` too), so a spawned Worker is
-  probably not terminating; (2) the file-fed batch harness can't run async mode
-  (stdin EOF ends the session before async work finishes); (3) stream tests
-  `compile_commands.json rewritten`, `didChangeConfiguration injects compile
-  flags` and `header edited on disk` fail async (probably stale-then-fresh
-  diagnostics ordering, unconfirmed); (4) then switch to `-background-index`.
+  with `CLANGD_SYNC=1`.
+  - **Fixed (2026-10-10): the ~40%-of-stream-sessions-never-exit hang.** Root
+    cause confirmed: clangd's real thread pool parks idle worker threads
+    forever in a blocking `Atomics.wait` (compiled from a condition-variable
+    wait) once a session ends -- `wasi.start()` on the main thread returns
+    fine, but the Node `Worker` backing each pool thread never emits `exit`,
+    and (confirmed empirically) `process.exit()`/`process.reallyExit()` does
+    NOT forcibly kill still-live `Worker` threads, it waits for them, so the
+    child process hung forever. Fixed by tracking every top-level spawned
+    `Worker` (`wasi_thread_hook.mjs`'s `instantiateThreaded()` now returns a
+    `workers` set) and calling the new `terminateWorkers()` (forceful
+    `worker.terminate()`, which does interrupt a blocked `Atomics.wait`) right
+    after `wasi.start()` returns and before `process.exit()` in
+    `clangd_stdio_runner.mjs`. Stream suite went from hanging to a clean
+    12/16 in one run (662s, no hang) -- the remaining 4 failures are the three
+    already-known stale-diagnostics-ordering cases below plus one new one.
+  - **New (2026-10-10): `closing stdin (host crash) ends clangd instead of
+    hanging` fails on the threaded build** -- `child.stdin.end()` never makes
+    `wasi.start()` return within 20s, unlike the single-threaded build. Not
+    yet root-caused; suspect the threaded transport's stdin-read loop
+    (`getc_unlocked` path, see the V1 upstream-fix note above) behaves
+    differently when driven from clangd's async/threaded request loop versus
+    `-sync`.
+  - Still open: (1) the file-fed batch harness can't run async mode (stdin
+    EOF ends the session before async work finishes); (2) stream tests
+    `compile_commands.json rewritten`, `didChangeConfiguration injects compile
+    flags` and `header edited on disk` fail async (probably stale-then-fresh
+    diagnostics ordering, unconfirmed); (3) then switch to `-background-index`.
 - **clangd, V3:** static analysis / clang-tidy checks (`CLANGD_TIDY_CHECKS=ON`),
   gated on binary-size budget.
 - Subprocess I/O redirection, timeouts, polling, and detached-process
