@@ -8,12 +8,23 @@ import { WASI } from 'node:wasi';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { findResourceDir } from './wasi_spawn_shim.mjs';
+import { instantiateThreaded, makeFakeInstance, readImportedMemoryLimits } from './wasi_thread_hook.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
-export const wasmPath = path.join(repoRoot, 'build-single-threaded', 'bin', 'clangd.wasm');
+// CLANGD_THREADED=1 selects the wasi-threads build (build-clangd-threads.bat):
+// it is instantiated with shared memory + wasi.thread-spawn and run without
+// -sync (set CLANGD_SYNC=1 to keep -sync). CLANGD_WASM overrides the path; a
+// module that imports memory is treated as threaded regardless of the flag.
+const wantThreaded = process.env.CLANGD_THREADED === '1';
+const buildDir = wantThreaded ? 'build-clangd-threads' : 'build-single-threaded';
+export const wasmPath = path.join(repoRoot, buildDir, 'bin', 'clangd.wasm');
 const sysrootPath = 'C:/Users/mooin/AppData/Local/wasi-sdk/wasi-sdk-34.0-x86_64-windows/share/wasi-sysroot';
+// The threaded build only builds clangd, so it has no resource dir of its own.
 const resourceDir = await findResourceDir(path.join(repoRoot, 'build-single-threaded', 'lib', 'clang'));
-const module = await WebAssembly.compile(await readFile(process.env.CLANGD_WASM ?? wasmPath));
+const activeWasmPath = process.env.CLANGD_WASM ?? wasmPath;
+const wasmBytes = await readFile(activeWasmPath);
+const module = await WebAssembly.compile(wasmBytes);
+export const threaded = readImportedMemoryLimits(wasmBytes) !== null;
 
 export const cppFlags = ['--target=wasm32-wasip1', '--sysroot=/sysroot', '-resource-dir=/resource',
   '-isystem/sysroot/include/wasm32-wasip1/noeh/c++/v1', '-isystem/sysroot/include/c++/v1', '-fno-exceptions'];
@@ -80,11 +91,15 @@ export async function session({ files = {}, compile = [], steps = [], args = [],
   await writeFile(inP, msgs.map(frame).join(''));
   const fds = [openSync(inP, 'r'), openSync(outP, 'w'), openSync(errP, 'w')];
   const compileArgs = compile.length ? ['-compile-commands-dir=/work'] : [];
-  const wasi = new WASI({ version: 'preview1', args: ['clangd', '-sync', '-background-index=false', '-log=verbose', ...compileArgs, ...args],
+  const wasi = new WASI({ version: 'preview1', args: ['clangd', ...(threaded && process.env.CLANGD_SYNC !== '1' ? [] : ['-sync']), '-background-index=false', '-log=verbose', ...compileArgs, ...args],
     env: {}, preopens: { '/work': dir, '/tmp': tmp, '/sysroot': sysrootPath, '/resource': resourceDir }, stdin: fds[0], stdout: fds[1], stderr: fds[2] });
-  const instance = await WebAssembly.instantiate(module, wasi.getImportObject());
+  let instance, memory;
+  if (threaded) {
+    ({ instance, memory } = await instantiateThreaded(module, wasmBytes, wasi.getImportObject(),
+      { wasmPath: activeWasmPath, preopens: { '/work': dir, '/tmp': tmp, '/sysroot': sysrootPath, '/resource': resourceDir } }));
+  } else instance = await WebAssembly.instantiate(module, wasi.getImportObject());
   let exitCode, trap;
-  try { exitCode = wasi.start(instance) ?? 0; } catch (e) { exitCode = -1; trap = String(e.message ?? e); }
+  try { exitCode = wasi.start(threaded ? makeFakeInstance(instance, memory) : instance) ?? 0; } catch (e) { exitCode = -1; trap = String(e.message ?? e); }
   fds.forEach(closeSync);
 
   const buf = await readFile(outP);
@@ -101,7 +116,7 @@ export async function session({ files = {}, compile = [], steps = [], args = [],
     } else if (m.method) notes.push(m);
   }
   const stderr = await readFile(errP, 'utf8');
-  const memBytes = instance.exports.memory?.buffer.byteLength;
+  const memBytes = (memory ?? instance.exports.memory)?.buffer.byteLength;
   return { res, errors, notes, exitCode, trap, stderr, dir, memBytes };
 }
 
