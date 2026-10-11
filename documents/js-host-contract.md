@@ -172,6 +172,17 @@ imports beyond `wasi_snapshot_preview1`, no threads, no spawn hook). Run it as
   a one-shot compile). Closing stdin ends clangd (exit code 1 unless
   `shutdown` + `exit` came first). Server-to-client requests such as
   `workspace/applyEdit` must be answered.
+  - **Threaded build (V2): a host must be able to *forcibly end* a thread
+    that is blocked in a clock sleep.** clangd starts a detached 5-minute
+    `abortAfterTimeout` watchdog (`sleep_for`) on exit, and `main` returning
+    does not stop it. When the host kills the remaining threads after
+    `main` returns (`terminateWorkers()` in `wasi_thread_hook.mjs`), a
+    blocking synchronous sleep import (node:wasi's `poll_oneoff`) cannot be
+    interrupted by `Worker.terminate()`, so shutdown took the full ~300s.
+    The reference host's thread worker now implements single-clock
+    `poll_oneoff` with `Atomics.wait` (interruptible); a browser host must
+    do likewise (or otherwise be able to kill a sleeping thread).
+    Abrupt stdin EOF then also ends clangd promptly.
 - **Preopens:** the workspace (any path; project files are addressed by the
   `file://` URIs the client sends), the sysroot and clang resource dir
   (read-only is fine), and a **writable `/tmp`** -- preamble PCHs are temp
@@ -202,4 +213,51 @@ imports beyond `wasi_snapshot_preview1`, no threads, no spawn hook). Run it as
   stdio's buffer, not the destination). clangd's transport reads message
   bodies with `getc_unlocked` under `__wasi__` to avoid it; a host with a
   sound `fd_read` is unaffected either way.
+- **The didOpen/didClose sweep has no memory ceiling or eviction, by upstream
+  design, not a bug in this fork.** Confirmed from unmodified upstream clangd
+  source (`clang-tools-extra/clangd/index/FileIndex.h/.cpp`,
+  `ClangdServer.cpp`):
+  - `FileSymbols` (`FileIndex.h:70-106`) is an unbounded `llvm::StringMap`
+    keyed by file; nothing caps its size and nothing evicts an entry. The
+    header says so outright: `FileIndex.h:109`
+    `// FIXME: Expose an interface to remove files that are closed.`
+  - `ClangdServer::removeDocument` (`ClangdServer.cpp:424-427`, the
+    `didClose` handler) drops the draft and the parsed-AST/preamble build
+    state, but never calls into `FileIndex` to purge that file's symbols —
+    even though the removal primitive already exists and is documented
+    (`FileSymbols::update(Key, nullptr, nullptr)`, see `FileIndex.h:74`).
+    So every swept file's symbols accumulate in memory for the life of the
+    process; a large project sweep can run clangd.wasm out of its configured
+    `--max-memory` with no warning before that point.
+  - The only size-reporting is the read-only `$/memoryUsage` custom LSP
+    extension (`ClangdLSPServer.cpp:1649-1655`, handler;
+    `memoryUsageProvider: true` capability at `:645`), returning a
+    byte-level `MemoryTree` breakdown. No API reports a "percent full" or
+    triggers shedding; a host-side sweep policy must poll this itself and
+    impose its own budget/ordering (and there is still no way to shrink the
+    index afterward short of restarting clangd).
+  - The only actual LRU eviction anywhere in clangd is `TUScheduler`'s
+    `ASTCache` (`MaxRetainedASTs = 3`, `TUScheduler.h:66`,
+    `TUScheduler.cpp:147-219`) — it evicts parsed ASTs to bound *that*
+    cache, but has no effect on `FileIndex`'s retained symbol slabs.
+  - *Why* `removeDocument` was never wired to the null-removal path, and
+    clangd's disk-index persistence behavior, are researched in full in
+    `documents/notes.md`. Short version: it's semantic, not a safety
+    landmine (`didClose` means "not shown right now," not "deleted"), and
+    removal is reference-counted/safe against in-flight readers. There is
+    no other event (not even `didChangeWatchedFiles`'s `Deleted` type) that
+    removes a file's symbols either.
+  - **A small clangd patch to let the host explicitly evict a file's
+    symbols is viable, but not yet decided on.** It would expose a
+    `FileIndex::removeFile`-style method and a new clangd-custom LSP
+    notification the plugin calls when it evicts a swept file (deliberately
+    *not* reusing `didClose`, so ordinary editor close/reopen churn stays
+    unaffected). Low implementation risk per the point above. Still an open
+    question whether to build this V1-only workaround at all, versus going
+    straight to V2 (threaded build, real background indexer) instead — see
+    `documents/remaining_work.md`'s sweep item. One consideration against
+    it: the project's general goal is to minimize non-wasm-core changes to
+    clangd/LLVM, keeping everything (non-wasm changes especially, most wasm
+    changes too) realistically upstreamable, and a temporary V1-only
+    eviction patch cuts against that.
 

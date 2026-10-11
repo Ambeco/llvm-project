@@ -397,6 +397,24 @@ here beyond this record.
   indexes a project by opening and closing each file while idle. Open items:
   - Measure on a real project: per-file cost (each file also builds a
     preamble), and whether index memory growth stays inside wasm32's limit.
+  - **Unbounded memory growth, no upstream fix exists (researched
+    2026-10-10, not yet decided).** Confirmed from source: upstream
+    clangd's `FileIndex`/`FileSymbols` has no cap and no eviction
+    (`FileIndex.h:109`'s own `// FIXME: Expose an interface to remove files
+    that are closed.`), and nothing -- not `didClose`, not
+    `didChangeWatchedFiles`'s `Deleted` event, nothing -- ever removes a
+    file's symbols from it once swept; see `documents/js-host-contract.md`
+    and `documents/notes.md` for the full trail. A small, scoped clangd
+    patch (expose `FileIndex::removeFile`-ish, call it from a new
+    clangd-custom LSP notification the plugin invokes explicitly when it
+    evicts a swept file) is technically viable and low-risk (the
+    underlying removal primitive is already reference-counted/snapshot-safe
+    against in-flight readers). **Still considering whether to build it, or
+    skip straight to V2's threaded build with a real background indexer
+    instead** -- leaning toward V2, partly because the goal is to minimize
+    non-wasm-core changes to clangd (ideally everything non-wasm, and most
+    wasm changes, stays upstreamable) and a temporary V1-only eviction
+    patch cuts against that.
   - Plugin must suppress `publishDiagnostics` for swept files, not close a
     file the user has open, pace opens while idle, order files near open ones
     first, and re-sweep each session (nothing persists to disk).
@@ -438,18 +456,24 @@ here beyond this record.
     `clangd_stdio_runner.mjs`. Stream suite went from hanging to a clean
     12/16 in one run (662s, no hang) -- the remaining 4 failures are the three
     already-known stale-diagnostics-ordering cases below plus one new one.
-  - **New (2026-10-10): `closing stdin (host crash) ends clangd instead of
-    hanging` fails on the threaded build** -- `child.stdin.end()` never makes
-    `wasi.start()` return within 20s, unlike the single-threaded build. Not
-    yet root-caused; suspect the threaded transport's stdin-read loop
-    (`getc_unlocked` path, see the V1 upstream-fix note above) behaves
-    differently when driven from clangd's async/threaded request loop versus
-    `-sync`.
-  - Still open: (1) the file-fed batch harness can't run async mode (stdin
-    EOF ends the session before async work finishes); (2) stream tests
-    `compile_commands.json rewritten`, `didChangeConfiguration injects compile
-    flags` and `header edited on disk` fail async (probably stale-then-fresh
-    diagnostics ordering, unconfirmed); (3) then switch to `-background-index`.
+  - **Fixed (2026-10-10): the three async stream-test failures were exactly
+    stale-then-fresh diagnostics ordering.** Confirmed by instrumentation: a
+    file/header edit under async mode makes clangd publish two
+    `publishDiagnostics` for the same uri in quick succession -- a stale one
+    (leftover from in-flight work that raced ahead of the edit) then the real
+    one -- and `Client.diags()` was returning the *first* match after a given
+    point, i.e. the stale one. Fixed by adding `diagsWhen(c, name, from, pred)`
+    to `run_clangd_stream_tests.mjs`, built on the existing `waitNote`
+    (event-driven, with its existing timeout as a backstop -- no polling/sleep
+    added), and switching the three affected tests to wait for diagnostics
+    matching the condition they actually expect rather than just "the next
+    one". Stream suite is now 16/16 in ~50s (`CLANGD_THREADED=1`).
+  - Still open: (1) the file-fed batch harness still can't run async mode at
+    all (not a quick fix -- its input is a single pre-built file read
+    synchronously by one blocking `wasi.start()` call, so there's no live
+    stdin to hold open while waiting on an event; async-mode tests needing
+    this belong in the stream harness instead, which already supports it);
+    (2) then switch to `-background-index`.
 - **clangd, V3:** static analysis / clang-tidy checks (`CLANGD_TIDY_CHECKS=ON`),
   gated on binary-size budget.
 - Subprocess I/O redirection, timeouts, polling, and detached-process

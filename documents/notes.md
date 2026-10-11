@@ -5,6 +5,33 @@ Things learned along the way that don't fit cleanly into `design.md`,
 Add to this file as we go, rather than letting these live only in chat
 history.
 
+## Research: why clangd's dynamic index never shrinks on `didClose`
+
+Upstream clangd's `FileIndex` (unmodified in this fork -- confirmed via
+`git log` that no wasm/fork commit touches `index/FileIndex.{h,cpp}`) never
+calls its own documented null-removal path
+(`FileSymbols::update(key, nullptr, nullptr)`, `FileIndex.h:74`) from
+`ClangdServer::removeDocument` (the `didClose` handler,
+`ClangdServer.cpp:424-427`) -- acknowledged as a gap in the header itself
+(`FileIndex.h:109`: `// FIXME: Expose an interface to remove files that are
+closed.`). Not a hidden landmine: slab removal is reference-counted and
+safe against in-flight readers (`FileIndex.h:63-66`), and the dynamic index
+(`DynamicIdx`) and the real background index (`BackgroundIdx`) are
+independent `FileSymbols` containers merged only at query time
+(`ClangdServer.cpp:245-251,264-272`), so removing from one can't corrupt
+the other. The likely real reason is just semantic: `didClose` means "the
+editor isn't showing this buffer," not "this file left the project" --
+discarding its symbols on every close would make normal edit sessions
+worse (briefly closing and reopening a file would cost a full reindex) for
+no benefit in the normal (non-sweep) case. Separately, persistence
+(`BackgroundIndexStorage`/shards) exists only for `BackgroundIndex`, loaded
+*eagerly* (not lazily) on startup (`Background.cpp:354-397`); plain
+`FileIndex`/`DynamicIdx` has no disk persistence or restart-reload path at
+all. Relevant because the V1 wasm plugin's didOpen/didClose "sweep" trick
+exploits exactly the behavior upstream never bothered to bound -- see
+`documents/js-host-contract.md`'s memory-ceiling note for the practical
+consequence.
+
 ## Build note: link libraries and flags
 
 `build.bat` links against `-lwasi-emulated-signal -lwasi-emulated-getpid
@@ -659,3 +686,4 @@ Frame 1 of a backtrace resolved to the wrong CU (`crt1-command.c:43`), and the t
 - Ninja "failed recompaction: Permission denied" during reconfigure = Dropbox holding `.ninja_log`; killing Dropbox fixes it.
 - `build*.bat` match `/build*` in `.gitignore`, so edits to them are never committed.
 - Streaming tests found three bugs the file-fed ones could not: code completion's `std::async` speculative query spawned a raw thread on the second completion (aborted the instance); `JSONTransport` double-advanced `Pos` on partial reads; `node:wasi` `fd_read` on a Windows pipe corrupts a large buffered `fread` after a short read (reproduced in a 20-line C program; `setvbuf(_IONBF)` worked in C but hung inside clangd, so we read bodies with `getc_unlocked` instead). A file-fed test passing says nothing about pipes.
+- Threaded clangd shutdown once took ~300s (async mode only): not a clangd/TUScheduler bug (lost-wakeup theory ruled out by logging; teardown finishes in ~8s) but `Worker.terminate()` being unable to interrupt node:wasi's blocking `poll_oneoff` in clangd's detached `abortAfterTimeout` watchdog thread. Fixed in `wasi_thread_worker.mjs` (Atomics.wait-based clock sleep). If a similar multi-minute exit delay recurs, log timestamps around `wasi.start()` and `terminateWorkers()` first (`worker exited` lines show which thread is stuck).

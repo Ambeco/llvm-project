@@ -23,12 +23,43 @@ const { wasmPath, memory, tid, startArg, preopens, tidCounterSAB,
        extraImportsModule, extraImportsConfig } = workerData;
 const tidCounter = new Int32Array(tidCounterSAB);
 
+// node:wasi's poll_oneoff blocks the worker thread synchronously for a clock
+// sleep, and Worker.terminate() cannot interrupt that: a detached thread in
+// sleep_for (clangd's 5-minute abortAfterTimeout watchdog) made
+// terminateWorkers() take the full 300s. Atomics.wait IS interruptible, so
+// handle the single-clock-subscription case (sleep_for/nanosleep) here and
+// delegate everything else (fd polling, multiple subscriptions) to node:wasi.
+function installInterruptibleClockSleep(wasiImports, memory) {
+  const orig = wasiImports.poll_oneoff;
+  const sleepCell = new Int32Array(new SharedArrayBuffer(4));
+  wasiImports.poll_oneoff = (inPtr, outPtr, nsubs, neventsPtr) => {
+    const dv = new DataView(memory.buffer);
+    if (nsubs !== 1 || dv.getUint8(inPtr + 8) !== 0) return orig(inPtr, outPtr, nsubs, neventsPtr);
+    const clockId = dv.getUint32(inPtr + 16, true);
+    const timeoutNs = dv.getBigUint64(inPtr + 24, true);
+    const abstime = (dv.getUint16(inPtr + 40, true) & 1) !== 0;
+    let waitNs = timeoutNs;
+    if (abstime) {
+      const nowNs = clockId === 0 ? BigInt(Date.now()) * 1000000n : process.hrtime.bigint();
+      waitNs = timeoutNs > nowNs ? timeoutNs - nowNs : 0n;
+    }
+    const waitMs = Number(waitNs) / 1e6;
+    if (waitMs > 0) Atomics.wait(sleepCell, 0, 0, waitMs);
+    dv.setBigUint64(outPtr, dv.getBigUint64(inPtr, true), true); // userdata
+    dv.setUint16(outPtr + 8, 0, true); // error: success
+    dv.setUint8(outPtr + 10, 0); // type: clock
+    dv.setUint32(neventsPtr, 1, true);
+    return 0;
+  };
+}
+
 try {
   const wasi = new WASI({ version: 'preview1', args: ['thread'], env: {}, preopens });
   const bytes = await readFile(wasmPath);
   const wasmModule = await WebAssembly.compile(bytes);
 
   const importObject = wasi.getImportObject();
+  installInterruptibleClockSleep(importObject.wasi_snapshot_preview1, memory);
   importObject.env = { memory };
   importObject.wasi = {
     'thread-spawn': makeThreadSpawn({ wasmPath, memory, preopens, tidCounter,
@@ -75,14 +106,14 @@ try {
   if (instance.exports.__wasi_shim_set_spawn_hook)
     installSpawnHook(instance, { wasmPath, preopens, memory });
 
-  parentPort.postMessage({ log: `starting (tid=${tid}, startArg=${startArg})` });
+  parentPort.postMessage({ log: `starting (tid=${tid}, startArg=${startArg}) at ${Date.now()}` });
   instance.exports.wasi_thread_start(tid, startArg);
-  parentPort.postMessage({ log: 'finished' });
+  parentPort.postMessage({ log: `finished at ${Date.now()}` });
 } catch (e) {
   // Synchronous too: postMessage is never delivered while the parent is
   // blocked inside a wasm call (see the comment above extraImportsModule).
-  writeSync(2, `[thread ${tid}] trapped: ${e}
+  writeSync(2, `[thread ${tid}] trapped at ${Date.now()}: ${e}
 ${e?.stack ?? ''}
 `);
-  parentPort.postMessage({ log: `trapped: ${e}` });
+  parentPort.postMessage({ log: `trapped at ${Date.now()}: ${e}` });
 }

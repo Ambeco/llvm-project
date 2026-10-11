@@ -16,6 +16,11 @@ const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const errorsOf = (d) => (d ?? []).filter((x) => x.severity === 1);
+/** Waits for the publishDiagnostics that actually matches `pred`, skipping any stale
+ * republish from in-flight async work that races ahead of the edit being waited on. */
+const diagsWhen = (c, name, from, pred) =>
+  c.waitNote((m) => m.method === 'textDocument/publishDiagnostics' && m.params.uri === uri(name) && pred(m.params.diagnostics), 60000, from)
+    .then((m) => m.params.diagnostics);
 const hoverText = (h) => (typeof h?.contents === 'string' ? h.contents : h?.contents?.value ?? '');
 
 /** Starts clangd, runs fn(client), always kills the child; returns fn's result. */
@@ -175,7 +180,7 @@ test('stream: compile_commands.json rewritten on disk takes effect after the 5 s
     c.notify('workspace/didChangeWatchedFiles', { changes: [{ uri: uri('compile_commands.json'), type: 2 }] });
     n = c.notes.length;
     c.notify('textDocument/didChange', { textDocument: { uri: uri('a.cpp'), version: 2 }, contentChanges: [{ text: src + '\n' }] });
-    check(errorsOf(await c.diags('a.cpp', n)).length === 0, 'expected the new flag to apply');
+    await diagsWhen(c, 'a.cpp', n, (d) => errorsOf(d).length === 0);
   });
 });
 
@@ -188,7 +193,7 @@ test('stream: workspace/didChangeConfiguration injects compile flags (the vscwCl
     check(errorsOf(await c.diags('a.cpp', n)).length >= 1, 'expected an error with default fallback flags');
     n = c.notes.length;
     c.notify('workspace/didChangeConfiguration', { settings: { compilationDatabaseChanges: { '/work/a.cpp': { workingDirectory: '/work', compilationCommand: ['clang', ...cppFlags, '-DINJECTED', '/work/a.cpp'] } } } });
-    check(errorsOf(await c.diags('a.cpp', n)).length === 0, 'expected injected flags to clear the error');
+    await diagsWhen(c, 'a.cpp', n, (d) => errorsOf(d).length === 0);
   });
 });
 
@@ -204,7 +209,7 @@ test('stream: header edited on disk invalidates the preamble', () => {
     c.notify('workspace/didChangeWatchedFiles', { changes: [{ uri: uri('api.h'), type: 2 }] });
     n = c.notes.length;
     c.notify('textDocument/didChange', { textDocument: { uri: uri('a.cpp'), version: 2 }, contentChanges: [{ text: main + '\n' }] });
-    check(errorsOf(await c.diags('a.cpp', n)).length === 1, 'expected a too-few-arguments error after the header changed');
+    await diagsWhen(c, 'a.cpp', n, (d) => errorsOf(d).length === 1);
   });
 });
 

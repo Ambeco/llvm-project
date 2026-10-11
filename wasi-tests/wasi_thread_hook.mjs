@@ -140,13 +140,13 @@ export function makeThreadSpawn({ wasmPath, memory, preopens, tidCounter,
                    extraImportsModule, extraImportsConfig },
     });
     worker.on('error', (err) => {
-      console.error(`wasi_thread_hook: thread ${tid} worker error:`, err);
+      console.error(`wasi_thread_hook: thread ${tid} worker error at ${Date.now()}:`, err);
     });
     worker.on('message', (msg) => {
       if (msg.log) console.error(`[thread ${tid}] ${msg.log}`);
     });
     workers?.add(worker);
-    worker.on('exit', () => workers?.delete(worker));
+    worker.on('exit', (code) => { console.error(`[thread ${tid}] worker exited with code ${code} at ${Date.now()}`); workers?.delete(worker); });
     return tid;
   };
 }

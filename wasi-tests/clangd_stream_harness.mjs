@@ -20,7 +20,7 @@ export class Client {
     this.notes = []; this.serverRequests = []; this.waiters = []; this.stderr = '';
     this.exited = new Promise((resolve) => child.on('exit', (code, sig) => { this.exitCode = code ?? sig; this.closed = true; this.wake(); resolve(this.exitCode); }));
     child.stdout.on('data', (d) => { this.buf = Buffer.concat([this.buf, d]); this.drain(); });
-    child.stderr.on('data', (d) => { this.stderr += d; });
+    child.stderr.on('data', (d) => { this.stderr += d; if (process.env.CLANGD_ECHO_STDERR) process.stderr.write(d); });
     child.stdin.on('error', () => {});
   }
   drain() {
