@@ -214,8 +214,8 @@ imports beyond `wasi_snapshot_preview1`, no threads, no spawn hook). Run it as
     `compile_commands.json` in use (`/work` with `-compile-commands-dir=/work`).
     That directory must be writable and should persist across sessions, or
     every session re-indexes from scratch (clangd logs `Failed to load shard`
-    for each file on a cold start; that is normal). Verified in
-    `run_clangd_bgindex_smoketest.mjs`'s setup. Files outside any CDB root fall
+    for each file on a cold start; that is normal). Observed
+    with the threaded build (not asserted by a test yet). Files outside any CDB root fall
     back to `llvm::sys::path::cache_directory()` (`$XDG_CACHE_HOME` or
     `$HOME/.cache`, plus `clangd/index`); not tested under WASI, where the
     harnesses pass an empty env, so expect no persistence for those unless the
