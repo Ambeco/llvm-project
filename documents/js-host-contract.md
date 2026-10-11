@@ -208,6 +208,18 @@ imports beyond `wasi_snapshot_preview1`, no threads, no spawn hook). Run it as
   headers; nothing persists). The wasi-threads build runs the real background
   indexer (default on): files in `compile_commands.json` are indexed without
   being opened.
+  - **Persisted shards:** one `<filename>.<16-hex digest of full path>.idx`
+    per indexed source or header, plus an auto-written `.gitignore`, in
+    `<root>/.cache/clangd/index/`, where `<root>` is the directory of the
+    `compile_commands.json` in use (`/work` with `-compile-commands-dir=/work`).
+    That directory must be writable and should persist across sessions, or
+    every session re-indexes from scratch (clangd logs `Failed to load shard`
+    for each file on a cold start; that is normal). Verified in
+    `run_clangd_bgindex_smoketest.mjs`'s setup. Files outside any CDB root fall
+    back to `llvm::sys::path::cache_directory()` (`$XDG_CACHE_HOME` or
+    `$HOME/.cache`, plus `clangd/index`); not tested under WASI, where the
+    harnesses pass an empty env, so expect no persistence for those unless the
+    host sets one of those variables and preopens the directory.
 - **Include-path completion** (`#include "ut|`) returned nothing under
   `node:wasi` on Windows, probably the same missing directory listing; recheck
   on the real host.
