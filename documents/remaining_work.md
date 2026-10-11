@@ -468,12 +468,16 @@ here beyond this record.
     added), and switching the three affected tests to wait for diagnostics
     matching the condition they actually expect rather than just "the next
     one". Stream suite is now 16/16 in ~50s (`CLANGD_THREADED=1`).
-  - Still open: (1) the file-fed batch harness still can't run async mode at
-    all (not a quick fix -- its input is a single pre-built file read
-    synchronously by one blocking `wasi.start()` call, so there's no live
-    stdin to hold open while waiting on an event; async-mode tests needing
-    this belong in the stream harness instead, which already supports it);
-    (2) then switch to `-background-index`.
+  - Batch harness now runs async mode (`CLANGD_THREADED=1`, no `CLANGD_SYNC`)
+    by delegating `session()` to the live-pipe client (`asyncSession()` in
+    `clangd_stream_harness.mjs`): 86/86 (the `scale` memory check is skipped,
+    the child's memory isn't observable). `CLANGD_BG_INDEX=1` drops
+    `-background-index=false`; `run_clangd_bgindex_smoketest.mjs` passes
+    (closed file's symbol in `workspace/symbol`, go-to-definition into it,
+    exit 0). Still open for `-background-index`: measure indexing time and
+    memory on a realistic project, where shards persist (`.cache/clangd/index`
+    under the project root) and whether the host should expose that dir, and
+    whether to run the stream suite with it enabled.
 - **clangd, V3:** static analysis / clang-tidy checks (`CLANGD_TIDY_CHECKS=ON`),
   gated on binary-size budget.
 - Subprocess I/O redirection, timeouts, polling, and detached-process

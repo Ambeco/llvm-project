@@ -8,7 +8,7 @@ import { WASI } from 'node:wasi';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { findResourceDir } from './wasi_spawn_shim.mjs';
-import { instantiateThreaded, makeFakeInstance, readImportedMemoryLimits } from './wasi_thread_hook.mjs';
+import { instantiateThreaded, makeFakeInstance, readImportedMemoryLimits, terminateWorkers } from './wasi_thread_hook.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
 // CLANGD_THREADED=1 selects the wasi-threads build (build-clangd-threads.bat):
@@ -65,6 +65,9 @@ export const td = (name, extra = {}) => ({ textDocument: { uri: uri(name) }, ...
  * {res: {name: result|undefined}, errors: {name: error}, notes: [...], exitCode, stderr}.
  */
 export async function session({ files = {}, compile = [], steps = [], args = [], initOptions, caps = {} } = {}) {
+  // Async clangd can't be fed a pre-built file (it would see exit before its workers publish).
+  if (threaded && process.env.CLANGD_SYNC !== '1')
+    return (await import('./clangd_stream_harness.mjs')).asyncSession({ files, compile, steps, args, initOptions, caps });
   const dir = await mkdtemp(path.join(tmpdir(), 'clangd-t-'));
   const tmp = await mkdtemp(path.join(tmpdir(), 'clangd-tmp-'));
   for (const [name, text] of Object.entries(files)) {
@@ -91,15 +94,17 @@ export async function session({ files = {}, compile = [], steps = [], args = [],
   await writeFile(inP, msgs.map(frame).join(''));
   const fds = [openSync(inP, 'r'), openSync(outP, 'w'), openSync(errP, 'w')];
   const compileArgs = compile.length ? ['-compile-commands-dir=/work'] : [];
-  const wasi = new WASI({ version: 'preview1', args: ['clangd', ...(threaded && process.env.CLANGD_SYNC !== '1' ? [] : ['-sync']), '-background-index=false', '-log=verbose', ...compileArgs, ...args],
+  const wasi = new WASI({ version: 'preview1', args: ['clangd', ...(threaded && process.env.CLANGD_SYNC !== '1' ? [] : ['-sync']), ...(process.env.CLANGD_BG_INDEX === '1' ? [] : ['-background-index=false']), '-log=verbose', ...compileArgs, ...args],
     env: {}, preopens: { '/work': dir, '/tmp': tmp, '/sysroot': sysrootPath, '/resource': resourceDir }, stdin: fds[0], stdout: fds[1], stderr: fds[2] });
-  let instance, memory;
+  let instance, memory, workers;
   if (threaded) {
-    ({ instance, memory } = await instantiateThreaded(module, wasmBytes, wasi.getImportObject(),
+    ({ instance, memory, workers } = await instantiateThreaded(module, wasmBytes, wasi.getImportObject(),
       { wasmPath: activeWasmPath, preopens: { '/work': dir, '/tmp': tmp, '/sysroot': sysrootPath, '/resource': resourceDir } }));
   } else instance = await WebAssembly.instantiate(module, wasi.getImportObject());
   let exitCode, trap;
   try { exitCode = wasi.start(threaded ? makeFakeInstance(instance, memory) : instance) ?? 0; } catch (e) { exitCode = -1; trap = String(e.message ?? e); }
+  // Idle pool workers and abortAfterTimeout's 5-minute sleeper outlive wasi.start().
+  if (workers) await terminateWorkers(workers);
   fds.forEach(closeSync);
 
   const buf = await readFile(outP);

@@ -100,7 +100,7 @@ export async function start({ files = {}, compile = [], args = [] } = {}) {
   }
   await writeCompile(dir, compile);
   const cfg = { wasm: process.env.CLANGD_WASM ?? wasmPath,
-    args: [...(threaded && process.env.CLANGD_SYNC !== '1' ? [] : ['-sync']), '-background-index=false', '-log=verbose', ...(compile.length ? ['-compile-commands-dir=/work'] : []), ...args],
+    args: [...(threaded && process.env.CLANGD_SYNC !== '1' ? [] : ['-sync']), ...(process.env.CLANGD_BG_INDEX === '1' ? [] : ['-background-index=false']), '-log=verbose', ...(compile.length ? ['-compile-commands-dir=/work'] : []), ...args],
     preopens: { '/work': dir, '/tmp': tmp, '/sysroot': sysrootPath, '/resource': resourceDir } };
   const child = spawn(process.execPath, ['--experimental-wasm-type-reflection', '--experimental-wasi-unstable-preview1', '--no-warnings', path.join(import.meta.dirname, 'clangd_stdio_runner.mjs')],
     { env: { ...process.env, CLANGD_RUN: JSON.stringify(cfg) }, stdio: ['pipe', 'pipe', 'pipe'] });
@@ -111,4 +111,43 @@ export async function writeCompile(dir, compile) {
   if (!compile.length) return;
   await writeFile(path.join(dir, 'compile_commands.json'), JSON.stringify(compile.map(({ file, flags }) => ({
     directory: '/work', file: `/work/${file}`, arguments: ['clang', ...(flags ?? cppFlags), `/work/${file}`] }))));
+}
+
+/**
+ * Async-mode equivalent of clangd_harness.mjs's session(): drives the same
+ * `steps` over live pipes, waiting for each reply (and for the diagnostics a
+ * didOpen/didChange/didClose produces) before sending the next, so clangd's
+ * worker threads finish before shutdown. Same return shape as session().
+ */
+export async function asyncSession({ files = {}, compile = [], steps = [], args = [], initOptions, caps = {} } = {}) {
+  const c = await start({ files, compile: compile.map((x) => ({ ...x })), args });
+  const res = {}, errors = {};
+  try {
+    const initR = await c.request('initialize', { processId: null, rootUri: 'file:///work', initializationOptions: initOptions,
+      capabilities: { ...caps, textDocument: { documentSymbol: { hierarchicalDocumentSymbolSupport: true }, ...caps.textDocument } } });
+    res.init = initR;
+    c.notify('initialized', {});
+    for (const s of steps) {
+      if (s.as) {
+        try {
+          res[s.as] = await c.request(s.m, s.p);
+          // The dynamic index is filled from the preamble after the first diagnostics, so an
+          // early completion can legitimately be empty; there is no event to wait on.
+          for (let i = 0; s.m === 'textDocument/completion' && !res[s.as]?.items?.length && i < 80; i++) {
+            await new Promise((r) => setTimeout(r, 250));
+            res[s.as] = await c.request(s.m, s.p);
+          }
+        } catch (e) { if (e.error) errors[s.as] = e.error; else throw e; }
+      } else {
+        const from = c.notes.length;
+        c.notify(s.n, s.p);
+        if (/^textDocument\/did(Open|Change|Close)$/.test(s.n))
+          await c.waitNote((m) => m.method === 'textDocument/publishDiagnostics' && m.params.uri === s.p.textDocument.uri, 60000, from).catch(() => {});
+      }
+    }
+    await c.request('shutdown', undefined);
+    c.notify('exit', undefined);
+    await c.exited;
+  } finally { if (!c.closed) c.child.kill(); }
+  return { res, errors, notes: c.notes, exitCode: c.exitCode, trap: undefined, stderr: c.stderr, dir: c.dir, memBytes: undefined };
 }

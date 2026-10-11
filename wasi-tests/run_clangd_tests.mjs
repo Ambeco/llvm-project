@@ -560,6 +560,7 @@ test('scale: 150 files swept, all searchable, wasm memory reported', async () =>
   const s = await session({ files, compile, steps });
   check(s.exitCode === 0, `exit ${s.exitCode} ${s.trap ?? ''}`);
   check((s.res.w ?? []).length >= 11, `expected memfn_14 + memfn_140..149, got ${(s.res.w ?? []).length}`);
+  if (s.memBytes === undefined) return console.log('       (wasm memory not observable in async mode)');
   console.log(`       wasm memory after sweeping 150 files: ${(s.memBytes / 1048576).toFixed(0)} MiB`);
   check(s.memBytes < 2 * 1024 ** 3, `memory ${s.memBytes} exceeds the 2 GiB link-time maximum`);
 });

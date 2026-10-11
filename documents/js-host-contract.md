@@ -201,10 +201,13 @@ imports beyond `wasi_snapshot_preview1`, no threads, no spawn hook). Run it as
   headers on disk are picked up on the next `didChange` of a file that
   includes them. By default headers are read from disk, not from unsaved
   editor buffers; pass `-use-dirty-headers` to use open buffers.
-- **No background index:** `-background-index` is a startup error in this
-  build. Project-wide symbols come from the dynamic index of files the client
-  has opened, and `didOpen` followed by `didClose` leaves a file's symbols in
-  it (the "sweep"; ~1.5 s per file with a few std headers). Nothing persists.
+- **Background index:** `-background-index` is a startup error in the
+  single-threaded build; there, project-wide symbols come from the dynamic
+  index of files the client has opened, and `didOpen` followed by `didClose`
+  leaves a file's symbols in it (the "sweep"; ~1.5 s per file with a few std
+  headers; nothing persists). The wasi-threads build runs the real background
+  indexer (default on): files in `compile_commands.json` are indexed without
+  being opened.
 - **Include-path completion** (`#include "ut|`) returned nothing under
   `node:wasi` on Windows, probably the same missing directory listing; recheck
   on the real host.
