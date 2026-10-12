@@ -443,7 +443,7 @@ Web extension (see the CDP/GDB-remote unreachability finding under
 
 ### Version policy
 
-The fork is currently built from llvm-project `main` (v24), while wasi-sdk and the VS Code `wasm-wasi-core` host ecosystem are on v23. That mismatch causes the oddities in this area (e.g. wasi-sdk's libc++/libunwind having a different wasm exception personality ABI than this clang). Once a v24 release branch exists we rebase onto it; going forward the fork tracks the latest llvm-project release that `wasm-wasi-core` supports, not `main`.
+The fork is currently built from llvm-project `main` (v24), while the wasi-sdk we take the sysroot from (34.0) is built from the LLVM 23 release branch (`23.1.0-rc3`). That mismatch causes the oddities in this area (e.g. wasi-sdk's `eh` libc++/libunwind having a different wasm exception personality ABI than this clang). Once an LLVM release branch exists that wasi-sdk also builds against, we rebase onto it; going forward the fork tracks the LLVM release the current wasi-sdk is built from, not `main`. (`wasm-wasi-core` is only the WASI host that runs the binaries; it does not pin an LLVM version, but its supported wasm/WASI features, e.g. wasm exception handling, still constrain what we can ship.)
 
 ### Exception-enabled libc++ runtimes
 
