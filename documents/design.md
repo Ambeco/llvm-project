@@ -447,7 +447,7 @@ The fork is currently built from llvm-project `main` (v24), while the wasi-sdk w
 
 ### Exception-enabled libc++ runtimes
 
-The `eh` libc++/libc++abi/libunwind must come from the same LLVM as the clang that compiles user code, because the wasm exception personality ABI differs across versions. They are therefore built from this tree with our own `clang.wasm`/`lld.wasm` (driven through node by `wasi-tests/clang_wasm_cli.mjs`; see `build-eh-runtimes.bat`), not taken from wasi-sdk. libc++ carries one patch: `__wasi__` uses the Linux locale support (`locale_base_api.h`) because the generic fallback conflicts with wasi-libc's `strtod_l` family.
+C++ exceptions are the default for shipped binaries and the sysroot (single libc++ set; no separate no-exceptions variant, since `-fno-exceptions` code links against the same libraries). The libc++/libc++abi/libunwind must come from the same LLVM as the clang that compiles user code, because the wasm exception personality ABI differs across versions, so they are built from this tree with our own `clang.wasm`/`lld.wasm` (driven through node by `wasi-tests/clang_wasm_cli.mjs`; see `build-eh-runtimes.bat`, plain and `threads`), not taken from wasi-sdk. libc++ carries one patch: `__wasi__` uses the Linux locale support (`locale_base_api.h`) because the generic fallback conflicts with wasi-libc's `strtod_l` family. The WebAssembly driver adds `-lunwind` for `-fwasm-exceptions` C++ links, and passes `-mllvm -wasm-enable-eh -mllvm -exception-model=wasm` to wasm-ld under LTO.
 
 ## Known limitations
 

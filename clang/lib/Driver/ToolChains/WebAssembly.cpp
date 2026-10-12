@@ -207,6 +207,18 @@ void wasm::Linker::ConstructJob(Compilation &C, const JobAction &JA,
 
   AddLinkerInputs(ToolChain, Inputs, Args, CmdArgs, JA);
 
+  // wasm-wasi fork addition: LTO codegen runs inside wasm-ld, which doesn't
+  // see the -fwasm-exceptions cc1 flags, so without these an LTO'd throw
+  // compiles to code whose landing pads are never reached (exceptions
+  // escape uncaught).
+  if (Args.hasArg(options::OPT_fwasm_exceptions) &&
+      ToolChain.isUsingLTO(Args)) {
+    CmdArgs.push_back("-mllvm");
+    CmdArgs.push_back("-wasm-enable-eh");
+    CmdArgs.push_back("-mllvm");
+    CmdArgs.push_back("-exception-model=wasm");
+  }
+
   if (WantsCooperativeMultithreading(ToolChain.getTriple(), Args))
     CmdArgs.push_back("--cooperative-threading");
 
@@ -228,8 +240,13 @@ void wasm::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   }
 
   if (!Args.hasArg(options::OPT_nostdlib, options::OPT_nodefaultlibs)) {
-    if (ToolChain.ShouldLinkCXXStdlib(Args))
+    if (ToolChain.ShouldLinkCXXStdlib(Args)) {
       ToolChain.AddCXXStdlibLibArgs(Args, CmdArgs);
+      // wasm-wasi fork addition: libc++abi's wasm EH personality lives in
+      // libunwind, which wasm-ld won't find unless asked.
+      if (Args.hasArg(options::OPT_fwasm_exceptions))
+        CmdArgs.push_back("-lunwind");
+    }
 
     if (WantsPthread(ToolChain.getTriple(), Args))
       CmdArgs.push_back("-lpthread");

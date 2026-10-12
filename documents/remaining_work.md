@@ -290,15 +290,15 @@ doesn't depend on any `lldb.wasm` work to be worth starting.
   `main` moving on its own, the same way the original `__WASM__`/`__wasm__`
   typo fix did, on every future rebase.
 
-## C++ exceptions + LTO everywhere (compile and debug)
+## C++ exceptions + LTO everywhere: debugging, and a real release
 
-Goal: every shipped binary/sysroot supports compiling and debugging C++ exceptions and LTO by default, not as a separate "eh" opt-in set. Today the packaged sysroot defaults to wasi-sdk's no-exceptions libc++ (`noeh`).
+Compile/link/run of exceptions, LTO, and exceptions+LTO is done and verified on both slices (`wasi-tests/run_clang_eh_lto_smoketest.mjs <release-dir> [--threads]` printed SMOKETEST PASSED, against a release dir packaged to `C:	mp\ehbelease`). Still open:
 
-- Make the exception-enabled libc++/libc++abi/libunwind (built from this tree by `build-eh-runtimes.bat`, wasip1 only so far) the default libs in the release sysroot, and drop or demote `noeh`.
-- Build the `wasm32-wasip1-threads` equivalents; the threaded slice is the more important one.
-- Test both slices (threaded and unthreaded) for exceptions, LTO, and exceptions+LTO: `run_clang_eh_lto_smoketest.mjs` covers this but takes a packaged release dir and carries a stale "KNOWN FAILING" comment; extend it to run against `--threads` too.
 - Verify debugging (lldb.wasm) of a program that throws and catches.
-- Candidate for `upstream-fixes`: the libc++ `__wasi__` locale routing patch.
+- Run the other smoke tests (`run_clang_nospawn_smoketest.mjs` etc.) against a release packaged with the new defaults; they were not re-run after switching `compile-flags.json` to exceptions.
+- The `-fno-exceptions` case is only exercised with libc++ built with exceptions (the supported setup); measure the size cost of the exception-enabled libs on a non-throwing program.
+- Check the minimum host support for wasm exception handling (`wasm-wasi-core`, the `vsclang` extension's minimum VS Code/browser).
+- Candidate for `upstream-fixes`: the libc++ `__wasi__` locale routing patch, and the two WebAssembly.cpp driver changes (`-lunwind`, LTO exception flags).
 
 ## Housekeeping / known fragile spots
 

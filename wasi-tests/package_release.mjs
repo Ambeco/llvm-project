@@ -83,24 +83,53 @@ for (const sub of ['include', 'lib']) {
 await cp(path.join(sysrootSrc, 'include', 'c++'), path.join(outDir, 'sysroot', 'include', 'c++'),
   { recursive: true });
 
+// Exceptions are the default: replace wasi-sdk's libc++/libc++abi/libunwind (built by an older LLVM, whose wasm
+// exception ABI differs from this clang's) with the ones built from this tree by build-eh-runtimes.bat, and drop
+// the no-exceptions variant so there is a single set. Headers: ours go in the shared include/c++/v1; each slice
+// keeps only its per-triple __config_site under <slice>/eh/c++/v1.
+const ehBuild = { 'wasm32-wasip1': 'build', 'wasm32-wasip1-threads': 'build-threads' };
+const ehRoot = path.join(repoRoot, 'build-eh-runtimes');
+for (const slice of SLICES) {
+  const b = path.join(ehRoot, ehBuild[slice]);
+  const hint = `run build-eh-runtimes.bat${slice.endsWith('-threads') ? ' threads' : ''}`;
+  const libDir = await mustExist(path.join(b, 'lib', TRIPLE[slice]), hint);
+  const sysLib = path.join(outDir, 'sysroot', 'lib', slice);
+  await rm(path.join(sysLib, 'noeh'), { recursive: true, force: true });
+  await rm(path.join(sysLib, 'eh'), { recursive: true, force: true });
+  await mkdir(path.join(sysLib, 'eh'), { recursive: true });
+  for (const lib of ['libc++.a', 'libc++abi.a', 'libunwind.a'])
+    await copyFile(await mustExist(path.join(libDir, lib), hint), path.join(sysLib, 'eh', lib));
+  const sysInc = path.join(outDir, 'sysroot', 'include', slice);
+  await rm(path.join(sysInc, 'noeh'), { recursive: true, force: true });
+  await rm(path.join(sysInc, 'eh'), { recursive: true, force: true });
+  await mkdir(path.join(sysInc, 'eh', 'c++', 'v1'), { recursive: true });
+  await copyFile(await mustExist(path.join(b, 'include', TRIPLE[slice], 'c++', 'v1', '__config_site'), hint),
+    path.join(sysInc, 'eh', 'c++', 'v1', '__config_site'));
+}
+// Shared headers are identical across slices; take them from the unthreaded build.
+await rm(path.join(outDir, 'sysroot', 'include', 'c++'), { recursive: true, force: true });
+await cp(await mustExist(path.join(ehRoot, 'build', 'include', 'c++'), 'run build-eh-runtimes.bat'),
+  path.join(outDir, 'sysroot', 'include', 'c++'), { recursive: true });
+
 const resSrc = await findResourceDir(path.join(repoRoot, 'build', 'lib', 'clang'));
 const ver = path.basename(resSrc);
 await cp(resSrc, path.join(outDir, 'resource', 'lib', 'clang', ver), { recursive: true });
 
 // Flags a host passes so clang.wasm needn't list directories (readdir) to find
-// libc++ headers. ${SYSROOT}/${RESOURCE} are the guest mount paths. Exceptions
-// are off because only the noeh libc++ slice is exercised by the smoke test.
+// libc++ headers. ${SYSROOT}/${RESOURCE} are the guest mount paths. C++ exceptions
+// (-fwasm-exceptions + libunwind) are the default.
 const compileFlags = {
   note: 'Substitute ${SYSROOT} and ${RESOURCE} with the guest paths the release sysroot/ and resource/lib/clang/<ver> dirs are mounted at. Required on hosts whose preopens cannot readdir.',
   clangResourceVersion: ver,
   compile: Object.fromEntries(SLICES.map((slice) => [slice, [
     `--target=${TRIPLE[slice]}`, '--sysroot=${SYSROOT}', '-resource-dir=${RESOURCE}',
-    `-isystem\${SYSROOT}/include/${slice}/noeh/c++/v1`, '-isystem${SYSROOT}/include/c++/v1',
-    '-fno-exceptions', ...(slice.endsWith('-threads') ? ['-pthread'] : [])]])),
+    `-isystem\${SYSROOT}/include/${slice}/eh/c++/v1`, '-isystem${SYSROOT}/include/c++/v1',
+    '-fwasm-exceptions', ...(slice.endsWith('-threads') ? ['-pthread'] : [])]])),
   link: Object.fromEntries(SLICES.map((slice) => [slice, [
-    `\${SYSROOT}/lib/${slice}/crt1.o`, `-L\${SYSROOT}/lib/${slice}/noeh`, `-L\${SYSROOT}/lib/${slice}`,
+    `\${SYSROOT}/lib/${slice}/crt1.o`, `-L\${SYSROOT}/lib/${slice}/eh`, `-L\${SYSROOT}/lib/${slice}`,
     ...(slice.endsWith('-threads') ? THREAD_LINK : []),
-    '-lc++', '-lc++abi', '-lc', `\${RESOURCE}/lib/${TRIPLE[slice]}/libclang_rt.builtins.a`]])),
+    '-mllvm', '-wasm-enable-eh', '-mllvm', '-exception-model=wasm', // LTO codegen runs in wasm-ld and needs these
+    '-lc++', '-lc++abi', '-lunwind', '-lc', `\${RESOURCE}/lib/${TRIPLE[slice]}/libclang_rt.builtins.a`]])),
 };
 await writeFile(path.join(outDir, 'compile-flags.json'), JSON.stringify(compileFlags, null, 2) + '\n');
 
