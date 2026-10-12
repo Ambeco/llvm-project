@@ -290,11 +290,15 @@ doesn't depend on any `lldb.wasm` work to be worth starting.
   `main` moving on its own, the same way the original `__WASM__`/`__wasm__`
   typo fix did, on every future rebase.
 
-## eh runtimes: package and smoke-test
+## C++ exceptions + LTO everywhere (compile and debug)
 
-- Package the rebuilt `eh` libs/headers (`build-eh-runtimes/build`) into the release sysroot's `eh` slice, run `wasi-tests/run_clang_eh_lto_smoketest.mjs <release-dir>`, and remove its "KNOWN FAILING" header comment if it passes. The `exceptions` case is only hand-verified so far.
-- Build the `wasm32-wasip1-threads` eh variant (`LIBCXX_ENABLE_THREADS=ON`, `-pthread`, threads triple); only plain `wasm32-wasip1` is built.
-- Upstream-ish: the libc++ `__wasi__` locale routing patch is a candidate for `upstream-fixes`.
+Goal: every shipped binary/sysroot supports compiling and debugging C++ exceptions and LTO by default, not as a separate "eh" opt-in set. Today the packaged sysroot defaults to wasi-sdk's no-exceptions libc++ (`noeh`).
+
+- Make the exception-enabled libc++/libc++abi/libunwind (built from this tree by `build-eh-runtimes.bat`, wasip1 only so far) the default libs in the release sysroot, and drop or demote `noeh`.
+- Build the `wasm32-wasip1-threads` equivalents; the threaded slice is the more important one.
+- Test both slices (threaded and unthreaded) for exceptions, LTO, and exceptions+LTO: `run_clang_eh_lto_smoketest.mjs` covers this but takes a packaged release dir and carries a stale "KNOWN FAILING" comment; extend it to run against `--threads` too.
+- Verify debugging (lldb.wasm) of a program that throws and catches.
+- Candidate for `upstream-fixes`: the libc++ `__wasi__` locale routing patch.
 
 ## Housekeeping / known fragile spots
 

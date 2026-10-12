@@ -441,6 +441,10 @@ Web extension (see the CDP/GDB-remote unreachability finding under
   This is worth two lines in `documents/js-host-contract.md` once a real
   (non-test-harness) multithreaded host needs this.
 
+### Version policy
+
+The fork is currently built from llvm-project `main` (v24), while wasi-sdk and the VS Code `wasm-wasi-core` host ecosystem are on v23. That mismatch causes the oddities in this area (e.g. wasi-sdk's libc++/libunwind having a different wasm exception personality ABI than this clang). Once a v24 release branch exists we rebase onto it; going forward the fork tracks the latest llvm-project release that `wasm-wasi-core` supports, not `main`.
+
 ### Exception-enabled libc++ runtimes
 
 The `eh` libc++/libc++abi/libunwind must come from the same LLVM as the clang that compiles user code, because the wasm exception personality ABI differs across versions. They are therefore built from this tree with our own `clang.wasm`/`lld.wasm` (driven through node by `wasi-tests/clang_wasm_cli.mjs`; see `build-eh-runtimes.bat`), not taken from wasi-sdk. libc++ carries one patch: `__wasi__` uses the Linux locale support (`locale_base_api.h`) because the generic fallback conflicts with wasi-libc's `strtod_l` family.
