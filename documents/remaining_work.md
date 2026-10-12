@@ -290,6 +290,12 @@ doesn't depend on any `lldb.wasm` work to be worth starting.
   `main` moving on its own, the same way the original `__WASM__`/`__wasm__`
   typo fix did, on every future rebase.
 
+## eh runtimes: package and smoke-test
+
+- Package the rebuilt `eh` libs/headers (`build-eh-runtimes/build`) into the release sysroot's `eh` slice, run `wasi-tests/run_clang_eh_lto_smoketest.mjs <release-dir>`, and remove its "KNOWN FAILING" header comment if it passes. The `exceptions` case is only hand-verified so far.
+- Build the `wasm32-wasip1-threads` eh variant (`LIBCXX_ENABLE_THREADS=ON`, `-pthread`, threads triple); only plain `wasm32-wasip1` is built.
+- Upstream-ish: the libc++ `__wasi__` locale routing patch is a candidate for `upstream-fixes`.
+
 ## Housekeeping / known fragile spots
 
 - Done: `build.bat` no longer hardcodes `lib/clang/24/...` for the
