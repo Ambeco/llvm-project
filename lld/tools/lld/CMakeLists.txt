@@ -24,15 +24,26 @@ function(lld_target_link_libraries target type)
   target_link_libraries(${target} ${type} ${ARGN})
 endfunction()
 
-lld_target_link_libraries(lld
-  PRIVATE
-  lldCommon
-  lldCOFF
-  lldELF
-  lldMachO
-  lldMinGW
-  lldWasm
-  )
+option(LLD_WASM_ONLY "Link only the wasm-ld driver into the lld executable" OFF)
+
+if(LLD_WASM_ONLY)
+  target_compile_definitions(lld PRIVATE LLD_WASM_ONLY)
+  lld_target_link_libraries(lld
+    PRIVATE
+    lldCommon
+    lldWasm
+    )
+else()
+  lld_target_link_libraries(lld
+    PRIVATE
+    lldCommon
+    lldCOFF
+    lldELF
+    lldMachO
+    lldMinGW
+    lldWasm
+    )
+endif()
 
 if(NOT LLD_SYMLINKS_TO_CREATE)
   set(LLD_SYMLINKS_TO_CREATE
