@@ -294,7 +294,7 @@ doesn't depend on any `lldb.wasm` work to be worth starting.
 
 Compile/link/run of exceptions, LTO, and exceptions+LTO is done and verified on both slices (`wasi-tests/run_clang_eh_lto_smoketest.mjs <release-dir> [--threads]` printed SMOKETEST PASSED, against a release dir packaged to `C:	mp\ehbelease`). Still open:
 
-- Verify debugging (lldb.wasm) of a program that throws and catches.
+- Verify `lldb-wasm-reactor` (`wasm_dbg_resolve_pc`/`wasm_dbg_format_value`; the plugin uses it as a symbol/value library, not a live debugger) on a `-g -fwasm-exceptions` program: PCs inside try/catch bodies and landing pads should resolve to the right source line, and locals inside `catch` handlers should format correctly.
 - Run the other smoke tests (`run_clang_nospawn_smoketest.mjs` etc.) against a release packaged with the new defaults; they were not re-run after switching `compile-flags.json` to exceptions.
 - The `-fno-exceptions` case is only exercised with libc++ built with exceptions (the supported setup); measure the size cost of the exception-enabled libs on a non-throwing program.
 - Check the minimum host support for wasm exception handling (`wasm-wasi-core`, the `vsclang` extension's minimum VS Code/browser).
