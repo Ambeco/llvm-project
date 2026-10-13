@@ -170,14 +170,24 @@ console.error('Instantiating...');
 // 2026-09-09 entry for why omitting this hangs `task_group.wait()`
 // forever instead of failing loudly.
 const extraImportsModule = new URL('./lldb_wasm_reactor_dbg_imports.mjs', import.meta.url).href;
-const { instance, memory } = await instantiateThreaded(
-  wasmModule, bytes, importObjectBase, { wasmPath: reactorPath, preopens, extraImportsModule });
+// A single-threaded reactor (build-lldb-single-threaded.bat) imports no wasi.thread-spawn and exports its own
+// memory, so it instantiates like any plain WASI module.
+const isThreaded = WebAssembly.Module.imports(wasmModule).some((i) => i.name === 'thread-spawn');
+console.error(isThreaded ? 'Threaded reactor.' : 'Single-threaded reactor.');
+let instance, memory;
+if (isThreaded) {
+  ({ instance, memory } = await instantiateThreaded(
+    wasmModule, bytes, importObjectBase, { wasmPath: reactorPath, preopens, extraImportsModule }));
+} else {
+  instance = await WebAssembly.instantiate(wasmModule, importObjectBase);
+  memory = instance.exports.memory;
+}
 // This is a reactor module (`-mexec-model=reactor`, see the CMakeLists
 // comment): no `_start`, initialize via `_initialize` instead --
 // makeFakeInstance's forThread:true strips `_start` for exactly this
 // reason (see wasi_thread_hook.mjs's file header), even though this
 // isn't a spawned thread.
-const fakeInstance = makeFakeInstance(instance, memory, { forThread: true });
+const fakeInstance = isThreaded ? makeFakeInstance(instance, memory, { forThread: true }) : instance;
 wasi.initialize(fakeInstance);
 console.error('Initialized.');
 
