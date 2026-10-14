@@ -52,7 +52,7 @@ async function walk(dir) {
   return out;
 }
 
-await rm(outDir, { recursive: true, force: true });
+await rm(outDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
 await mkdir(path.join(outDir, 'bin'), { recursive: true });
 
 const single = path.join(repoRoot, 'build-single-threaded', 'bin');
@@ -97,20 +97,20 @@ for (const slice of SLICES) {
   const hint = `run build-eh-runtimes.bat${slice.endsWith('-threads') ? ' threads' : ''}`;
   const libDir = await mustExist(path.join(b, 'lib', TRIPLE[slice]), hint);
   const sysLib = path.join(outDir, 'sysroot', 'lib', slice);
-  await rm(path.join(sysLib, 'noeh'), { recursive: true, force: true });
-  await rm(path.join(sysLib, 'eh'), { recursive: true, force: true });
+  await rm(path.join(sysLib, 'noeh'), { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
+  await rm(path.join(sysLib, 'eh'), { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
   await mkdir(path.join(sysLib, 'eh'), { recursive: true });
   for (const lib of ['libc++.a', 'libc++abi.a', 'libunwind.a'])
     await copyFile(await mustExist(path.join(libDir, lib), hint), path.join(sysLib, 'eh', lib));
   const sysInc = path.join(outDir, 'sysroot', 'include', slice);
-  await rm(path.join(sysInc, 'noeh'), { recursive: true, force: true });
-  await rm(path.join(sysInc, 'eh'), { recursive: true, force: true });
+  await rm(path.join(sysInc, 'noeh'), { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
+  await rm(path.join(sysInc, 'eh'), { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
   await mkdir(path.join(sysInc, 'eh', 'c++', 'v1'), { recursive: true });
   await copyFile(await mustExist(path.join(b, 'include', TRIPLE[slice], 'c++', 'v1', '__config_site'), hint),
     path.join(sysInc, 'eh', 'c++', 'v1', '__config_site'));
 }
 // Shared headers are identical across slices; take them from the unthreaded build.
-await rm(path.join(outDir, 'sysroot', 'include', 'c++'), { recursive: true, force: true });
+await rm(path.join(outDir, 'sysroot', 'include', 'c++'), { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
 await cp(await mustExist(path.join(ehRoot, 'build', 'include', 'c++'), 'run build-eh-runtimes.bat'),
   path.join(outDir, 'sysroot', 'include', 'c++'), { recursive: true });
 
