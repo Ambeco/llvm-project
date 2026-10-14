@@ -309,7 +309,7 @@ Covered today: `--version`, compile, compile+link+run, parallel compiles, single
 
 ### A. Hosted tools
 
-- **P0 `llvm-ar` (+ `llvm-ranlib`, same binary).** Not built as wasm. Needed by any Makefile that builds a static library. Build it, then test creating/extending archives and linking against them with `wasm-ld`, including archives containing LTO bitcode. Optional (only if the plugin wants disassemble/inspect/strip features): `llvm-nm`, `llvm-objdump`, `llvm-strip`/`objcopy`; `llvm-symbolizer` is not needed (the reactor does PC-to-line).
+- **P1 Optional binutils.** `llvm-nm`, `llvm-objdump`, `llvm-strip`/`objcopy` are configured in both build trees but not built or tested; build/test (same pattern as `wasi-tests/run_llvm_ar_smoketest.mjs`) only if the plugin wants disassemble/inspect/strip features. `llvm-symbolizer` is not needed (the reactor does PC-to-line). `llvm-ar`/`llvm-ranlib` are done and shipped (single-threaded only).
 - **P0 Build-system contract (make plugin).** Test `-MD -MF`/`-MMD` depfiles (content and paths), response files (`@file`), long command lines, `-o` into other dirs, relative vs absolute paths and cwd handling, exit codes, diagnostics on stderr with `$COLUMNS`, `-pipe`/`-time`/`-save-temps`/`-###`/`-v` (flags that would need subprocess redirection must fail with a clear message, not hang), `-ftime-trace`, parallel invocations sharing one output dir.
 - **P0 Incremental rebuild / offline restart.** File mtimes written by wasm tools must be ordered correctly for make (WASI timestamp resolution, `utimensat`); outputs must be deterministic (byte-identical across runs, 1 vs N threads, threaded vs single-threaded tools) or caching and `--build-id` matching break.
 - **P0 Real-size workloads.** Compile and link the stand-in Makefile project (above) and a few real LLVM source files (e.g. `llvm/lib/Support` with LLVM's flags: `-std=c++17 -fno-rtti -pthread`); a template-heavy C++20/23 TU; PCH round trip; `-fmodules`/module cache. Watch the 2 GiB shared-memory ceiling, deep template recursion vs stack size (only the main thread's stack is protected, see Known limitations), and that OOM fails loudly.
@@ -338,6 +338,7 @@ Covered today: `--version`, compile, compile+link+run, parallel compiles, single
 - `Atomics.wait` is forbidden on the browser main thread: run produced `-pthread` programs and the spawn-hook blocking calls only in Workers.
 - The offline north star end to end: install, open a Makefile project, edit, rebuild (only the changed file recompiles), run, build debug, debug, restart with no network, debug again with no rebuild.
 - Asset persistence: sysroot, resource dir, and binaries cached on disk and loaded with no network access; cached-module/startup time for the 100 MB tools.
+- `llvm-ar x` writes into the cwd, which WASI lacks: a Makefile or script that extracts archive members must pass `--output=<dir>`; `llvm-ranlib` is `llvm-ar.wasm` run with `argv[0]` `llvm-ranlib`.
 - Process-spawn contract (`documents/js-host-contract.md`) under real Workers: termination cleanup, `$COLUMNS`, many concurrent compiles.
 
 ## Housekeeping / known fragile spots

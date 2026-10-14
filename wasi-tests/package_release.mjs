@@ -2,6 +2,7 @@
 //
 //   <out>/bin/clang.wasm, lld.wasm            single-process, single-thread (build-single-threaded)
 //   <out>/bin/clang-threads.wasm, lld-threads.wasm   threaded pair (build)
+//   <out>/bin/llvm-ar.wasm                    single-threaded only (also serves as llvm-ranlib via argv[0])
 //   <out>/bin/lldb.wasm, lldb-wasm-reactor.wasm      (build-lldb, skipped if absent)
 //   <out>/sysroot/include, sysroot/lib        wasip1 + wasip1-threads slices of wasi-sdk's sysroot
 //   <out>/resource/lib/clang/<ver>/           clang resource dir from the threaded build
@@ -61,6 +62,8 @@ const copies = [
   [path.join(single, 'lld.wasm'), 'bin/lld.wasm', 'run build-single-threaded.bat'],
   [path.join(threaded, 'clang.wasm'), 'bin/clang-threads.wasm', 'run build.bat'],
   [path.join(threaded, 'lld.wasm'), 'bin/lld-threads.wasm', 'run build.bat'],
+  // llvm-ar never spawns threads, so only the single-threaded build ships; run it as argv[0] "llvm-ranlib" for ranlib.
+  [path.join(single, 'llvm-ar.wasm'), 'bin/llvm-ar.wasm', 'run: cmake --build build-single-threaded --target llvm-ar'],
 ];
 for (const [src, dst, hint] of copies)
   await copyFile(await mustExist(src, hint), path.join(outDir, dst));
