@@ -124,6 +124,8 @@ await cp(resSrc, path.join(outDir, 'resource', 'lib', 'clang', ver), { recursive
 const compileFlags = {
   note: 'Substitute ${SYSROOT} and ${RESOURCE} with the guest paths the release sysroot/ and resource/lib/clang/<ver> dirs are mounted at. Required on hosts whose preopens cannot readdir.',
   clangResourceVersion: ver,
+  // Present only when this clang.wasm has the per-line guard option (SanitizerCoverage.cpp, -sanitizer-coverage-stmt).
+  debugCoverage: ['-mllvm', '-sanitizer-coverage-stmt'],
   compile: Object.fromEntries(SLICES.map((slice) => [slice, [
     `--target=${TRIPLE[slice]}`, '--sysroot=${SYSROOT}', '-resource-dir=${RESOURCE}',
     `-isystem\${SYSROOT}/include/${slice}/eh/c++/v1`, '-isystem${SYSROOT}/include/c++/v1',

@@ -181,6 +181,13 @@ static cl::opt<bool> ClGatedCallbacks(
              ". Currently only supported for trace-pc-guard and trace-cmp."),
     cl::Hidden, cl::init(false));
 
+static cl::opt<bool> ClStmtGuards(
+    "sanitizer-coverage-stmt",
+    cl::desc("With trace-pc-guard, also add a guard before the first "
+             "instruction of every source line that starts inside a block, "
+             "so a debugger can stop at each line (use with no-prune)"),
+    cl::Hidden, cl::init(false));
+
 namespace {
 
 SanitizerCoverageOptions getOptions(int LegacyCoverageLevel) {
@@ -269,12 +276,16 @@ private:
                             ArrayRef<Instruction *> SwitchTraceTargets,
                             Value *&FunctionGateCmp);
   bool InjectCoverage(Function &F, ArrayRef<BasicBlock *> AllBlocks,
+                      ArrayRef<Instruction *> LinePoints,
                       Value *&FunctionGateCmp, bool IsLeafFunc);
+  void CollectLinePoints(Function &F, ArrayRef<BasicBlock *> Blocks,
+                         SmallVectorImpl<Instruction *> &LinePoints);
   GlobalVariable *CreateFunctionLocalArrayInSection(size_t NumElements,
                                                     Function &F, Type *Ty,
                                                     const char *Section);
   GlobalVariable *CreatePCArray(Function &F, ArrayRef<BasicBlock *> AllBlocks);
-  void CreateFunctionLocalArrays(Function &F, ArrayRef<BasicBlock *> AllBlocks);
+  void CreateFunctionLocalArrays(Function &F, ArrayRef<BasicBlock *> AllBlocks,
+                                 size_t ExtraGuards);
   Instruction *CreateGateBranch(Function &F, Value *&FunctionGateCmp,
                                 Instruction *I);
   Value *CreateFunctionLocalGateCmp(IRBuilder<> &IRB);
@@ -756,8 +767,13 @@ void ModuleSanitizerCoverage::instrumentFunction(Function &F) {
   if (Options.CollectControlFlow)
     createFunctionControlFlow(F);
 
+  SmallVector<Instruction *, 32> LinePoints;
+  if (ClStmtGuards && Options.TracePCGuard && !Options.GatedCallbacks)
+    CollectLinePoints(F, BlocksToInstrument, LinePoints);
+
   Value *FunctionGateCmp = nullptr;
-  InjectCoverage(F, BlocksToInstrument, FunctionGateCmp, IsLeafFunc);
+  InjectCoverage(F, BlocksToInstrument, LinePoints, FunctionGateCmp,
+                 IsLeafFunc);
   InjectCoverageForIndirectCalls(F, IndirCalls);
   InjectTraceForCmp(F, CmpTraceTargets, FunctionGateCmp);
   InjectTraceForSwitch(F, SwitchTraceTargets, FunctionGateCmp);
@@ -828,10 +844,10 @@ ModuleSanitizerCoverage::CreatePCArray(Function &F,
 }
 
 void ModuleSanitizerCoverage::CreateFunctionLocalArrays(
-    Function &F, ArrayRef<BasicBlock *> AllBlocks) {
+    Function &F, ArrayRef<BasicBlock *> AllBlocks, size_t ExtraGuards) {
   if (Options.TracePCGuard)
     FunctionGuardArray = CreateFunctionLocalArrayInSection(
-        AllBlocks.size(), F, Int32Ty, SanCovGuardsSectionName);
+        AllBlocks.size() + ExtraGuards, F, Int32Ty, SanCovGuardsSectionName);
 
   if (Options.Inline8bitCounters)
     Function8bitCounterArray = CreateFunctionLocalArrayInSection(
@@ -870,15 +886,57 @@ Instruction *ModuleSanitizerCoverage::CreateGateBranch(Function &F,
   return SplitBlockAndInsertIfThen(FunctionGateCmp, IP, false, Weights);
 }
 
+// Finds the first instruction of each source line that begins in the middle of
+// a block; the block's own guard already covers its first line. Line 0 and
+// column-only changes are ignored. Only stepping through user code needs these,
+// so they are not collected unless -sanitizer-coverage-stmt is given.
+void ModuleSanitizerCoverage::CollectLinePoints(
+    Function &F, ArrayRef<BasicBlock *> Blocks,
+    SmallVectorImpl<Instruction *> &LinePoints) {
+  for (BasicBlock *BB : Blocks) {
+    unsigned PrevLine = 0;
+    if (BB == &F.getEntryBlock())
+      if (auto *SP = F.getSubprogram())
+        PrevLine = SP->getScopeLine();
+    bool First = true;
+    for (BasicBlock::iterator It = BB->getFirstInsertionPt(); It != BB->end();
+         ++It) {
+      Instruction &I = *It;
+      if (I.isDebugOrPseudoInst() || isa<AllocaInst>(I))
+        continue;
+      unsigned Line = I.getDebugLoc() ? I.getDebugLoc().getLine() : 0;
+      if (!Line)
+        continue;
+      if (First && !PrevLine)
+        PrevLine = Line;
+      First = false;
+      if (Line == PrevLine)
+        continue;
+      PrevLine = Line;
+      LinePoints.push_back(&I);
+    }
+  }
+}
+
 bool ModuleSanitizerCoverage::InjectCoverage(Function &F,
                                              ArrayRef<BasicBlock *> AllBlocks,
+                                             ArrayRef<Instruction *> LinePoints,
                                              Value *&FunctionGateCmp,
                                              bool IsLeafFunc) {
   if (AllBlocks.empty())
     return false;
-  CreateFunctionLocalArrays(F, AllBlocks);
+  CreateFunctionLocalArrays(F, AllBlocks, LinePoints.size());
   for (size_t i = 0, N = AllBlocks.size(); i < N; i++)
     InjectCoverageAtBlock(F, *AllBlocks[i], i, FunctionGateCmp, IsLeafFunc);
+  // Same hook as a block guard, so the host sees both kinds as one stream.
+  for (size_t i = 0, N = LinePoints.size(); i < N; i++) {
+    InstrumentationIRBuilder IRB(LinePoints[i]);
+    IRB.SetCurrentDebugLocation(LinePoints[i]->getDebugLoc());
+    auto GuardPtr = IRB.CreateConstInBoundsGEP2_64(
+        FunctionGuardArray->getValueType(), FunctionGuardArray, 0,
+        AllBlocks.size() + i);
+    IRB.CreateCall(SanCovTracePCGuard, GuardPtr)->setCannotMerge();
+  }
 
   return true;
 }
