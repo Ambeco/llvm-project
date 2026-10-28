@@ -17,12 +17,15 @@
 #include "llvm/Analysis/PostDominators.h"
 #include "llvm/IR/Constant.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DebugInfo.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/EHPersonalities.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
@@ -188,6 +191,14 @@ static cl::opt<bool> ClStmtGuards(
              "so a debugger can stop at each line (use with no-prune)"),
     cl::Hidden, cl::init(false));
 
+static cl::opt<bool> ClSpillDebugVars(
+    "sanitizer-coverage-spill-debug-vars",
+    cl::desc("With trace-pc-guard, copy each by-value argument pointer and "
+             "each dynamic alloca (VLA) address that a dbg.declare names into "
+             "a stack slot and describe the variable with DW_OP_deref, so a "
+             "debugger that reads only memory can show it"),
+    cl::Hidden, cl::init(false));
+
 namespace {
 
 SanitizerCoverageOptions getOptions(int LegacyCoverageLevel) {
@@ -286,6 +297,7 @@ private:
                       bool IsLeafFunc);
   void CollectLinePoints(Function &F, ArrayRef<BasicBlock *> Blocks,
                          SmallVectorImpl<LinePoint> &LinePoints);
+  void SpillDebugVariables(Function &F);
   GlobalVariable *CreateFunctionLocalArrayInSection(size_t NumElements,
                                                     Function &F, Type *Ty,
                                                     const char *Section);
@@ -780,6 +792,8 @@ void ModuleSanitizerCoverage::instrumentFunction(Function &F) {
   Value *FunctionGateCmp = nullptr;
   InjectCoverage(F, BlocksToInstrument, LinePoints, FunctionGateCmp,
                  IsLeafFunc);
+  if (ClSpillDebugVars && Options.TracePCGuard)
+    SpillDebugVariables(F);
   InjectCoverageForIndirectCalls(F, IndirCalls);
   InjectTraceForCmp(F, CmpTraceTargets, FunctionGateCmp);
   InjectTraceForSwitch(F, SwitchTraceTargets, FunctionGateCmp);
@@ -933,6 +947,53 @@ void ModuleSanitizerCoverage::CollectLinePoints(
         LinePoints.push_back({Next, I.getDebugLoc()});
     }
   }
+}
+
+// At -O0 a by-value aggregate parameter (an Argument pointer) and a VLA (a
+// dynamic alloca) are named by a dbg.declare on an SSA value, which DWARF
+// can only describe as a wasm local, and a debugger that reads memory cannot
+// read a local. Store the value into a fresh static alloca and point the
+// dbg.declare at that slot with a DW_OP_deref instead. Argument stores go
+// before the entry guard (so the first stop sees them); a VLA's goes right
+// after its alloca. Run after InjectCoverage so the guards are in place.
+void ModuleSanitizerCoverage::SpillDebugVariables(Function &F) {
+  BasicBlock &Entry = F.getEntryBlock();
+  auto FirstNonAlloca = [&]() {
+    for (Instruction &I : Entry) {
+      auto *AI = dyn_cast<AllocaInst>(&I);
+      if (!AI || !AI->isStaticAlloca())
+        return I.getIterator();
+    }
+    return Entry.end();
+  };
+  auto Spill = [&](Value *V, BasicBlock::iterator StoreAt) {
+    auto Declares = findDVRDeclares(V);
+    if (Declares.empty())
+      return;
+    IRBuilder<> Builder(&*Entry.getFirstInsertionPt());
+    AllocaInst *Slot = Builder.CreateAlloca(V->getType(), nullptr,
+                                            V->getName() + ".dbg.spill");
+    Slot->setAlignment(F.getDataLayout().getPointerABIAlignment(0));
+    IRBuilder<> StoreBuilder(StoreAt->getParent(), StoreAt);
+    StoreInst *Store = StoreBuilder.CreateStore(V, Slot);
+    if (auto *Loc = dyn_cast<Instruction>(V))
+      Store->setDebugLoc(Loc->getDebugLoc());
+    for (DbgVariableRecord *DVR : Declares) {
+      DVR->replaceVariableLocationOp(V, Slot);
+      DVR->setExpression(
+          DIExpression::prepend(DVR->getExpression(), DIExpression::DerefBefore));
+    }
+  };
+  for (Argument &A : F.args())
+    if (A.getType()->isPointerTy())
+      Spill(&A, FirstNonAlloca());
+  SmallVector<AllocaInst *, 4> Dynamic;
+  for (Instruction &I : instructions(F))
+    if (auto *AI = dyn_cast<AllocaInst>(&I))
+      if (!AI->isStaticAlloca())
+        Dynamic.push_back(AI);
+  for (AllocaInst *AI : Dynamic)
+    Spill(AI, std::next(AI->getIterator()));
 }
 
 bool ModuleSanitizerCoverage::InjectCoverage(Function &F,
