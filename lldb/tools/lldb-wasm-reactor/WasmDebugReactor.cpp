@@ -28,6 +28,8 @@
 #include "lldb/Symbol/Function.h"
 #include "lldb/Symbol/LineEntry.h"
 #include "lldb/Symbol/SymbolContext.h"
+#include "lldb/Symbol/Variable.h"
+#include "lldb/Symbol/VariableList.h"
 #include "lldb/Target/StackFrame.h"
 #include "lldb/Target/Target.h"
 #include "lldb/Target/TargetList.h"
@@ -148,6 +150,116 @@ bool AppendResolvedPc(TargetSP target_sp, uint64_t pc, Stream &stream) {
     stream.Printf("0x%llx", static_cast<unsigned long long>(pc));
   }
   return true;
+}
+
+constexpr uint32_t kMaxListedChildren = 256;
+
+/// The frame's variables visible at its pc, in declaration order (parameters
+/// first). The position in this list is the first component of the paths
+/// `wasm_dbg_get_variables` hands out, so listing and resolving must agree.
+/// Compiler-made variables (the `__vla_expr` size slots) are skipped, but
+/// `this` is kept.
+std::vector<VariableSP> FrameVariables(StackFrame &frame) {
+  std::vector<VariableSP> result;
+  VariableListSP list_sp = frame.GetInScopeVariableList(
+      /*get_file_globals=*/false);
+  if (!list_sp)
+    return result;
+  for (size_t i = 0; i < list_sp->GetSize(); ++i) {
+    VariableSP var_sp = list_sp->GetVariableAtIndex(i);
+    if (var_sp && (!var_sp->IsArtificial() ||
+                   var_sp->GetName() == ConstString("this")))
+      result.push_back(var_sp);
+  }
+  return result;
+}
+
+/// The object whose children a debugger shows: the data formatter's synthetic
+/// view (`std::vector` as its elements) when one applies, else the object.
+ValueObjectSP DisplayValue(ValueObjectSP val_sp) {
+  if (ValueObjectSP synthetic_sp = val_sp->GetSyntheticValue())
+    return synthetic_sp;
+  return val_sp;
+}
+
+/// Resolves a path made of `/`-separated indices: the first selects a
+/// variable from `FrameVariables`, each further one a child of the previous
+/// value (as `DisplayValue` presents it). Indices rather than names or
+/// expressions because a synthetic child (a `std::vector` element) has no
+/// expression that reaches it.
+ValueObjectSP ResolveVariablePath(StackFrame &frame, llvm::StringRef path,
+                                  std::string &error) {
+  llvm::SmallVector<llvm::StringRef, 8> parts;
+  path.split(parts, '/');
+  ValueObjectSP val_sp;
+  for (size_t i = 0; i < parts.size(); ++i) {
+    uint32_t index;
+    if (parts[i].getAsInteger(10, index)) {
+      error = llvm::formatv("\"{0}\" is not a variable path from "
+                            "wasm_dbg_get_variables (index {1} is not a "
+                            "number)",
+                            path, i)
+                  .str();
+      return nullptr;
+    }
+    if (i == 0) {
+      std::vector<VariableSP> vars = FrameVariables(frame);
+      if (index >= vars.size()) {
+        error = llvm::formatv("the frame has {0} variables, none at index {1}",
+                              vars.size(), index)
+                    .str();
+        return nullptr;
+      }
+      val_sp = frame.GetValueObjectForFrameVariable(vars[index],
+                                                    eNoDynamicValues);
+    } else {
+      val_sp = DisplayValue(val_sp)->GetChildAtIndex(index);
+    }
+    if (!val_sp) {
+      error = llvm::formatv("\"{0}\" has no value at component {1}", path, i)
+                  .str();
+      return nullptr;
+    }
+  }
+  return val_sp;
+}
+
+void AppendField(Stream &stream, const char *text) {
+  for (const char *p = text ? text : ""; *p; ++p)
+    stream.PutChar((*p == '\t' || *p == '\n' || *p == '\r') ? ' ' : *p);
+}
+
+/// One `path\tname\ttype\tvalue\thas_children` line. `value` is the data
+/// formatter summary, else the plain value, else the reason there is none
+/// (e.g. a variable living in a wasm local, which the host cannot read).
+void AppendVariableLine(Stream &stream, llvm::StringRef path,
+                        ValueObjectSP val_sp) {
+  const char *summary = val_sp->GetSummaryAsCString();
+  const char *value = summary ? summary : val_sp->GetValueAsCString();
+  std::string failure;
+  if (!value && val_sp->GetError().Fail()) {
+    llvm::StringRef reason = val_sp->GetError().AsCString();
+    // A location in a wasm local (a by-value struct parameter, a VLA pointer)
+    // is not in linear memory and no host can read it.
+    if (reason.contains("DW_OP_WASM_location"))
+      failure = "<not available: stored in a WebAssembly local, which the "
+                "debugger cannot read>";
+    else
+      failure = ("<" + reason + ">").str();
+    value = failure.c_str();
+  }
+  bool has_children =
+      DisplayValue(val_sp)->GetNumChildrenIgnoringErrors(1) > 0;
+  stream.PutCString(path);
+  stream.PutChar('\t');
+  AppendField(stream, val_sp->GetName().GetCString());
+  stream.PutChar('\t');
+  AppendField(stream, val_sp->GetDisplayTypeName().GetCString());
+  stream.PutChar('\t');
+  AppendField(stream, value);
+  stream.PutChar('\t');
+  stream.PutChar(has_children ? '1' : '0');
+  stream.PutChar('\n');
 }
 
 } // namespace
@@ -410,6 +522,77 @@ int32_t wasm_dbg_format_value(uint32_t frame_index, const char *expr,
   if (llvm::Error err = val_sp->Dump(stream)) {
     SetLastError(llvm::toString(std::move(err)));
     return -3;
+  }
+  return CopyToBuffer(stream.GetString(), out_buf, out_buf_size);
+}
+
+/// Lists variables for a debugger's Variables pane into `(out_buf,
+/// out_buf_size)`, one `path\tname\ttype\tvalue\thas_children` line each
+/// (tab and newline in the fields become spaces; `has_children` is `0` or
+/// `1`). An empty `path` lists frame `frame_index`'s variables visible at its
+/// pc; otherwise `path` is a `path` field from an earlier call and its
+/// children (a struct's members, an array's elements, a pointee, or what a
+/// data formatter exposes such as a `std::vector`'s elements) are listed,
+/// capped at 256 with a final line saying how many were left out.
+///
+/// Paths are indices into the frame's current state and are only valid for
+/// the stop that produced them; they are re-resolved on every call, so a host
+/// that has to fetch missed memory pages can call `wasm_dbg_set_stop()` again
+/// and repeat the call. A variable that cannot be read still gets a line, its
+/// value text being the reason. Returns the untruncated length of the result
+/// (`snprintf` convention), or a negative value if the frame or path does
+/// not exist.
+int32_t wasm_dbg_get_variables(uint32_t frame_index, const char *path,
+                               char *out_buf, uint32_t out_buf_size)
+    WASM_EXPORT("wasm_dbg_get_variables");
+int32_t wasm_dbg_get_variables(uint32_t frame_index, const char *path,
+                               char *out_buf, uint32_t out_buf_size) {
+  ClearLastError();
+  ProcessWasmMemory *wasm_process = GetWasmProcess();
+  if (!wasm_process) {
+    SetLastError("wasm_dbg_create_target() was not called (or failed)");
+    return -1;
+  }
+  ThreadSP thread_sp = wasm_process->GetThreadList().GetThreadAtIndex(0);
+  StackFrameSP frame_sp =
+      thread_sp ? thread_sp->GetStackFrameAtIndex(frame_index) : nullptr;
+  if (!frame_sp) {
+    SetLastError(
+        llvm::formatv("no frame {0} -- has wasm_dbg_set_stop() been called "
+                      "yet, and does it include that many frames?",
+                      frame_index)
+            .str());
+    return -1;
+  }
+
+  StreamString stream;
+  llvm::StringRef path_ref(path ? path : "");
+  if (path_ref.empty()) {
+    std::vector<VariableSP> vars = FrameVariables(*frame_sp);
+    for (size_t i = 0; i < vars.size(); ++i) {
+      ValueObjectSP val_sp =
+          frame_sp->GetValueObjectForFrameVariable(vars[i], eNoDynamicValues);
+      if (val_sp)
+        AppendVariableLine(stream, std::to_string(i), val_sp);
+    }
+  } else {
+    std::string error;
+    ValueObjectSP parent_sp = ResolveVariablePath(*frame_sp, path_ref, error);
+    if (!parent_sp) {
+      SetLastError(error);
+      return -2;
+    }
+    ValueObjectSP shown_sp = DisplayValue(parent_sp);
+    uint32_t count =
+        shown_sp->GetNumChildrenIgnoringErrors(kMaxListedChildren + 1);
+    for (uint32_t i = 0; i < std::min(count, kMaxListedChildren); ++i) {
+      if (ValueObjectSP child_sp = shown_sp->GetChildAtIndex(i))
+        AppendVariableLine(stream, path_ref.str() + "/" + std::to_string(i),
+                           child_sp);
+    }
+    if (count > kMaxListedChildren)
+      stream.Printf("\t...\t\tonly the first %u children are shown\t0\n",
+                    kMaxListedChildren);
   }
   return CopyToBuffer(stream.GetString(), out_buf, out_buf_size);
 }
