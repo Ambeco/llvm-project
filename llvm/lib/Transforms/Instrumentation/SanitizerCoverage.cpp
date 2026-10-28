@@ -242,6 +242,12 @@ SanitizerCoverageOptions OverrideFromCL(SanitizerCoverageOptions Options) {
   return Options;
 }
 
+// A place for an extra guard inside a block (see CollectLinePoints).
+struct LinePoint {
+  Instruction *InsertBefore;
+  DebugLoc Loc;
+};
+
 class ModuleSanitizerCoverage {
 public:
   using DomTreeCallback = function_ref<const DominatorTree &(Function &F)>;
@@ -276,10 +282,10 @@ private:
                             ArrayRef<Instruction *> SwitchTraceTargets,
                             Value *&FunctionGateCmp);
   bool InjectCoverage(Function &F, ArrayRef<BasicBlock *> AllBlocks,
-                      ArrayRef<Instruction *> LinePoints,
-                      Value *&FunctionGateCmp, bool IsLeafFunc);
+                      ArrayRef<LinePoint> LinePoints, Value *&FunctionGateCmp,
+                      bool IsLeafFunc);
   void CollectLinePoints(Function &F, ArrayRef<BasicBlock *> Blocks,
-                         SmallVectorImpl<Instruction *> &LinePoints);
+                         SmallVectorImpl<LinePoint> &LinePoints);
   GlobalVariable *CreateFunctionLocalArrayInSection(size_t NumElements,
                                                     Function &F, Type *Ty,
                                                     const char *Section);
@@ -767,7 +773,7 @@ void ModuleSanitizerCoverage::instrumentFunction(Function &F) {
   if (Options.CollectControlFlow)
     createFunctionControlFlow(F);
 
-  SmallVector<Instruction *, 32> LinePoints;
+  SmallVector<LinePoint, 32> LinePoints;
   if (ClStmtGuards && Options.TracePCGuard && !Options.GatedCallbacks)
     CollectLinePoints(F, BlocksToInstrument, LinePoints);
 
@@ -886,13 +892,15 @@ Instruction *ModuleSanitizerCoverage::CreateGateBranch(Function &F,
   return SplitBlockAndInsertIfThen(FunctionGateCmp, IP, false, Weights);
 }
 
-// Finds the first instruction of each source line that begins in the middle of
-// a block; the block's own guard already covers its first line. Line 0 and
-// column-only changes are ignored. Only stepping through user code needs these,
-// so they are not collected unless -sanitizer-coverage-stmt is given.
+// Finds where a debugger can stop inside a block: before the first instruction
+// of each source line that begins there (the block's own guard covers its first
+// line; line 0 and column-only changes are ignored), and right after each call
+// that is followed by more code of the call's own line, so a step that returns
+// from the callee stops on the call line. Not collected unless
+// -sanitizer-coverage-stmt is given.
 void ModuleSanitizerCoverage::CollectLinePoints(
     Function &F, ArrayRef<BasicBlock *> Blocks,
-    SmallVectorImpl<Instruction *> &LinePoints) {
+    SmallVectorImpl<LinePoint> &LinePoints) {
   for (BasicBlock *BB : Blocks) {
     unsigned PrevLine = 0;
     if (BB == &F.getEntryBlock())
@@ -910,17 +918,26 @@ void ModuleSanitizerCoverage::CollectLinePoints(
       if (First && !PrevLine)
         PrevLine = Line;
       First = false;
-      if (Line == PrevLine)
+      if (Line != PrevLine) {
+        PrevLine = Line;
+        LinePoints.push_back({&I, I.getDebugLoc()});
+      }
+      auto *Call = dyn_cast<CallInst>(&I);
+      if (!Call || isa<IntrinsicInst>(Call))
         continue;
-      PrevLine = Line;
-      LinePoints.push_back(&I);
+      Instruction *Next = I.getNextNode();
+      while (Next && Next->isDebugOrPseudoInst())
+        Next = Next->getNextNode();
+      if (Next && !Next->isTerminator() && Next->getDebugLoc() &&
+          Next->getDebugLoc().getLine() == Line)
+        LinePoints.push_back({Next, I.getDebugLoc()});
     }
   }
 }
 
 bool ModuleSanitizerCoverage::InjectCoverage(Function &F,
                                              ArrayRef<BasicBlock *> AllBlocks,
-                                             ArrayRef<Instruction *> LinePoints,
+                                             ArrayRef<LinePoint> LinePoints,
                                              Value *&FunctionGateCmp,
                                              bool IsLeafFunc) {
   if (AllBlocks.empty())
@@ -930,8 +947,8 @@ bool ModuleSanitizerCoverage::InjectCoverage(Function &F,
     InjectCoverageAtBlock(F, *AllBlocks[i], i, FunctionGateCmp, IsLeafFunc);
   // Same hook as a block guard, so the host sees both kinds as one stream.
   for (size_t i = 0, N = LinePoints.size(); i < N; i++) {
-    InstrumentationIRBuilder IRB(LinePoints[i]);
-    IRB.SetCurrentDebugLocation(LinePoints[i]->getDebugLoc());
+    InstrumentationIRBuilder IRB(LinePoints[i].InsertBefore);
+    IRB.SetCurrentDebugLocation(LinePoints[i].Loc);
     auto GuardPtr = IRB.CreateConstInBoundsGEP2_64(
         FunctionGuardArray->getValueType(), FunctionGuardArray, 0,
         AllBlocks.size() + i);
