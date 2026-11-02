@@ -83,6 +83,7 @@ Screening (no PGO, no wasm-opt), best-of-2 per unit, total over the 6-project co
 | thin | LLVM_ENABLE_LTO=Thin | 152.5 | -3.0% | 66.5 MB | borderline alone; much better stacked on -O2 |
 | o2thin | -O2 + ThinLTO | 128.2 | -18.5% | 94.4 MB | 3 runs: -18.2 / -18.3 / -15.5% vs base run 2; chosen base for PGO |
 | pgouse | o2thin + PGO (front-end instrumentation, trained on Lua/fmt/Catch2/json) | 120.4 | -23.5% | 98.2 MB (lld 43 MB) | 3 runs: -22.7 / -24.0 / -23.3%; held-out SQLite+Eigen 63.6 -> 58.8 s (-7.6%), train 64.6 -> 61.6 s (-4.6%), so no overfit |
+| final | pgouse + wasm-opt -O3 (explicit --enable list) | 143.1 | -9.0% | clang 85.5 MB, lld 37.7 MB | 3 runs: -8.2 / -8.1 / -9.4%. wasm-opt undoes most of the ThinLTO+PGO gain (it helped 6-7% on the plain -Os build); ship the raw PGO binaries |
 
 Real noise is about +-2.5% with best-of-2 (identical binaries scored +1.5% and +2.6%), mostly from other activity on the machine; do not use the machine during suite runs, and prefer 3 runs for close calls.
 
@@ -95,3 +96,7 @@ Real noise is about +-2.5% with best-of-2 (identical binaries scored +1.5% and +
 5. Rebuild with `-fprofile-instr-use=<profdata> -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date`.
 
 Raw (no wasm-opt) binaries and the merged profile are kept in `C:\Users\mooin\pgo\variants\keep\<name>`.
+
+## clangd and lldb
+
+Built with the same flags (`pgo/build-clangd-variant.bat`, `pgo/build-lldb-variant.bat`, generated from the originals): Release -O2, ThinLTO, `-fprofile-instr-use` with the clang profile (only shared clang code gets profile data; their own sources are unprofiled, which the -Wno-profile-* flags silence). Raw sizes: clangd 50.6 MB, lldb-wasm-reactor 87.3 MB; wasm-opt -O3 gives 44.2 / 76.6 MB but is likely slower, like clang (not measured for these two; their only check is that the node tests pass). The extension ships a single-threaded llvm-ar, so the threaded llvm-ar from these builds is unused.
