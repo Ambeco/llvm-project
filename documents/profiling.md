@@ -100,3 +100,33 @@ Raw (no wasm-opt) binaries and the merged profile are kept in `C:\Users\mooin\pg
 ## clangd and lldb
 
 Built with the same flags (`pgo/build-clangd-variant.bat`, `pgo/build-lldb-variant.bat`, generated from the originals): Release -O2, ThinLTO, `-fprofile-instr-use` with the clang profile (only shared clang code gets profile data; their own sources are unprofiled, which the -Wno-profile-* flags silence). Raw sizes: clangd 50.6 MB, lldb-wasm-reactor 87.3 MB; wasm-opt -O3 gives 44.2 / 76.6 MB but is likely slower, like clang (not measured for these two; their only check is that the node tests pass). The extension ships a single-threaded llvm-ar, so the threaded llvm-ar from these builds is unused.
+
+## Retrain with `--debug` compiles (2026-11-03): no debug-build gain, not shipped
+
+Question: v24.0.10 (profile trained on release-mode compiles only) gained 23.5% on release compiles but only 10.9% on `-O0 -g` + trace-pc-guard compiles. Does adding `--debug` compiles to the training set close that gap?
+
+What was run (all scripts and results are under `C:\Users\mooin\pgo`; sources = this repo at `0f08c558812c`, clean tree):
+1. Instrumented build `pgogen2`: Release `-O2 -DNDEBUG`, ThinLTO, `-resource-dir=<resdir> -fprofile-instr-generate -fprofile-update=atomic` (same recipe as above).
+2. Training with `perf-bench.mjs`, `--pch on --repeat 1 --j 1`, on the 4 training projects only (Lua; 8 fmt files; 4 Catch2 files; 3 nlohmann/json files; no SQLite or Eigen). Release pass, then the same files again with `--debug` (and `--link`/debug stub where the project links). Each pass merged separately with `llvm-profdata merge -sparse`: `rel.profdata` (19.9 MB, 98,108 functions, 317,651 blocks, total count 1.041e11; essentially identical to the v24.0.10 `o2thin.profdata`, which has the same size and counts), `dbg.profdata` (34.7 MB, 160,760 functions, 479,540 blocks, total 1.270e11), and `both.profdata` = unweighted merge of the two (160,987 functions, total 2.311e11).
+3. Rebuilds with `-fprofile-instr-use` (`-Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date`), same flags otherwise: `pgouse2` (both.profdata) and `pgorel` (rel.profdata only, as a control for the merge).
+
+Results (raw binaries, no wasm-opt; sum of per-unit compile medians plus link times; 58 release units / 47 debug units):
+
+| Build | Release total (s) | Debug total (s) |
+|---|---|---|
+| base (`-Os`, no PGO) | 157.3 (best of 3) | 92.5 (1 run) |
+| v24.0.10, Nov 1-2 runs | 120.4 (best of 3) | 82.5 (1 run) |
+| v24.0.10 control, Nov 3 | 133.3 (1 run) | 82.4 (1 run) |
+| `pgorel` (release-only profile) | 140.6 (1 run) | 83.3 (1 run) |
+| `pgouse2` (release+debug profile) | 146.6 (best of 2) | 83.7 (1 run) |
+
+Per project, release (s): v24.0.10 control Nov 3 = catch2 7.9, eigen 57.0, fmt 30.5, json 22.1, lua 8.5, sqlite 7.2; `pgorel` = 7.9, 56.8, 35.0, 23.0, 9.4, 8.6; `pgouse2` = 9.0, 58.2, 35.3, 25.9, 9.1, 9.1. Per project, debug (s): v24.0.10 Nov 3 = fmt 50.5, lua 10.5, sqlite 21.4; `pgorel` = 51.2, 10.7, 21.4; `pgouse2` = 51.4, 11.6, 20.8.
+
+Conclusions:
+- The debug-trained profile does not speed up debug compiles: 83.7 s vs 83.3 s (release-only rebuild) vs 82.4 s (v24.0.10), all within the roughly +-2.5% noise. The "debug-only code paths are unprofiled" explanation for the smaller debug gain is not supported; the `-O0 -g` compile time is apparently not dominated by what PGO improves.
+- Release: both rebuilds measure 5.5% (`pgorel`, 1 run) and 10% (`pgouse2`, best of 2) slower than the v24.0.10 binaries measured the same day. The `pgorel` profile is essentially the v24.0.10 profile, so that 5.5% is unexplained (noise is about 2.5%; not investigated further). Do not read the 120.4 s historic figure against today's runs: the same v24.0.10 binaries scored 133.3 s on Nov 3 (+10.8%), so the machine is slower now. Compare only runs made back to back.
+- Decision: nothing republished; v24.0.10 stays pinned. The instrumented build and retrain build trees were deleted (about 14 GB); `rel.profdata`, `dbg.profdata`, `both.profdata`, the scripts and results remain in `C:\Users\mooin\pgo`.
+
+Pitfalls found:
+- A clang from a different commit rejects the benchmark's prebuilt PCH ("PCH file ... built from a different branch"), so every C++ unit fails while C (Lua, SQLite) still passes. The first attempt trained on Lua only and came out 16-22% slower than v24.0.10 on release. Build a PCH with the clang under test (`mkpch.mjs <cache dir> <clang.wasm>`, then `VSCWCLANG_BENCH_CACHE=<cache dir>`), and check the `ok`/`FAIL` counts in the training logs before trusting a profile. The instrumented clang's own PCH build writes a stray `default.profraw` warning; it is harmless.
+- `suite.sh <anything> <tag> <dir>` takes the binaries from the third argument; `dbg.sh <tag> <clang> <lld>` uses `tc-raw` as its artifacts.
